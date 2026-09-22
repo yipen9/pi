@@ -9,10 +9,24 @@ For a built-in provider, start with `/login`, then choose a model with `/model`.
 | A supported subscription | Sign in through `/login` |
 | A provider API key | Store it through `/login` or set its environment variable |
 | A local GGUF model | Connect Pi to the llama.cpp router |
-| An OpenAI-, Anthropic-, or Google-compatible endpoint | Add it to `models.json` |
+| An OpenAI-, Anthropic-, or Google-compatible endpoint | Add it with `/provider` or to `models.json` |
 | A provider with a custom protocol or authentication flow | Build or install a provider extension |
 
 Browse the [model catalog](https://pi.dev/models) for current providers, model IDs, capabilities, context limits, and pricing. Pi starts with its bundled catalog and can overlay newer catalog data from pi.dev. Cached catalog data remains available offline; run `pi update --models` to force a refresh.
+
+## Add a provider interactively
+
+Use `/provider` in interactive mode to add or modify a text-only provider backed by an OpenAI Chat Completions, OpenAI Responses, or Anthropic Messages endpoint without editing JSON. The form asks for a provider id, API protocol, base URL, API key, and a comma-separated model list:
+
+```text
+deepseek-v4-flash[1m],deepseek-v4-pro[128k]
+```
+
+`k` and `m` are decimal token units, so `128k` is `128000` and `1m` is `1000000`. A model without a suffix defaults to `128k`. After saving, use `/model provider-id/model-id` or open `/model` to switch immediately. Run `/provider provider-id` to open one provider directly for editing; leaving its API key blank preserves the stored key.
+
+These providers are stored in `~/.pi/agent/providers.sqlite` (or beside the active `models.json` path for SDK-created runtimes). The database is not encrypted. On Unix, pi restricts the database file to the current user, but disk encryption or an external secret manager is still required for encrypted-at-rest credentials.
+
+The command intentionally covers the common text-only case. It assigns zero cost metadata, a 16K maximum output, and no reasoning capability. Use `models.json` below when you need environment or command-based key resolution, custom headers, image input, reasoning metadata, pricing, compatibility flags, or different output limits.
 
 ## Authenticate
 

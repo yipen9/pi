@@ -152,6 +152,7 @@ import {
 	formatAuthSelectorProviderType,
 	OAuthSelectorComponent,
 } from "./components/oauth-selector.ts";
+import { ProviderManagerComponent } from "./components/provider-manager.ts";
 import { ScopedModelsSelectorComponent } from "./components/scoped-models-selector.ts";
 import { SessionSelectorComponent } from "./components/session-selector.ts";
 import { SettingsSelectorComponent } from "./components/settings-selector.ts";
@@ -3096,6 +3097,12 @@ export class InteractiveMode {
 				await this.handleModelCommand(searchTerm);
 				return;
 			}
+			if (text === "/provider" || text.startsWith("/provider ")) {
+				const providerId = text.startsWith("/provider ") ? text.slice(10).trim() : undefined;
+				this.editor.setText("");
+				this.showProviderManager(providerId);
+				return;
+			}
 			if (text === "/thinking" || text.startsWith("/thinking ")) {
 				const searchTerm = text.startsWith("/thinking ") ? text.slice(10).trim() : undefined;
 				this.editor.setText("");
@@ -5213,6 +5220,28 @@ export class InteractiveMode {
 				defaultProvider && defaultModel ? { provider: defaultProvider, id: defaultModel } : undefined,
 			);
 			return { component: selector, focus: selector, dispose: () => selector.dispose() };
+		});
+	}
+
+	private showProviderManager(initialProviderId?: string): void {
+		this.showSelector((done) => {
+			const selector = new ProviderManagerComponent({
+				providers: this.session.modelRuntime.getCustomProviders(),
+				initialProviderId,
+				onSave: async (draft) => {
+					const provider = await this.session.modelRuntime.saveCustomProvider(draft);
+					this.updateAvailableProviderCount();
+					this.footer.invalidate();
+					done();
+					this.showStatus(`Provider saved: ${provider.id}. Use /model ${provider.id}/<model> to switch.`);
+				},
+				onCancel: () => {
+					done();
+					this.ui.requestRender();
+				},
+				requestRender: () => this.ui.requestRender(),
+			});
+			return { component: selector, focus: selector };
 		});
 	}
 

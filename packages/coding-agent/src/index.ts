@@ -49,6 +49,18 @@ export {
 	serializeConversation,
 	shouldCompact,
 } from "./core/compaction/index.ts";
+export {
+	CUSTOM_PROVIDER_APIS,
+	type CustomProvider,
+	type CustomProviderApi,
+	type CustomProviderDraft,
+	type CustomProviderModel,
+	type CustomProviderStore,
+	DEFAULT_CUSTOM_PROVIDER_API,
+	InMemoryCustomProviderStore,
+	isCustomProviderApi,
+	SqliteCustomProviderStore,
+} from "./core/custom-provider-store.ts";
 export { createEventBus, type EventBus, type EventBusController } from "./core/event-bus.ts";
 // Extension system
 export type {

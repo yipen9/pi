@@ -41,6 +41,15 @@ import * as builtinProviderCatalog from "@earendil-works/pi-ai/providers/all";
 import { getAgentDir } from "../config.ts";
 import { operationSignal, raceWithAbortSignal } from "../utils/abort.ts";
 import { AuthStorage as DefaultAuthStorage } from "./auth-storage.ts";
+import {
+	type CustomProvider,
+	type CustomProviderDraft,
+	type CustomProviderStore,
+	customProviderToConfig,
+	InMemoryCustomProviderStore,
+	normalizeCustomProvider,
+	SqliteCustomProviderStore,
+} from "./custom-provider-store.ts";
 import { ModelConfig } from "./model-config.ts";
 import { FileModelsStore, InMemoryCodingAgentModelsStore } from "./models-store.ts";
 import {
@@ -71,6 +80,9 @@ export interface CreateModelRuntimeOptions {
 	modelsPath?: string | null;
 	modelsStore?: ModelsStore;
 	modelsStorePath?: string;
+	/** Persistent custom provider storage. Defaults to providers.sqlite beside models.json. */
+	customProviderStore?: CustomProviderStore;
+	customProviderStorePath?: string;
 	/** Allow create() to refresh model catalogs over the network. Defaults to false. */
 	allowModelNetwork?: boolean;
 	/** Timeout for the create-time network model refresh. */
@@ -135,6 +147,8 @@ export class ModelRuntime implements Models {
 	private readonly builtins = new Map<string, Provider>();
 	private readonly nativeExtensionProviders = new Map<string, Provider>();
 	private readonly extensionProviders = new Map<string, ProviderConfigInput>();
+	private readonly customProviderStore: CustomProviderStore;
+	private readonly customProviders = new Map<string, CustomProvider>();
 	private readonly compositionErrors = new Map<string, string>();
 	private readonly modelsPath: string | undefined;
 	private readonly modelNetworkEnabled: boolean;
@@ -157,12 +171,16 @@ export class ModelRuntime implements Models {
 		config: ModelConfig,
 		modelsPath: string | undefined,
 		modelsStore: ModelsStore,
+		customProviderStore: CustomProviderStore,
+		customProviders: readonly CustomProvider[],
 		providers: readonly Provider[],
 		modelNetworkEnabled: boolean,
 	) {
 		this.credentials = credentials;
 		this.config = config;
 		this.modelsPath = modelsPath;
+		this.customProviderStore = customProviderStore;
+		for (const provider of customProviders) this.customProviders.set(provider.id, provider);
 		this.modelNetworkEnabled = modelNetworkEnabled;
 		this.defaultBuiltins = new Map(providers.map((provider) => [provider.id, provider]));
 		for (const [providerId, provider] of this.defaultBuiltins) this.builtins.set(providerId, provider);
@@ -180,6 +198,14 @@ export class ModelRuntime implements Models {
 			(modelsPath
 				? new FileModelsStore(options.modelsStorePath ?? join(dirname(modelsPath), "models-store.json"))
 				: new InMemoryCodingAgentModelsStore());
+		const customProviderStore =
+			options.customProviderStore ??
+			(options.customProviderStorePath
+				? new SqliteCustomProviderStore(options.customProviderStorePath)
+				: modelsPath
+					? new SqliteCustomProviderStore(join(dirname(modelsPath), "providers.sqlite"))
+					: new InMemoryCustomProviderStore());
+		const customProviders = customProviderStore.list();
 		const builtinModelDataGeneratedAt = builtinProviderCatalog.getBuiltinModelDataGeneratedAt();
 		const providers = builtinProviderCatalog
 			.builtinProviders()
@@ -193,6 +219,8 @@ export class ModelRuntime implements Models {
 			config,
 			modelsPath,
 			modelsStore,
+			customProviderStore,
+			customProviders,
 			providers,
 			process.env.PI_OFFLINE === undefined,
 		);
@@ -239,26 +267,34 @@ export class ModelRuntime implements Models {
 			...this.builtins.keys(),
 			...this.nativeExtensionProviders.keys(),
 			...this.config.getProviderIds(),
+			...this.customProviders.keys(),
 			...this.extensionProviders.keys(),
 		]);
 	}
 
+	private getProviderOverlay(providerId: string): ProviderConfigInput | undefined {
+		const extension = this.extensionProviders.get(providerId);
+		if (extension) return extension;
+		const customProvider = this.customProviders.get(providerId);
+		return customProvider ? customProviderToConfig(customProvider) : undefined;
+	}
+
 	private recomposeProvider(providerId: string): void {
 		const base = this.nativeExtensionProviders.get(providerId) ?? this.builtins.get(providerId);
-		const extension = this.extensionProviders.get(providerId);
-		if (!base && !this.config.getProvider(providerId) && !extension) {
+		const overlay = this.getProviderOverlay(providerId);
+		if (!base && !this.config.getProvider(providerId) && !overlay) {
 			this.models.deleteProvider(providerId);
 			this.compositionErrors.delete(providerId);
 			return;
 		}
-		if (base && !this.config.getProvider(providerId) && !extension) {
+		if (base && !this.config.getProvider(providerId) && !overlay) {
 			// No overlays: use the builtin untouched so its auth/login/stream behavior is exact.
 			this.models.setProvider(base);
 			this.compositionErrors.delete(providerId);
 			return;
 		}
 		try {
-			this.models.setProvider(composeModelProvider(providerId, base, this.config, extension));
+			this.models.setProvider(composeModelProvider(providerId, base, this.config, overlay));
 			this.compositionErrors.delete(providerId);
 		} catch (error) {
 			this.compositionErrors.set(providerId, error instanceof Error ? error.message : String(error));
@@ -447,12 +483,43 @@ export class ModelRuntime implements Models {
 		return this.nativeExtensionProviders.get(providerId);
 	}
 
+	getCustomProviders(): readonly CustomProvider[] {
+		return [...this.customProviders.values()]
+			.sort((left, right) => left.id.localeCompare(right.id))
+			.map((provider) => structuredClone(provider));
+	}
+
+	async saveCustomProvider(draft: CustomProviderDraft): Promise<CustomProvider> {
+		const normalizedId = draft.id.trim().toLowerCase();
+		const existing = this.customProviders.get(normalizedId);
+		const provider = normalizeCustomProvider({
+			...draft,
+			api: draft.api ?? existing?.api,
+			apiKey: draft.apiKey.trim() || existing?.apiKey || "",
+		});
+		const config = customProviderToConfig(provider);
+		validateExtensionProvider(
+			provider.id,
+			this.builtins.get(provider.id),
+			this.config.getProvider(provider.id),
+			config,
+		);
+		this.customProviderStore.write(provider);
+		this.customProviders.set(provider.id, provider);
+		this.recomposeProvider(provider.id);
+		this.updateModelSnapshot();
+		const result = await this.refresh({ allowNetwork: false, providers: [provider.id] });
+		const error = result.errors.get(provider.id);
+		if (error) throw error;
+		return structuredClone(provider);
+	}
+
 	/** @internal Compatibility fallback for ModelRegistry when provider auth is unconfigured. */
 	getCompatibilityRequestConfig(model: Model<Api>): CompatibilityRequestConfig {
 		return resolveCompatibilityRequestConfig(
 			model,
 			this.config.getProvider(model.provider),
-			this.extensionProviders.get(model.provider),
+			this.getProviderOverlay(model.provider),
 		);
 	}
 
@@ -480,7 +547,7 @@ export class ModelRuntime implements Models {
 		const configuredHeaders = resolveConfiguredModelHeaders(
 			providerOrModel,
 			this.config.getProvider(providerOrModel.provider),
-			this.extensionProviders.get(providerOrModel.provider),
+			this.getProviderOverlay(providerOrModel.provider),
 			{ ...(resolution.env ?? {}), ...(overrides.env ?? {}) },
 		);
 		return {
@@ -564,7 +631,7 @@ export class ModelRuntime implements Models {
 		if (this.snapshot.storedProviders.has(providerId)) return { configured: true, source: "stored" };
 		const configured = configuredRequestAuthStatus(
 			this.config.getProvider(providerId),
-			this.extensionProviders.get(providerId),
+			this.getProviderOverlay(providerId),
 		);
 		if (configured) return configured;
 		const check = this.snapshot.auth.get(providerId);
@@ -700,6 +767,8 @@ export class ModelRuntime implements Models {
 
 	async refresh(options: ModelsRefreshOptions = {}): Promise<ModelsRefreshResult> {
 		this.config = await ModelConfig.load(this.modelsPath);
+		this.customProviders.clear();
+		for (const provider of this.customProviderStore.list()) this.customProviders.set(provider.id, provider);
 		this.configureRadiusProviders();
 		if (options.providers) {
 			for (const providerId of new Set(options.providers)) this.recomposeProvider(providerId);
