@@ -9,6 +9,7 @@
 ### Changed
 
 - Changed the default xAI model to Grok 4.7.
+- Changed `/model` confirmation to save the chosen model as the startup default and as that provider's default. Searching the provider later opens on the saved model instead of the first catalog model. Cycling models stays session-scoped.
 
 ### Fixed
 

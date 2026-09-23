@@ -40,7 +40,7 @@ Keep `auth.json` and any credential commands private. Project settings and exten
 
 ## Select a model
 
-Run `/model` to search available models. The picker shows models whose providers have usable authentication. Press `Ctrl+S` on a model to save it as the default for new sessions.
+Run `/model` to search available models. The picker shows models whose providers have usable authentication. Confirming a model saves it as the startup default and as that provider's default, so the next session and the next search for that provider open on it. `Ctrl+P` only changes the current session.
 
 Run `/thinking` to select the thinking level for the current model. Press `Ctrl+S` there to save the startup level. Pi limits the choices to levels supported by the selected model.
 

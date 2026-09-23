@@ -10,6 +10,14 @@ function createFakeTui(): TUI {
 	return { requestRender: () => {} } as unknown as TUI;
 }
 
+function selectedModelId(rendered: string): string | undefined {
+	const line = rendered.split("\n").find((entry) => entry.trimStart().startsWith("→"));
+	if (!line) return undefined;
+	const rest = line.trimStart().replace(/^→\s*/, "");
+	const id = rest.split(" [")[0]?.replace(/^✓\s*/, "");
+	return id?.trim() || undefined;
+}
+
 describe("model selector", () => {
 	let harness: Harness | undefined;
 
@@ -102,5 +110,38 @@ describe("model selector", () => {
 			const rendered = stripAnsi(selector.render(120).join("\n"));
 			expect(rendered).toContain("Could not refresh 2 model catalogs (openai, anthropic); showing cached models.");
 		});
+	});
+
+	it("opens a provider search on that provider's saved default model", async () => {
+		harness = await createHarness({
+			models: [
+				{ id: "first-model", name: "First Model", reasoning: false },
+				{ id: "saved-default", name: "Saved Default", reasoning: false },
+			],
+		});
+		const currentModel = harness.getModel("first-model")!;
+		const selector = new ModelSelectorComponent(
+			createFakeTui(),
+			currentModel,
+			harness.session.modelRuntime,
+			[],
+			() => {},
+			() => {},
+			undefined,
+			undefined,
+			undefined,
+			{ [currentModel.provider]: "saved-default" },
+		);
+
+		await vi.waitFor(() => {
+			expect(stripAnsi(selector.render(120).join("\n"))).toContain("Model catalogs refreshed.");
+		});
+
+		for (const char of currentModel.provider) {
+			selector.handleInput(char);
+		}
+
+		expect(selectedModelId(stripAnsi(selector.render(120).join("\n")))).toBe("saved-default");
+		selector.dispose();
 	});
 });

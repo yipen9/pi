@@ -111,6 +111,8 @@ export interface Settings {
 	lastChangelogVersion?: string;
 	defaultProvider?: string;
 	defaultModel?: string;
+	/** Last model explicitly chosen for a provider, keyed by provider id. */
+	providerDefaultModels?: Record<string, string>;
 	defaultThinkingLevel?: ThinkingLevel;
 	modelThinkingLevels?: Record<string, ThinkingLevel>; // per-model default thinking level overrides keyed by "provider/modelId"
 	transport?: TransportSetting; // default: "auto"
@@ -751,11 +753,24 @@ export class SettingsManager {
 		this.save();
 	}
 
+	getProviderDefaultModels(): Record<string, string> {
+		return { ...(this.settings.providerDefaultModels ?? {}) };
+	}
+
+	getProviderDefaultModel(provider: string): string | undefined {
+		return this.settings.providerDefaultModels?.[provider];
+	}
+
 	setDefaultModelAndProvider(provider: string, modelId: string): void {
 		this.globalSettings.defaultProvider = provider;
 		this.globalSettings.defaultModel = modelId;
+		if (!this.globalSettings.providerDefaultModels) {
+			this.globalSettings.providerDefaultModels = {};
+		}
+		this.globalSettings.providerDefaultModels[provider] = modelId;
 		this.markModified("defaultProvider");
 		this.markModified("defaultModel");
+		this.markModified("providerDefaultModels", provider);
 		this.save();
 	}
 

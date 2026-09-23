@@ -5046,10 +5046,10 @@ export class InteractiveMode {
 		const model = await this.findExactModelMatch(searchTerm);
 		if (model) {
 			try {
-				await this.session.setModel(model, { persist: false });
+				await this.session.setModel(model, { persist: true });
 				this.footer.invalidate();
 				this.updateEditorBorderColor();
-				this.showStatus(`Model: ${model.id}`);
+				this.showStatus(`Default model: ${model.provider}/${model.id}`);
 				void this.maybeWarnAboutAnthropicSubscriptionAuth(model);
 				this.checkDaxnutsEasterEgg(model);
 			} catch (error) {
@@ -5205,12 +5205,16 @@ export class InteractiveMode {
 			};
 			const defaultProvider = this.settingsManager.getDefaultProvider();
 			const defaultModel = this.settingsManager.getDefaultModel();
+			const providerDefaultModels = {
+				...defaultModelPerProvider,
+				...this.settingsManager.getProviderDefaultModels(),
+			};
 			const selector = new ModelSelectorComponent(
 				this.ui,
 				this.session.model,
 				this.session.modelRuntime,
 				this.session.scopedModels,
-				(model) => selectModel(model, false),
+				(model) => selectModel(model, true),
 				() => {
 					done();
 					this.ui.requestRender();
@@ -5218,6 +5222,7 @@ export class InteractiveMode {
 				initialSearchInput,
 				(model) => selectModel(model, true),
 				defaultProvider && defaultModel ? { provider: defaultProvider, id: defaultModel } : undefined,
+				providerDefaultModels,
 			);
 			return { component: selector, focus: selector, dispose: () => selector.dispose() };
 		});

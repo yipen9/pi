@@ -66,6 +66,7 @@ export class ModelSelectorComponent extends Container implements Focusable {
 	private tui: TUI;
 	private scopedModels: ReadonlyArray<ScopedModelItem>;
 	private defaultModel?: DefaultModelReference;
+	private providerDefaultModels?: Readonly<Record<string, string>>;
 	private scope: ModelScope = "all";
 	private scopeText?: Text;
 	private scopeHintText?: Text;
@@ -83,6 +84,7 @@ export class ModelSelectorComponent extends Container implements Focusable {
 		initialSearchInput?: string,
 		onSelectAsDefault?: (model: Model<any>) => void,
 		defaultModel?: DefaultModelReference,
+		providerDefaultModels?: Readonly<Record<string, string>>,
 	) {
 		super();
 
@@ -91,6 +93,7 @@ export class ModelSelectorComponent extends Container implements Focusable {
 		this.modelRuntime = modelRuntime;
 		this.scopedModels = scopedModels;
 		this.defaultModel = defaultModel;
+		this.providerDefaultModels = providerDefaultModels;
 		this.scope = scopedModels.length > 0 ? "scoped" : "all";
 		this.onSelectCallback = onSelect;
 		this.onSelectAsDefaultCallback = onSelectAsDefault;
@@ -139,7 +142,7 @@ export class ModelSelectorComponent extends Container implements Focusable {
 				new Text(
 					theme.fg(
 						"dim",
-						`  ${keyDisplayText("tui.select.confirm")} to select · ${keyDisplayText("app.models.save")} to set as default · ${keyDisplayText("tui.select.cancel")} to cancel`,
+						`  ${keyDisplayText("tui.select.confirm")} to select and set as default · ${keyDisplayText("app.models.save")} to set as default · ${keyDisplayText("tui.select.cancel")} to cancel`,
 					),
 					0,
 					0,
@@ -240,7 +243,13 @@ export class ModelSelectorComponent extends Container implements Focusable {
 			const bIsDefault = this.isDefaultModel(b.model);
 			if (aIsDefault && !bIsDefault) return -1;
 			if (!aIsDefault && bIsDefault) return 1;
-			return a.provider.localeCompare(b.provider);
+			const providerOrder = a.provider.localeCompare(b.provider);
+			if (providerOrder !== 0) return providerOrder;
+			const aIsProviderDefault = this.isProviderDefault(a.model);
+			const bIsProviderDefault = this.isProviderDefault(b.model);
+			if (aIsProviderDefault && !bIsProviderDefault) return -1;
+			if (!aIsProviderDefault && bIsProviderDefault) return 1;
+			return a.id.localeCompare(b.id);
 		});
 		return sorted;
 	}
@@ -257,6 +266,39 @@ export class ModelSelectorComponent extends Container implements Focusable {
 
 	private isDefaultModel(model: Model<any>): boolean {
 		return this.defaultModel?.provider === model.provider && this.defaultModel.id === model.id;
+	}
+
+	private isProviderDefault(model: Model<any>): boolean {
+		return this.providerDefaultModels?.[model.provider] === model.id;
+	}
+
+	/** When the query names one provider, open on that provider's saved or built-in default model. */
+	private promoteProviderDefault(models: ModelItem[], query: string): ModelItem[] {
+		const provider = this.providerIdentifiedByQuery(models, query);
+		if (!provider) return models;
+		const preferredId = this.providerDefaultModels?.[provider];
+		if (!preferredId) return models;
+		const index = models.findIndex((item) => item.provider === provider && item.id === preferredId);
+		if (index <= 0) return models;
+		const promoted = [...models];
+		const [preferred] = promoted.splice(index, 1);
+		if (!preferred) return models;
+		promoted.unshift(preferred);
+		return promoted;
+	}
+
+	private providerIdentifiedByQuery(models: ModelItem[], query: string): string | undefined {
+		const normalized = query.trim().toLowerCase();
+		if (!normalized) return undefined;
+		const providers = [...new Set(models.map((item) => item.provider))];
+		const exact = providers.filter((provider) => {
+			const id = provider.toLowerCase();
+			return normalized === id || normalized.startsWith(`${id}/`);
+		});
+		if (exact.length === 1) return exact[0];
+		if (providers.length !== 1) return undefined;
+		const only = providers[0];
+		return only?.toLowerCase().startsWith(normalized) ? only : undefined;
 	}
 
 	private isDefaultSearch(query: string): boolean {
@@ -290,7 +332,7 @@ export class ModelSelectorComponent extends Container implements Focusable {
 					...filtered.filter((item) => !defaultKeys.has(`${item.provider}\0${item.id}`)),
 				];
 			} else {
-				this.filteredModels = filtered;
+				this.filteredModels = this.promoteProviderDefault(filtered, query);
 			}
 		} else {
 			this.filteredModels = this.activeModels;

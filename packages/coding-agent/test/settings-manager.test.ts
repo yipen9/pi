@@ -665,4 +665,30 @@ describe("SettingsManager", () => {
 			expect(manager.getShellPath()).toBe(homedir());
 		});
 	});
+
+	describe("provider default models", () => {
+		it("remembers the selected model for its provider without dropping other providers", async () => {
+			const settingsPath = join(agentDir, "settings.json");
+			writeFileSync(
+				settingsPath,
+				JSON.stringify({
+					providerDefaultModels: { "logcat-2": "LongCat-2.0" },
+				}),
+			);
+
+			const manager = SettingsManager.create(projectDir, agentDir);
+			manager.setDefaultModelAndProvider("dmall-deepseek", "glm-5.3-flash-zp");
+			await manager.flush();
+
+			const saved = JSON.parse(readFileSync(settingsPath, "utf-8")) as Settings;
+			expect(saved.defaultProvider).toBe("dmall-deepseek");
+			expect(saved.defaultModel).toBe("glm-5.3-flash-zp");
+			expect(saved.providerDefaultModels).toEqual({
+				"logcat-2": "LongCat-2.0",
+				"dmall-deepseek": "glm-5.3-flash-zp",
+			});
+			expect(manager.getProviderDefaultModel("dmall-deepseek")).toBe("glm-5.3-flash-zp");
+			expect(manager.getProviderDefaultModel("logcat-2")).toBe("LongCat-2.0");
+		});
+	});
 });
