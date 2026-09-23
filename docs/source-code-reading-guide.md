@@ -335,6 +335,15 @@ npm run check                                       # 格式 + lint + 类型 + �
 
 调试建议：在 VS Code 里用 `npx tsx --inspect-brk packages/coding-agent/src/cli.ts` 启动，然后在浏览器 `chrome://inspect` 里打断点单步执行——这是理解调用链最快的方式。
 
+仓库还提供了几个免构建的开发启动脚本（详见 [13.5 节](#135-开发用的启动包装脚本pi-testsh--mini-testsh--auto-pish)）：
+
+```bash
+./pi-test.sh               # tsx 直接跑源码；加 --no-env 模拟无 API key 环境
+./mini-test.sh             # 跑实验 mini 实现
+# 把当前 checkout 的开发版装成 pi 命令（需先 npm run build）：
+ln -s "$PWD/scripts/auto-pi.sh" "$HOME/.local/bin/pi"
+```
+
 ---
 
 ## 8. 读代码的实用技巧
@@ -665,6 +674,131 @@ npx tsx packages/coding-agent/src/cli.ts --help
 
 ---
 
+### 13.5 开发用的启动包装脚本（pi-test.sh / mini-test.sh / auto-pi.sh）
+
+前面三种是"正式"启动方式。仓库根目录还有几个**开发用包装脚本**，它们不构建、直接跑源码，方便改一行立刻验证。理解它们能帮你看清"启动"这层到底做了什么。
+
+#### 13.5.1 `pi-test.sh` —— 不构建直接跑源码
+
+全文不到 80 行，干两件事：处理 `--no-env`，然后用 `tsx` 跑源码。
+
+```bash
+#!/usr/bin/env bash
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+```
+
+- `set -euo pipefail`：出错即停（`-e`）、用到未定义变量报错（`-u`）、管道中任一环失败也算失败（`pipefail`）。这是写健壮 shell 脚本的标准开头。
+- `BASH_SOURCE[0]` 是脚本自身路径；`cd ... && pwd` 把它转成绝对目录 `SCRIPT_DIR`。这样无论从哪个目录调用脚本，都能定位到仓库根。
+
+接着解析参数，只挑出 `--no-env`，其余原样存进 `ARGS`：
+
+```bash
+for arg in "$@"; do
+  if [[ "$arg" == "--no-env" ]]; then NO_ENV=true
+  else ARGS+=("$arg"); fi
+done
+```
+
+`--no-env` 会 `unset` 掉一大批环境变量，包括 `ANTHROPIC_API_KEY`、`OPENAI_API_KEY`、`AWS_ACCESS_KEY_ID`、`GOOGLE_APPLICATION_CREDENTIALS` 等（注释指明对应 `packages/ai/src/env-api-keys.ts`）。**用途**：模拟"没有配置任何 API key"的环境，测试首次启动引导、凭据缺失提示、`/login` 流程等。
+
+最后一行才是真正启动：
+
+```bash
+"$SCRIPT_DIR/node_modules/.bin/tsx" \
+  --tsconfig "$SCRIPT_DIR/tsconfig.json" \
+  "$SCRIPT_DIR/packages/coding-agent/src/experimental/cli.ts" \
+  ${ARGS[@]+"${ARGS[@]}"}
+```
+
+逐段看：
+
+1. **直接调 `node_modules/.bin/tsx`**，不走 `npx`、不依赖全局 PATH——保证用的就是本仓库装的那个 tsx 版本。
+2. **`--tsconfig tsconfig.json`** 很关键。根 `tsconfig.json` 的 `paths` 把所有 `@earendil-works/*` 映射到 `packages/*/src/index.ts`（源码）。tsx 读取它后，源码里的 `import "@earendil-works/pi-ai"` 会被解析到**源码**而非 `dist/`。这正是"不构建也能跑"的原因（对照第 14.2 节的三套解析上下文）。
+3. **入口是 `src/experimental/cli.ts`**（不是 `src/cli.ts`）。它是普通的 `cli.ts` 加上实验命令的包装：
+   ```ts
+   #!/usr/bin/env node
+   import { setupCli } from "../cli/setup.ts";
+   import { main } from "../main.ts";
+   import { runExperimentalCommand } from "./commands.ts";
+
+   setupCli();
+   const args = process.argv.slice(2);
+   if (await runExperimentalCommand(args)) {          // 先试实验命令（mini / client 等）
+     if (args[0] === "client") process.exit(process.exitCode ?? 0);
+   } else {
+     await main(args);                                 // 否则走正常 pi 主流程
+   }
+   ```
+   也就是说：`pi-test.sh` 既能跑正常 pi，也能识别实验子命令，最后都汇入第 13 节的 `main()`。
+4. **`${ARGS[@]+"${ARGS[@]}"}`** 这个写法不是笔误。在 `set -u`（未定义变量报错）下，如果 `ARGS` 是空数组，直接写 `"${ARGS[@]}"` 在某些老版本 bash 会报错。`${ARGS[@]+...}` 表示"只有 `ARGS` 已定义时才展开它"，是用在 `set -u` 脚本里安全展开可选数组的惯用法。
+
+**小结**：`pi-test.sh` = 处理 `--no-env` → 用仓库内 tsx + 根 tsconfig（源码路径别名）→ 跑 `src/experimental/cli.ts`（源码）。不构建，改完代码立即生效。
+
+> 注意一个不一致：`pi-test.sh` 跑的是 `src/experimental/cli.ts`，而 `pi-test.ps1` 跑的是 `src/cli.ts`。两者入口不同（前者多一层实验命令分派）。
+
+#### 13.5.2 `pi-test.ps1` / `pi-test.bat` —— Windows 版本
+
+逻辑与 `pi-test.sh` 同构：解析 `--no-env` → `Remove-Item Env:<名>` 清除密钥 → 检查 `node_modules/.bin/tsx.cmd` 是否存在（不存在就提示先 `npm install`）→ 用 tsx 跑 `packages/coding-agent/src/cli.ts`。
+
+`.bat` 只是个薄壳：Windows 双击/`cmd` 调用 `.ps1` 不方便，于是 `.bat` 用 `powershell -NoProfile -ExecutionPolicy Bypass -File pi-test.ps1 %*` 转交给 PowerShell。这是 Windows 上分发脚本的常见做法。
+
+#### 13.5.3 `mini-test.sh` —— 跑实验性 mini 实现
+
+`mini` 是 `src/experimental/mini/` 下另一套实验实现，`mini-test.sh` 专门启动它：
+
+```bash
+exec "$SCRIPT_DIR/node_modules/.bin/tsx" --tsconfig "$SCRIPT_DIR/tsconfig.json" \
+  "$SCRIPT_DIR/packages/coding-agent/src/experimental/mini/main.ts" ...
+```
+
+相比 `pi-test.sh`，它多了三个开发便利开关：
+
+| 开关 | 作用 |
+|---|---|
+| `--dist` | 改用 `node dist/experimental/mini/main.js`（已构建产物），不跑源码 |
+| `--fresh` | 先停掉后台常驻的 mini session server，让它重启后加载你的新代码 |
+| `--stop` | 停掉后台 server 并退出 |
+
+这里有个值得理解的机制：mini 的 session server 是**脱离父进程后台运行**的（TUI 退出后它还在）。这带来一个陷阱——server 一旦启动就固定运行当时的代码，你改了 `mini/` 下的东西后它不会自动更新，必须 `--fresh` 重启，否则客户端和服务端协议对不上。脚本用 `pkill -f "mini/server/entry"` 加上删 socket 文件（`$HOME/.pi/agent/experimental/mini.sock`）来重启。这是"常驻后台进程与源码热更新冲突"的典型例子。
+
+#### 13.5.4 `scripts/auto-pi.sh` —— 把开发版 pi 装成命令
+
+如果你想在任意目录敲 `pi` 就用**当前 checkout 的最新构建**，可以把它软链接到 PATH 靠前的目录：
+
+```bash
+mkdir -p "$HOME/.local/bin"
+ln -s "$PWD/scripts/auto-pi.sh" "$HOME/.local/bin/pi"
+```
+
+它的启动逻辑：
+
+1. **解析软链接**：沿着 `readlink` 一路找到脚本真实位置，从而定位 `repo_dir`（不能直接信任 `$0`，因为用户是通过软链接调用的）。
+2. **判断要不要用稳定版**：若传了 `--stable`，或第一个参数是 `update`（`pi update` 自更新必须走已安装的稳定版，不能用开发版），就在 PATH 上找**下一个** `pi`（跳过自己这个 wrapper）并 `exec` 它。`find_stable_pi` 逐个遍历 PATH 条目，排除指向自身的候选。
+3. **默认走开发版**：`dev_pi="$repo_dir/packages/coding-agent/dist/bundle/cli.js"`，检查存在且可执行，然后：
+   ```bash
+   export PI_EXPERIMENTAL="${PI_EXPERIMENTAL:-1}"   # 开发调用默认开实验特性
+   exec "$dev_pi" "${args[@]}"
+   ```
+   `PI_EXPERIMENTAL=1` 会打开实验特性（`packages/coding-agent/src/core/experimental.ts` 里判断 `process.env.PI_EXPERIMENTAL === "1"`）。
+4. **`exec`**：用新进程**替换**当前 shell 进程，而不是派生子进程。好处是信号（Ctrl-C）、退出码、资源都直接传给 pi，没有中间层。
+
+所以 `auto-pi.sh` = 一个根据"是否要稳定版"在两个 pi 之间切换的调度器：开发版跑 `dist/bundle/cli.js`（打包产物），`update`/`--stable` 时转给真正的稳定版。
+
+#### 13.5.5 四个脚本对比
+
+| 脚本 | 入口 | 用不用构建 | 特点 |
+|---|---|---|---|
+| `pi-test.sh` | `src/experimental/cli.ts`（源码） | 否（tsx + 源码别名） | `--no-env` 清空密钥 |
+| `pi-test.ps1` / `.bat` | `src/cli.ts`（源码） | 否 | Windows 版，`--no-env` |
+| `mini-test.sh` | `src/experimental/mini/main.ts` | 默认否，`--dist` 用构建 | `--fresh`/`--stop` 管后台 server |
+| `scripts/auto-pi.sh` | `dist/bundle/cli.js` | **是**（要求已 `npm run build`） | 软链接成 `pi`；`update`/`--stable` 转稳定版 |
+
+共同点：都自解析脚本真实路径、都优先用仓库内 `node_modules/.bin` 的工具、都用 `exec` 或等价方式把参数原样透传。这是"本地开发运行器"的标准套路。
+
+---
+
 ## 14. 依赖在运行时是怎么被加载的
 
 把第 11 节的解析算法和第 13 节的启动串起来，运行时加载依赖的全景是：
@@ -907,6 +1041,9 @@ node "$(git rev-parse --show-toplevel)/node_modules/vitest/dist/cli.js" --run te
 | 装依赖 | `npm install --ignore-scripts` | 阶段 4 |
 | 编译所有包 | `npm run build` | 阶段 2 |
 | 改完代码快速跑源码 | `npx tsx packages/coding-agent/src/cli.ts` | 阶段 1 → 5（跳过 2） |
+| 同上，但用仓库封装脚本 | `./pi-test.sh` | 阶段 1 → 5（tsx + 源码别名；`--no-env` 清空密钥） |
+| 跑实验 mini | `./mini-test.sh` | 阶段 1 → 5（`--dist` 则走产物） |
+| 把开发版装成 `pi` 命令 | 软链接 `scripts/auto-pi.sh` | 阶段 2 产物 → 5 |
 | 跑本地构建的 pi | `node packages/coding-agent/dist/cli.js` | 阶段 2 产物 → 5 |
 | 跑全部测试 | `./test.sh` | 阶段 1（vitest 直接吃源码） |
 | 质量检查 | `npm run check` | Biome + tsgo 类型检查 |
@@ -929,3 +1066,5 @@ node "$(git rev-parse --show-toplevel)/node_modules/vitest/dist/cli.js" --run te
 - 会话文件 = 用户目录下的 JSONL，一棵事件树
 - 改完代码：`npm run check`；跑测试：`./test.sh`
 - 启动链路：`pi` → shebang → `bundle/cli.js` → `cli-runtime.js` → `main()` → 模式分派
+- 开发跑源码：`./pi-test.sh`（tsx + 源码别名，免构建）；实验 mini：`./mini-test.sh`
+- 把开发版装成命令：软链接 `scripts/auto-pi.sh`（`update`/`--stable` 会自动转给稳定版）
