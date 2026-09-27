@@ -26,7 +26,7 @@ deepseek-v4-flash[1m],deepseek-v4-pro[128k]
 
 These providers are stored in `~/.pi/agent/providers.sqlite` (or beside the active `models.json` path for SDK-created runtimes). The database is not encrypted. On Unix, pi restricts the database file to the current user, but disk encryption or an external secret manager is still required for encrypted-at-rest credentials.
 
-The command intentionally covers the common text-only case. It assigns zero cost metadata, a 16K maximum output, and no reasoning capability. Use `models.json` below when you need environment or command-based key resolution, custom headers, image input, reasoning metadata, pricing, compatibility flags, or different output limits.
+The command intentionally covers the common text-only case. It assigns zero cost metadata and a 16K maximum output. Reasoning is enabled automatically: the selected protocol decides which thinking levels Pi offers (OpenAI Chat Completions and Anthropic Messages expose `off, low, medium, high`; OpenAI Responses adds `minimal`). The `/provider` review step shows the derived levels. Use `models.json` below when you need environment or command-based key resolution, custom headers, image input, custom reasoning metadata, pricing, compatibility flags, or different output limits.
 
 ## Authenticate
 

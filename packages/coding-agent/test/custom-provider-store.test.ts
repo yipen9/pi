@@ -3,6 +3,8 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import {
+	customProviderThinkingLevels,
+	customProviderToConfig,
 	formatCustomProviderModels,
 	normalizeCustomProvider,
 	parseCustomProviderModels,
@@ -31,6 +33,52 @@ describe("custom provider store", () => {
 	it("rejects invalid and duplicate model declarations", () => {
 		expect(() => parseCustomProviderModels("model[128]")).toThrow("Use values such as 128k or 1m");
 		expect(() => parseCustomProviderModels("model[128k],model[1m]")).toThrow('Duplicate model "model"');
+	});
+
+	it("derives reasoning and thinking levels from the selected protocol", () => {
+		expect(customProviderThinkingLevels("openai-completions")).toEqual(["off", "low", "medium", "high"]);
+		expect(customProviderThinkingLevels("openai-responses")).toEqual(["off", "minimal", "low", "medium", "high"]);
+		expect(customProviderThinkingLevels("anthropic-messages")).toEqual(["off", "low", "medium", "high"]);
+
+		const config = customProviderToConfig(
+			normalizeCustomProvider({
+				id: "deepseek-local",
+				api: "openai-responses",
+				baseUrl: "https://api.example.test/v1",
+				apiKey: "secret",
+				models: "deepseek-v4-flash[1m]",
+			}),
+		);
+		expect(config.models?.[0]).toMatchObject({
+			reasoning: true,
+			thinkingLevelMap: { minimal: "minimal", low: "low", medium: "medium", high: "high" },
+		});
+	});
+
+	it("sends an Authorization Bearer header for anthropic-messages providers", () => {
+		// The Anthropic client sends the key as x-api-key, but Anthropic-compatible
+		// gateways typically only read Authorization: Bearer, so send both.
+		const anthropicConfig = customProviderToConfig(
+			normalizeCustomProvider({
+				id: "longcat",
+				api: "anthropic-messages",
+				baseUrl: "https://api.example.test/anthropic",
+				apiKey: "secret",
+				models: "LongCat-2.5[1m]",
+			}),
+		);
+		expect(anthropicConfig.authHeader).toBe(true);
+
+		const openaiConfig = customProviderToConfig(
+			normalizeCustomProvider({
+				id: "deepseek-local",
+				api: "openai-responses",
+				baseUrl: "https://api.example.test/v1",
+				apiKey: "secret",
+				models: "deepseek-v4-flash[1m]",
+			}),
+		);
+		expect(openaiConfig.authHeader).toBe(false);
 	});
 
 	it("does not create an empty database while listing", () => {

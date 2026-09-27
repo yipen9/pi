@@ -5007,13 +5007,27 @@ export class InteractiveMode {
 
 	private selectThinkingLevel(level: ThinkingLevel, persist: boolean): void {
 		try {
+			const model = this.session.model;
 			this.session.setThinkingLevel(level, { persist });
+			// An explicitly chosen level becomes the default for the current model so
+			// switching away and back restores it. Persisted selections additionally
+			// update the global default.
+			if (model) {
+				this.settingsManager.setModelThinkingLevel(model.provider, model.id, level);
+			}
 			this.footer.invalidate();
 			this.updateEditorBorderColor();
 			this.showStatus(persist ? `Default thinking level: ${level}` : `Thinking level: ${level}`);
 		} catch (error) {
 			this.showError(error instanceof Error ? error.message : String(error));
 		}
+	}
+
+	/** Default thinking level for the current model: per-model override, else the global default. */
+	private getCurrentModelDefaultThinkingLevel(): ThinkingLevel {
+		const model = this.session.model;
+		const perModel = model ? this.settingsManager.getModelThinkingLevel(model.provider, model.id) : undefined;
+		return perModel ?? this.settingsManager.getDefaultThinkingLevel() ?? DEFAULT_THINKING_LEVEL;
 	}
 
 	private showThinkingSelector(): void {
@@ -5031,7 +5045,7 @@ export class InteractiveMode {
 					this.ui.requestRender();
 				},
 				(level) => selectLevel(level, true),
-				this.settingsManager.getDefaultThinkingLevel() ?? DEFAULT_THINKING_LEVEL,
+				this.getCurrentModelDefaultThinkingLevel(),
 			);
 			return { component: selector, focus: selector };
 		});

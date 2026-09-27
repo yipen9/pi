@@ -10,7 +10,9 @@ import {
 } from "@earendil-works/pi-tui";
 import {
 	type CustomProvider,
+	type CustomProviderApi,
 	type CustomProviderDraft,
+	customProviderThinkingLevels,
 	DEFAULT_CUSTOM_PROVIDER_API,
 	formatCustomProviderModels,
 	isCustomProviderApi,
@@ -48,6 +50,10 @@ const API_OPTIONS: readonly SelectItem[] = [
 		description: "POST /messages",
 	},
 ];
+
+function thinkingLevelSummary(api: CustomProviderApi): string {
+	return customProviderThinkingLevels(api).join(", ");
+}
 
 export interface ProviderManagerOptions {
 	providers: readonly CustomProvider[];
@@ -282,6 +288,19 @@ export class ProviderManagerComponent extends Container implements Focusable {
 			if (!field) continue;
 			this.addChild(
 				new Text(`${theme.fg("muted", `${field.label}: `)}${this.formatFieldSummary(field, index)}`, 1, 0),
+			);
+		}
+		const apiValue = this.formValues[this.getFieldDefinitions().findIndex((field) => field.key === "api")];
+		if (isCustomProviderApi(apiValue)) {
+			this.addChild(
+				new Text(
+					theme.fg(
+						"muted",
+						`Thinking levels: ${theme.fg("success", thinkingLevelSummary(apiValue))} ${theme.fg("dim", "(auto from protocol)")}`,
+					),
+					1,
+					0,
+				),
 			);
 		}
 		this.addChild(new Spacer(1));

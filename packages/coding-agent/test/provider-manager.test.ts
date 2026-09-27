@@ -62,6 +62,7 @@ describe("provider manager", () => {
 		manager.handleInput("deepseek-v4-flash[1m],deepseek-v4-pro[128k]");
 		manager.handleInput("\r");
 		expect(stripAnsi(manager.render(120).join("\n"))).toContain("Review provider");
+		expect(stripAnsi(manager.render(120).join("\n"))).toContain("Thinking levels: off, low, medium, high");
 		manager.handleInput("\r");
 
 		await vi.waitFor(() => {

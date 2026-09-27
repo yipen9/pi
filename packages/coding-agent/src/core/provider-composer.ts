@@ -1,6 +1,7 @@
 import {
 	type Api,
 	type ApiKeyAuth,
+	type ApiKeyCredential,
 	type AssistantMessageEventStream,
 	type AuthContext,
 	type AuthInteraction,
@@ -337,6 +338,16 @@ async function configContextEnv(
 	return Object.keys(env).length > 0 ? env : undefined;
 }
 
+/**
+ * A stored api-key credential with neither key nor env cannot satisfy a request
+ * (for example a leftover entry with an empty key). Such credentials must not
+ * shadow a configured API key, so auth falls through to the configured layers.
+ */
+function hasUsableStoredCredential(credential: ApiKeyCredential | undefined): boolean {
+	if (!credential) return false;
+	return (credential.key !== undefined && credential.key !== "") || credential.env !== undefined;
+}
+
 function composeApiKeyAuth(
 	providerId: string,
 	base: Provider | undefined,
@@ -350,6 +361,8 @@ function composeApiKeyAuth(
 	if (!inherited && rawKey === undefined && oauth) return undefined;
 	const rawHeaders = configuredHeaders(config, extension);
 	const authHeader = extension?.authHeader ?? config?.authHeader ?? false;
+	const effectiveCredential = (input: { credential?: ApiKeyCredential }) =>
+		hasUsableStoredCredential(input.credential) ? input.credential : undefined;
 	return {
 		name: inherited?.name ?? "API key",
 		login:
@@ -359,9 +372,10 @@ function composeApiKeyAuth(
 				key: await interaction.prompt({ type: "secret", message: "Enter API key" }),
 			})),
 		check: async (input) => {
-			if (input.credential) {
+			const credential = effectiveCredential(input);
+			if (credential) {
 				if (inherited?.check) return inherited.check(input);
-				if (input.credential.key) return { type: "api_key", source: "stored credential" };
+				if (credential.key) return { type: "api_key", source: "stored credential" };
 				const resolved = await inherited?.resolve(input);
 				return resolved ? { type: "api_key", source: resolved.source } : undefined;
 			}
@@ -373,29 +387,32 @@ function composeApiKeyAuth(
 				}
 				return { type: "api_key", source: "configured API key" };
 			}
-			if (inherited?.check) return inherited.check(input);
-			const resolved = await inherited?.resolve(input);
+			if (inherited?.check) return inherited.check({ ...input, credential: undefined });
+			const resolved = await inherited?.resolve({ ...input, credential: undefined });
 			return resolved ? { type: "api_key", source: resolved.source } : undefined;
 		},
 		resolve: async (input) => {
 			let result: AuthResult | undefined;
-			if (input.credential) {
+			const credential = effectiveCredential(input);
+			if (credential) {
 				result = inherited
 					? await inherited.resolve(input)
-					: input.credential.key
-						? { auth: { apiKey: input.credential.key }, env: input.credential.env, source: "stored credential" }
+					: credential.key
+						? { auth: { apiKey: credential.key }, env: credential.env, source: "stored credential" }
 						: undefined;
-			} else if (rawKey !== undefined) {
+			}
+			if (!result && rawKey !== undefined) {
 				const env = await configContextEnv([rawKey], input.ctx);
 				const key = resolveConfigValueOrThrow(rawKey, `API key for provider "${providerId}"`, env);
 				result = inherited
 					? await inherited.resolve({ ...input, credential: { type: "api_key", key } })
 					: { auth: { apiKey: key }, source: "configured API key" };
-			} else {
-				result = await inherited?.resolve(input);
+			}
+			if (!result) {
+				result = await inherited?.resolve({ ...input, credential: undefined });
 			}
 			if (!result) return undefined;
-			const explicitEnv = { ...(input.credential?.env ?? {}), ...(result.env ?? {}) };
+			const explicitEnv = { ...(credential?.env ?? {}), ...(result.env ?? {}) };
 			const headerEnv = await configContextEnv(Object.values(rawHeaders ?? {}), input.ctx, explicitEnv);
 			const headers = resolveHeadersOrThrow(rawHeaders, `provider "${providerId}"`, headerEnv);
 			return { ...result, auth: withConfiguredAuth(result.auth, headers, authHeader) };

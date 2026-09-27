@@ -54,6 +54,18 @@ Never write access tokens, refresh tokens, authorization headers, or complete pr
 
 Every model needs an ID, display name, input capabilities, context window, output limit, reasoning support, and cost metadata. Choose the API implementation at the provider level unless one model requires an override.
 
+Providers registered through `/provider` set `reasoning: true` and derive `thinkingLevelMap` from the selected protocol, because the interactive form cannot collect per-model reasoning metadata:
+
+| Protocol | Thinking levels |
+|---|---|
+| OpenAI Chat Completions | `off, low, medium, high` |
+| OpenAI Responses | `off, minimal, low, medium, high` |
+| Anthropic Messages | `off, low, medium, high` |
+
+These defaults leave `off` unmapped so the request code omits the effort field when thinking is disabled, and omit model-specific `xhigh` and `max`. When a model supports different levels, register a provider extension or a `models.json` entry with an explicit `thinkingLevelMap` instead.
+
+Anthropic Messages providers additionally send `Authorization: Bearer <key>` next to the standard `x-api-key` header. Many Anthropic-compatible gateways only read the Bearer header; the standard Anthropic API accepts both.
+
 Set `promptCache.short` or `promptCache.long` to the provider's best-effort cache lifetime in seconds when Pi should keep an idle prompt cache warm. Leave them unset to disable cache warming for that retention tier.
 
 Compatibility flags describe verified differences in an otherwise supported API. Do not enable them based only on an endpoint claiming compatibility.

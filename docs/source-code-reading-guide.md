@@ -7,6 +7,7 @@
 ## 目录
 
 - [A. 先建立整体心智模型](#a-先建立整体心智模型)
+
 1. [预备知识：Node.js 和 npm 是什么](#1-预备知识)
 2. [TypeScript：为什么代码里全是类型](#2-typescript)
 3. [什么是 monorepo，这个仓库的布局](#3-仓库布局)
@@ -89,13 +90,13 @@ my-project/
 
 ### 1.3 常用 npm 命令
 
-| 命令 | 作用 |
-|---|---|
-| `npm install` | 按 package.json 安装所有依赖到 node_modules |
-| `npm run <脚本名>` | 执行 package.json 里 `scripts` 定义的命令 |
-| `npm run build` | 通常执行编译/打包 |
-| `npm test` | 通常执行测试 |
-| `npx <命令>` | 临时运行某个命令行工具（不必全局安装） |
+| 命令                 | 作用                                        |
+| -------------------- | ------------------------------------------- |
+| `npm install`      | 按 package.json 安装所有依赖到 node_modules |
+| `npm run <脚本名>` | 执行 package.json 里`scripts` 定义的命令  |
+| `npm run build`    | 通常执行编译/打包                           |
+| `npm test`         | 通常执行测试                                |
+| `npx <命令>`       | 临时运行某个命令行工具（不必全局安装）      |
 
 ---
 
@@ -213,11 +214,11 @@ packages/xxx/
 - **`exports`**：包的"API 窗口"。例如 `"./providers/*": "./dist/providers/*.js"` 表示你可以 `import ... from "@earendil-works/pi-ai/providers/anthropic"`。不在 exports 里的路径 import 不到。
 - **`scripts`**：根目录常用的有：
 
-| 脚本 | 干什么 |
-|---|---|
-| `npm run build` | 按依赖顺序编译所有包（chord → tui → ... → coding-agent） |
+| 脚本              | 干什么                                                       |
+| ----------------- | ------------------------------------------------------------ |
+| `npm run build` | 按依赖顺序编译所有包（chord → tui → ... → coding-agent）  |
 | `npm run check` | 一站式检查：格式、lint、类型检查、依赖一致性（改完代码必跑） |
-| `npm test` | 跑所有包的测试 |
+| `npm test`      | 跑所有包的测试                                               |
 
 ---
 
@@ -281,24 +282,30 @@ packages/xxx/
 不要从第一个文件顺着读。按下面的顺序，每一步都有明确的问题驱动：
 
 **第 0 步：先读两篇文档**
+
 - `packages/coding-agent/docs/how-pi-works.md` — 10 分钟讲清 pi 的工作原理（agent loop、会话树、上下文组装）
 - `README.md` — 包之间的关系
 
 **第 1 步：搞清"一次对话发生了什么"（packages/agent）**
+
 1. `packages/ai/src/types.ts` — 认识 `Context`、`Message`、`ToolCall` 这些名词
 2. `packages/agent/src/agent-loop.ts` — 工具调用循环。带着问题读：模型返回一个工具调用后，代码走到哪里？结果怎么拼回请求？
 
 **第 2 步：看 pi 怎么启动（packages/coding-agent）**
+
 1. `src/cli.ts`（只有几行）→ `src/main.ts` — 参数解析、创建会话
 2. `src/core/agent-session.ts` — AgentSession 类。不用读完，重点看事件和消息队列
 
 **第 3 步：挑一个工具看实现**
+
 - `src/core/tools/read.ts` — 读文件工具。看它如何校验参数、读文件、截断、渲染给模型看的结果。再对比 `bash.ts`、`edit.ts`。
 
 **第 4 步：看会话怎么存**
+
 - `src/core/session-manager.ts` — JSONL 格式，每条记录一个事件，形成树
 
 **第 5 步（可选）：UI 层**
+
 - `src/modes/interactive/interactive-mode.ts` + `packages/tui/src/tui.ts`
 
 每读一个包，先看 `src/index.ts`（公共出口），它告诉你这个包认为哪些东西是"正式 API"。
@@ -355,7 +362,6 @@ ln -s "$PWD/scripts/auto-pi.sh" "$HOME/.local/bin/pi"
    rg "createAgentSession" packages/       # 找一个函数在哪定义/使用
    rg -t ts "steering" packages/coding-agent/src   # 按关键词搜
    ```
-
 3. **从 import 语句反推结构**。看 `main.ts` 顶部 import 了哪些本地模块，就知道了入口依赖图。
 4. **类型即文档**。遇到不懂的函数，先看参数和返回值的类型定义（`types.ts` 通常是起点）。本仓库注释密度高，函数头部注释值得读。
 5. **git log 看演化**：`git log --oneline -- packages/agent/src/agent-loop.ts` 看某个文件的历史，比读代码更快理解"为什么这样写"。
@@ -367,19 +373,19 @@ ln -s "$PWD/scripts/auto-pi.sh" "$HOME/.local/bin/pi"
 
 读源码时高频出现的 Node 内置模块（都以 `node:` 前缀导入）：
 
-| 导入 | 用途 |
-|---|---|
-| `node:fs` | 读写文件（`readFileSync`、`createReadStream`…） |
-| `node:path` | 路径拼接/解析（`join`、`resolve`、`dirname`），跨平台安全 |
-| `node:process` | 进程信息：`process.argv`（命令行参数）、`process.env`（环境变量）、`process.exit` |
-| `node:child_process` | 启动子进程（pi 的 bash 工具就靠它） |
-| `node:events` | 事件发射器 `EventEmitter`（on/emit 模式） |
-| `node:stream` | 流式数据处理（模型的流式响应就是流） |
-| `node:http` / `node:https` | HTTP 服务与请求 |
-| `node:readline` | 逐行读取（交互输入、JSONL 解析） |
-| `node:url` | `fileURLToPath(import.meta.url)`：把模块 URL 转成文件路径 |
-| `node:module` | `createRequire`、`enableCompileCache` 等模块系统工具 |
-| `node:crypto` | 哈希、随机数 |
+| 导入                           | 用途                                                                                    |
+| ------------------------------ | --------------------------------------------------------------------------------------- |
+| `node:fs`                    | 读写文件（`readFileSync`、`createReadStream`…）                                    |
+| `node:path`                  | 路径拼接/解析（`join`、`resolve`、`dirname`），跨平台安全                         |
+| `node:process`               | 进程信息：`process.argv`（命令行参数）、`process.env`（环境变量）、`process.exit` |
+| `node:child_process`         | 启动子进程（pi 的 bash 工具就靠它）                                                     |
+| `node:events`                | 事件发射器`EventEmitter`（on/emit 模式）                                              |
+| `node:stream`                | 流式数据处理（模型的流式响应就是流）                                                    |
+| `node:http` / `node:https` | HTTP 服务与请求                                                                         |
+| `node:readline`              | 逐行读取（交互输入、JSONL 解析）                                                        |
+| `node:url`                   | `fileURLToPath(import.meta.url)`：把模块 URL 转成文件路径                             |
+| `node:module`                | `createRequire`、`enableCompileCache` 等模块系统工具                                |
+| `node:crypto`                | 哈希、随机数                                                                            |
 
 异步语法速记：
 
@@ -392,25 +398,25 @@ try { ... } catch (e) { ... }        // async 函数里用 try/catch 捕获错�
 
 ## 10. 术语表
 
-| 术语 | 含义 |
-|---|---|
-| monorepo | 一个 git 仓库管理多个包 |
-| workspace | npm workspaces，monorepo 里互相可链接的子包 |
-| ESM / CJS | JS 的两代模块系统；`import/export` vs `require`。pi 全用 ESM |
-| `dist/` | 编译产物目录（TS → JS），由 build 生成，不进 git |
-| tsgo | TypeScript 原生加速编译器（`@typescript/native-preview`），本仓库用它构建 |
-| esbuild | 极快的 JS 打包器，把很多文件打成少量 bundle 文件 |
-| bundle | 打包产物；pi 的 `pi` 命令就是 `dist/bundle/cli.js` |
-| Biome | 代码格式化 + lint 工具（本仓库用 `npm run check` 调它） |
-| Vitest | 测试框架（`tui` 包用 Node 自带的 `node --test`） |
-| JSONL | 每行一个 JSON 对象的文本格式；pi 的会话文件和 JSON/RPC 模式都用它 |
-| CBOR | 二进制 JSON 替代格式，用于远程会话协议（packages/protocol） |
-| steering | 在模型回答生成期间插入新消息改变其方向 |
-| compaction | 压缩历史上下文为摘要，避免超出模型窗口 |
-| e2e test | 端到端测试，会真实调用模型 API，默认不跑 |
-| husky | git 钩子工具，本仓库用它做 pre-commit 检查 |
-| bare specifier | 不带 `./` 或 `/` 的导入名，如 `"@earendil-works/pi-ai"`，Node 会去 node_modules 找 |
-| symlink（软链接） | 一个指向真实文件的"快捷方式"；npm workspaces 就靠它把包互相连起来 |
+| 术语              | 含义                                                                                    |
+| ----------------- | --------------------------------------------------------------------------------------- |
+| monorepo          | 一个 git 仓库管理多个包                                                                 |
+| workspace         | npm workspaces，monorepo 里互相可链接的子包                                             |
+| ESM / CJS         | JS 的两代模块系统；`import/export` vs `require`。pi 全用 ESM                        |
+| `dist/`         | 编译产物目录（TS → JS），由 build 生成，不进 git                                       |
+| tsgo              | TypeScript 原生加速编译器（`@typescript/native-preview`），本仓库用它构建             |
+| esbuild           | 极快的 JS 打包器，把很多文件打成少量 bundle 文件                                        |
+| bundle            | 打包产物；pi 的`pi` 命令就是 `dist/bundle/cli.js`                                   |
+| Biome             | 代码格式化 + lint 工具（本仓库用`npm run check` 调它）                                |
+| Vitest            | 测试框架（`tui` 包用 Node 自带的 `node --test`）                                    |
+| JSONL             | 每行一个 JSON 对象的文本格式；pi 的会话文件和 JSON/RPC 模式都用它                       |
+| CBOR              | 二进制 JSON 替代格式，用于远程会话协议（packages/protocol）                             |
+| steering          | 在模型回答生成期间插入新消息改变其方向                                                  |
+| compaction        | 压缩历史上下文为摘要，避免超出模型窗口                                                  |
+| e2e test          | 端到端测试，会真实调用模型 API，默认不跑                                                |
+| husky             | git 钩子工具，本仓库用它做 pre-commit 检查                                              |
+| bare specifier    | 不带`./` 或 `/` 的导入名，如 `"@earendil-works/pi-ai"`，Node 会去 node_modules 找 |
+| symlink（软链接） | 一个指向真实文件的"快捷方式"；npm workspaces 就靠它把包互相连起来                       |
 
 ---
 
@@ -428,12 +434,12 @@ try { ... } catch (e) { ... }        // async 函数里用 try/catch 捕获错�
 
 JS 历史上有两套模块系统：
 
-| | CommonJS (CJS) | ES Modules (ESM) |
-|---|---|---|
-| 语法 | `const x = require("pkg")` | `import { x } from "pkg"` |
-| 出现 | 2009，Node 早期 | 2015 起，JS 官方标准 |
-| 加载 | 同步，运行时按需 | 静态分析（import 在顶层），异步准备 |
-| 文件扩展名 | 可省略（`require("./x")` 能找到 `x.js`） | 必须写全（`import "./x.js"`） |
+|            | CommonJS (CJS)                               | ES Modules (ESM)                    |
+| ---------- | -------------------------------------------- | ----------------------------------- |
+| 语法       | `const x = require("pkg")`                 | `import { x } from "pkg"`         |
+| 出现       | 2009，Node 早期                              | 2015 起，JS 官方标准                |
+| 加载       | 同步，运行时按需                             | 静态分析（import 在顶层），异步准备 |
+| 文件扩展名 | 可省略（`require("./x")` 能找到 `x.js`） | 必须写全（`import "./x.js"`）     |
 
 **pi 全部用 ESM。** package.json 里的 `"type": "module"` 就是在告诉 Node："这个包里的 `.js` 文件请按 ESM 解析"。没有这行，Node 会把 `.js` 当成老的 CJS。
 
@@ -465,6 +471,7 @@ Node 的步骤：
    /mnt/d/Github/node_modules
    ...
    ```
+
    一直找到文件系统的根目录为止。
 2. 在该 `node_modules` 下找**与包名完全对应的目录**。包名 `@earendil-works/pi-agent-core` 会映射到 `node_modules/@earendil-works/pi-agent-core/`（`@scope/name` 是两级目录）。
 3. 进入这个包目录，读**它自己的 `package.json` 的 `exports` 字段**（或旧的 `main` 字段），确定"`.` 这个子路径对应哪个文件"。例如 `packages/agent/package.json` 里：
@@ -477,6 +484,7 @@ Node 的步骤：
      "./node": { "import": "./dist/node.js" }   // 对应 import ".../pi-agent-core/node"
    }
    ```
+
    条件是 `import`（因为我们现在是 ESM 导入），所以最终文件是 `.../pi-agent-core/dist/index.js`。
 4. 读取该 `.js` 文件，递归解析它自己的 import，形成一个模块图。
 
@@ -504,15 +512,16 @@ node_modules/@earendil-works/
 
 这可能是本仓库最让人困惑的点，一次性讲清：
 
-| 场景 | 导入写法 | 谁在处理 | 实际加载 |
-|---|---|---|---|
-| 直接跑源码（tsx / Node 类型擦除） | `import "./main.ts"` | tsx / Node 类型擦除 | `main.ts` 源码 |
-| 编译后（tsgo） | 源码写 `./main.ts`，编译产物里变成 `./main.js` | tsgo 的 `rewriteRelativeImportExtensions` | `main.js` |
-| 打包后（esbuild） | esbuild 从 `dist/*.js` 出发 | esbuild | 内联进 bundle |
+| 场景                              | 导入写法                                          | 谁在处理                                   | 实际加载         |
+| --------------------------------- | ------------------------------------------------- | ------------------------------------------ | ---------------- |
+| 直接跑源码（tsx / Node 类型擦除） | `import "./main.ts"`                            | tsx / Node 类型擦除                        | `main.ts` 源码 |
+| 编译后（tsgo）                    | 源码写`./main.ts`，编译产物里变成 `./main.js` | tsgo 的`rewriteRelativeImportExtensions` | `main.js`      |
+| 打包后（esbuild）                 | esbuild 从`dist/*.js` 出发                      | esbuild                                    | 内联进 bundle    |
 
 关键点：**源码里写的 `.ts` 是给运行时看的，编译时会被改写成 `.js`。** 因为编译前 Node/tsx 看到 `.ts` 能直接加载；编译后 `dist/` 里只有 `.js`，所以导入路径必须也跟着改成 `.js`。`rewriteRelativeImportExtensions` 这个选项自动完成改写。
 
 这样一来：
+
 - 开发时 `npx tsx src/cli.ts` 能跑（源码带着 `.ts` 导入）。
 - 构建后 `node dist/cli.js` 也能跑（导入已被改成 `.js`）。
 
@@ -544,6 +553,7 @@ Node 按顺序匹配条件：它总带 `import`/`require`/`node`/`default` 这�
 `npm install` 远不止"下载文件"。它是一条流水线：
 
 ### 步骤 1：读说明书
+
 npm 读根 `package.json`，看到：
 
 ```jsonc
@@ -558,23 +568,29 @@ npm 读根 `package.json`，看到：
 这告诉 npm："`packages/*` 每个目录都是一个子包，请一起处理"。
 
 ### 步骤 2：解析依赖图
+
 npm 读所有子包的 `dependencies` / `devDependencies`，构建一张**依赖图**。依赖有版本范围（如 `^0.87.1`），npm 要算出每个包最终用哪个精确版本。若版本冲突，可能需要在不同层级放不同版本（node_modules 允许嵌套）。
 
 ### 步骤 3：读/写 lockfile
+
 `package-lock.json` 记录了上次安装的**精确版本 + 下载地址 + 完整性哈希**。有它就复现完全一致的依赖树；没有（或 package.json 变了）就重新向 registry 查询并更新 lockfile。
 
 ### 步骤 4：下载并解压
+
 npm 把每个包从 npm registry 下载（tarball，`.tgz`），解压到 `node_modules/<包名>/`。相同包尽量"扁平化"提升到顶层，减少重复。
 
 ### 步骤 5：为 workspace 建软链接（关键）
+
 对每个 workspace 子包，npm 在 `node_modules/<包名>` 建立**软链接**指向 `packages/<真实目录>`（就是第 11.4 节看到的那些）。这样包 A import 包 B 时，走的是源码所在的真实目录，拿到的永远是本地最新代码，无需发布。
 
 ### 步骤 6：建立可执行文件（.bin）
+
 若某个包声明了 `bin`（如 pi 的 `"pi": "dist/bundle/cli.js"`），npm 会在 `node_modules/.bin/pi` 建一个入口（软链接或 Windows 下的 `.cmd`/`.ps1` 包装脚本）。当你在终端或脚本里直接写 `pi` 时，npm/npx 会把 `node_modules/.bin` 加进 PATH，于是找到它。
 
 本仓库因为你还没构建 `dist/`，所以现在 `node_modules/.bin/pi` 可能不存在；构建后再装/链接才出现。日常本地运行直接用 `node packages/coding-agent/dist/cli.js` 即可。
 
 ### 步骤 7：运行 lifecycle scripts
+
 npm 会执行包声明的 `preinstall` / `install` / `postinstall` 等脚本。这些脚本能运行任意代码，是**安全风险点**（恶意包可借此执行命令）。
 
 本仓库用：
@@ -586,6 +602,7 @@ npm install --ignore-scripts
 `--ignore-scripts` 表示**跳过所有 lifecycle 脚本**，只做下载和解压。仓库还有 `scripts/check-runtime-deps.mjs` 等检查、`generate-coding-agent-shrinkwrap.mjs` 的白名单机制，专门审查带脚本的依赖。这是"依赖供应链安全"的实践。
 
 ### 步骤 8：husky（git 钩子）
+
 根 `package.json` 有 `"prepare": "husky"`。`prepare` 是 npm 的一个生命周期：在 `npm install` 后自动跑。husky 会安装 git 钩子（如 pre-commit 时跑检查）。因为你用了 `--ignore-scripts`，这步会被跳过——需要时手动 `npx husky` 或按项目文档处理。
 
 ### 一句话总结
@@ -616,6 +633,7 @@ $ pi
    enableCompileCache();                     // 开启 V8 编译缓存，二次启动更快
    createRequire(import.meta.url)("./cli-runtime.js");  // 加载真正的程序
    ```
+
    真正的逻辑在 `cli-runtime.js`（由 esbuild 从编译后的 `dist/cli.js` 打包而来）。
 5. **进入源码入口**。`cli-runtime.js` 对应的源码是 `src/cli.ts`，全文只有几行：
    ```ts
@@ -626,6 +644,7 @@ $ pi
    setupCli();                              // 一次性初始化（设置标题、HTTP 代理等）
    main(process.argv.slice(2));             // 把命令行参数（去掉 node 和脚本路径）交给 main
    ```
+
    `process.argv` 是 Node 给的原始参数数组：`[node路径, 脚本路径, ...用户参数]`，所以 `.slice(2)` 取用户真正传的参数。
 6. **`main()` 做这些事**（`src/main.ts`）：
    - 调用 `parseArgs()` 解析 `--help`、`--model`、`--mode` 等参数（`src/cli/args.ts`）
@@ -731,6 +750,7 @@ done
      await main(args);                                 // 否则走正常 pi 主流程
    }
    ```
+
    也就是说：`pi-test.sh` 既能跑正常 pi，也能识别实验子命令，最后都汇入第 13 节的 `main()`。
 4. **`${ARGS[@]+"${ARGS[@]}"}`** 这个写法不是笔误。在 `set -u`（未定义变量报错）下，如果 `ARGS` 是空数组，直接写 `"${ARGS[@]}"` 在某些老版本 bash 会报错。`${ARGS[@]+...}` 表示"只有 `ARGS` 已定义时才展开它"，是用在 `set -u` 脚本里安全展开可选数组的惯用法。
 
@@ -755,11 +775,11 @@ exec "$SCRIPT_DIR/node_modules/.bin/tsx" --tsconfig "$SCRIPT_DIR/tsconfig.json" 
 
 相比 `pi-test.sh`，它多了三个开发便利开关：
 
-| 开关 | 作用 |
-|---|---|
-| `--dist` | 改用 `node dist/experimental/mini/main.js`（已构建产物），不跑源码 |
-| `--fresh` | 先停掉后台常驻的 mini session server，让它重启后加载你的新代码 |
-| `--stop` | 停掉后台 server 并退出 |
+| 开关        | 作用                                                                |
+| ----------- | ------------------------------------------------------------------- |
+| `--dist`  | 改用`node dist/experimental/mini/main.js`（已构建产物），不跑源码 |
+| `--fresh` | 先停掉后台常驻的 mini session server，让它重启后加载你的新代码      |
+| `--stop`  | 停掉后台 server 并退出                                              |
 
 这里有个值得理解的机制：mini 的 session server 是**脱离父进程后台运行**的（TUI 退出后它还在）。这带来一个陷阱——server 一旦启动就固定运行当时的代码，你改了 `mini/` 下的东西后它不会自动更新，必须 `--fresh` 重启，否则客户端和服务端协议对不上。脚本用 `pkill -f "mini/server/entry"` 加上删 socket 文件（`$HOME/.pi/agent/experimental/mini.sock`）来重启。这是"常驻后台进程与源码热更新冲突"的典型例子。
 
@@ -781,6 +801,7 @@ ln -s "$PWD/scripts/auto-pi.sh" "$HOME/.local/bin/pi"
    export PI_EXPERIMENTAL="${PI_EXPERIMENTAL:-1}"   # 开发调用默认开实验特性
    exec "$dev_pi" "${args[@]}"
    ```
+
    `PI_EXPERIMENTAL=1` 会打开实验特性（`packages/coding-agent/src/core/experimental.ts` 里判断 `process.env.PI_EXPERIMENTAL === "1"`）。
 4. **`exec`**：用新进程**替换**当前 shell 进程，而不是派生子进程。好处是信号（Ctrl-C）、退出码、资源都直接传给 pi，没有中间层。
 
@@ -788,12 +809,12 @@ ln -s "$PWD/scripts/auto-pi.sh" "$HOME/.local/bin/pi"
 
 #### 13.5.5 四个脚本对比
 
-| 脚本 | 入口 | 用不用构建 | 特点 |
-|---|---|---|---|
-| `pi-test.sh` | `src/experimental/cli.ts`（源码） | 否（tsx + 源码别名） | `--no-env` 清空密钥 |
-| `pi-test.ps1` / `.bat` | `src/cli.ts`（源码） | 否 | Windows 版，`--no-env` |
-| `mini-test.sh` | `src/experimental/mini/main.ts` | 默认否，`--dist` 用构建 | `--fresh`/`--stop` 管后台 server |
-| `scripts/auto-pi.sh` | `dist/bundle/cli.js` | **是**（要求已 `npm run build`） | 软链接成 `pi`；`update`/`--stable` 转稳定版 |
+| 脚本                       | 入口                                | 用不用构建                               | 特点                                             |
+| -------------------------- | ----------------------------------- | ---------------------------------------- | ------------------------------------------------ |
+| `pi-test.sh`             | `src/experimental/cli.ts`（源码） | 否（tsx + 源码别名）                     | `--no-env` 清空密钥                            |
+| `pi-test.ps1` / `.bat` | `src/cli.ts`（源码）              | 否                                       | Windows 版，`--no-env`                         |
+| `mini-test.sh`           | `src/experimental/mini/main.ts`   | 默认否，`--dist` 用构建                | `--fresh`/`--stop` 管后台 server             |
+| `scripts/auto-pi.sh`     | `dist/bundle/cli.js`              | **是**（要求已 `npm run build`） | 软链接成`pi`；`update`/`--stable` 转稳定版 |
 
 共同点：都自解析脚本真实路径、都优先用仓库内 `node_modules/.bin` 的工具、都用 `exec` 或等价方式把参数原样透传。这是"本地开发运行器"的标准套路。
 
@@ -805,13 +826,13 @@ ln -s "$PWD/scripts/auto-pi.sh" "$HOME/.local/bin/pi"
 
 ### 14.1 内置 vs 第三方 vs 本地包
 
-| import 写法 | 解析方式 | 例子 |
-|---|---|---|
-| `import ... from "node:fs"` | Node 内置，不走磁盘 | `node:path`、`node:process` |
-| `import ... from "chalk"` | 逐级向上找 `node_modules/chalk`，读其 package.json 的 exports/main | 大量第三方库 |
-| `import ... from "@earendil-works/pi-ai"` | 找到 `node_modules/@earendil-works/pi-ai`（workspace 软链接）→ 真实目录 `packages/ai` → 其 exports | 仓库内部包 |
-| `import ... from "./tools/read.ts"` | 相对路径，直接定位文件 | 包内模块 |
-| `import("./big-module.js")` | 动态 import，运行时才加载（懒加载） | OAuth、Bedrock 等 |
+| import 写法                                 | 解析方式                                                                                                | 例子                            |
+| ------------------------------------------- | ------------------------------------------------------------------------------------------------------- | ------------------------------- |
+| `import ... from "node:fs"`               | Node 内置，不走磁盘                                                                                     | `node:path`、`node:process` |
+| `import ... from "chalk"`                 | 逐级向上找`node_modules/chalk`，读其 package.json 的 exports/main                                     | 大量第三方库                    |
+| `import ... from "@earendil-works/pi-ai"` | 找到`node_modules/@earendil-works/pi-ai`（workspace 软链接）→ 真实目录 `packages/ai` → 其 exports | 仓库内部包                      |
+| `import ... from "./tools/read.ts"`       | 相对路径，直接定位文件                                                                                  | 包内模块                        |
+| `import("./big-module.js")`               | 动态 import，运行时才加载（懒加载）                                                                     | OAuth、Bedrock 等               |
 
 ### 14.2 三个解析上下文（同一份代码，不同解析结果）
 
@@ -830,6 +851,7 @@ pi 的 `node_modules/` 里不仅有直接依赖，还有依赖的依赖。`packa
 ### 14.4 版本冲突怎么解决
 
 如果包 A 要 `foo@1`，包 B 要 `foo@2`，npm 无法在同一个 `node_modules/foo` 放两个版本。它会：
+
 - 把其中一个（通常是较顶层常用的）放顶层 `node_modules/foo`
 - 另一个放进冲突包自己的 `node_modules/foo`（`packages/A/node_modules/foo`）
 
@@ -849,6 +871,7 @@ Node 的"逐级向上查找"天然支持这种嵌套：A 先找到自己目录�
 ```
 
 `tsgo -p tsconfig.build.json` 做：
+
 - 把所有 `src/**/*.ts` 编译成 `dist/**/*.js`
 - 生成 `.d.ts` 类型声明（供别的包/编辑器用）
 - 把 `import "./main.ts"` 改写成 `import "./main.js"`（`rewriteRelativeImportExtensions`）
@@ -863,6 +886,7 @@ Node 的"逐级向上查找"天然支持这种嵌套：A 先找到自己目录�
 ```
 
 `build-coding-agent-bundle.mjs` 从**已编译的** `dist/*.js` 出发（注意：是 dist，不是 src），用 esbuild：
+
 - `bundle: true`：追踪所有 import，把内部模块内联
 - `format: "esm"`、`platform: "node"`、`target: "node22.19"`：产出 Node ESM
 - `external: [...]`：列表里的包不打进去
@@ -909,6 +933,7 @@ pi 仓库里有**两套**测试机制。
    { find: /^@earendil-works\/pi-ai$/, replacement: workspaceSourcePaths.aiIndex }
    // aiIndex = <repo>/packages/ai/src/index.ts
    ```
+
    这样测试跑的是最新源码，跳过构建，也避免"dist 过期导致测试结果不对"。
 5. 测试文件里 `import { ... } from "@earendil-works/pi-ai"` 被 alias 重定向到源码。
 6. Vitest 执行断言、收集结果、按 reporter 输出（`packages/coding-agent` 里用 `dot` + 可选 `github-actions`）。
@@ -931,6 +956,7 @@ node "$(git rev-parse --show-toplevel)/node_modules/vitest/dist/cli.js" --run te
 ```
 
 这里完全不用第三方框架：
+
 - `node --test`：Node 22 自带的测试运行器，会发现并执行指定文件。
 - 文件是 `.ts`：Node 22.18+ 默认启用类型擦除，**可以直接运行删掉类型后的 TS**（这正是仓库强制 `erasableSyntaxOnly` 的原因——否则 Node 无法擦除）。这也说明为什么源码导入要写 `.ts` 扩展名：Node 需要显式文件名。
 - 断言用 Node 内置的 `node:assert`。
@@ -962,6 +988,7 @@ node "$(git rev-parse --show-toplevel)/node_modules/vitest/dist/cli.js" --run te
 > `test.sh` = 在"没有你的配置、没有你的密钥、没有你的临时文件"的隔离环境里跑测试，保证结果可重复、无副作用。
 
 日常约定：
+
 - 全量非 e2e 测试：`./test.sh`
 - 单文件测试：在包目录下用 vitest 或 `node --test`
 - 绝不要直接跑完整 vitest 套件（仓库含 e2e 测试，一旦环境里有 endpoint/auth 就会被激活，可能产生真实调用）
@@ -974,21 +1001,21 @@ node "$(git rev-parse --show-toplevel)/node_modules/vitest/dist/cli.js" --run te
 
 ### 17.1 每个工具的角色
 
-| 工具 | 属于哪一层 | 作用 | 在本仓库怎么用 |
-|---|---|---|---|
-| **Node.js** | 运行时 | 执行 JS/TS，提供 `fs`/`http` 等 API | 版本要求 `>=22.19` |
-| **npm** | 包管理器 | 安装依赖、跑脚本、管理 monorepo | `npm install` / `npm run` |
-| **package.json** | 配置 | 声明包名、依赖、入口、脚本 | 每个包一份 + 根一份 |
-| **package-lock.json** | 配置 | 锁定依赖精确版本 | 保证全组环境一致 |
-| **node_modules** | 依赖仓库 | 存放所有依赖 + workspace 软链接 | `npm install` 生成 |
-| **TypeScript** | 语言/编译器 | 给 JS 加类型，编译成 JS | 源码全是 `.ts` |
-| **tsgo** | 构建工具 | TS 原生加速编译器 | `tsgo -p tsconfig.build.json` |
-| **esbuild** | 打包器 | 把多文件合成 bundle | `build-coding-agent-bundle.mjs` |
-| **Biome** | 质量工具 | 格式化 + lint | `npm run check` |
-| **Vitest** | 测试框架 | 跑测试（Vite 驱动，直接吃 TS） | 多数包 `vitest --run` |
-| **node --test** | 测试框架 | Node 内置测试器 | `packages/tui` |
-| **husky** | git 钩子 | 提交前自动检查 | `prepare` 脚本 |
-| **tsx** | 开发工具 | 直接运行 TS，无需构建 | `npx tsx src/cli.ts` |
+| 工具                        | 属于哪一层  | 作用                                   | 在本仓库怎么用                    |
+| --------------------------- | ----------- | -------------------------------------- | --------------------------------- |
+| **Node.js**           | 运行时      | 执行 JS/TS，提供`fs`/`http` 等 API | 版本要求`>=22.19`               |
+| **npm**               | 包管理器    | 安装依赖、跑脚本、管理 monorepo        | `npm install` / `npm run`     |
+| **package.json**      | 配置        | 声明包名、依赖、入口、脚本             | 每个包一份 + 根一份               |
+| **package-lock.json** | 配置        | 锁定依赖精确版本                       | 保证全组环境一致                  |
+| **node_modules**      | 依赖仓库    | 存放所有依赖 + workspace 软链接        | `npm install` 生成              |
+| **TypeScript**        | 语言/编译器 | 给 JS 加类型，编译成 JS                | 源码全是`.ts`                   |
+| **tsgo**              | 构建工具    | TS 原生加速编译器                      | `tsgo -p tsconfig.build.json`   |
+| **esbuild**           | 打包器      | 把多文件合成 bundle                    | `build-coding-agent-bundle.mjs` |
+| **Biome**             | 质量工具    | 格式化 + lint                          | `npm run check`                 |
+| **Vitest**            | 测试框架    | 跑测试（Vite 驱动，直接吃 TS）         | 多数包`vitest --run`            |
+| **node --test**       | 测试框架    | Node 内置测试器                        | `packages/tui`                  |
+| **husky**             | git 钩子    | 提交前自动检查                         | `prepare` 脚本                  |
+| **tsx**               | 开发工具    | 直接运行 TS，无需构建                  | `npx tsx src/cli.ts`            |
 
 ### 17.2 完整生命周期图
 
@@ -1036,18 +1063,18 @@ node "$(git rev-parse --show-toplevel)/node_modules/vitest/dist/cli.js" --run te
 
 ### 17.3 命令与链路阶段的对应
 
-| 你想做的事 | 命令 | 命中链路哪一环 |
-|---|---|---|
-| 装依赖 | `npm install --ignore-scripts` | 阶段 4 |
-| 编译所有包 | `npm run build` | 阶段 2 |
-| 改完代码快速跑源码 | `npx tsx packages/coding-agent/src/cli.ts` | 阶段 1 → 5（跳过 2） |
-| 同上，但用仓库封装脚本 | `./pi-test.sh` | 阶段 1 → 5（tsx + 源码别名；`--no-env` 清空密钥） |
-| 跑实验 mini | `./mini-test.sh` | 阶段 1 → 5（`--dist` 则走产物） |
-| 把开发版装成 `pi` 命令 | 软链接 `scripts/auto-pi.sh` | 阶段 2 产物 → 5 |
-| 跑本地构建的 pi | `node packages/coding-agent/dist/cli.js` | 阶段 2 产物 → 5 |
-| 跑全部测试 | `./test.sh` | 阶段 1（vitest 直接吃源码） |
-| 质量检查 | `npm run check` | Biome + tsgo 类型检查 |
-| 查某个包 | `npm run build --workspace=@earendil-works/pi-tui` | 阶段 2（单包） |
+| 你想做的事              | 命令                                                 | 命中链路哪一环                                       |
+| ----------------------- | ---------------------------------------------------- | ---------------------------------------------------- |
+| 装依赖                  | `npm install --ignore-scripts`                     | 阶段 4                                               |
+| 编译所有包              | `npm run build`                                    | 阶段 2                                               |
+| 改完代码快速跑源码      | `npx tsx packages/coding-agent/src/cli.ts`         | 阶段 1 → 5（跳过 2）                                |
+| 同上，但用仓库封装脚本  | `./pi-test.sh`                                     | 阶段 1 → 5（tsx + 源码别名；`--no-env` 清空密钥） |
+| 跑实验 mini             | `./mini-test.sh`                                   | 阶段 1 → 5（`--dist` 则走产物）                   |
+| 把开发版装成`pi` 命令 | 软链接`scripts/auto-pi.sh`                         | 阶段 2 产物 → 5                                     |
+| 跑本地构建的 pi         | `node packages/coding-agent/dist/cli.js`           | 阶段 2 产物 → 5                                     |
+| 跑全部测试              | `./test.sh`                                        | 阶段 1（vitest 直接吃源码）                          |
+| 质量检查                | `npm run check`                                    | Biome + tsgo 类型检查                                |
+| 查某个包                | `npm run build --workspace=@earendil-works/pi-tui` | 阶段 2（单包）                                       |
 
 ### 17.4 记住这三句话
 

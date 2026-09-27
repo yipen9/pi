@@ -1,6 +1,7 @@
 import { chmodSync, closeSync, existsSync, mkdirSync, openSync } from "node:fs";
 import { dirname } from "node:path";
 import type { DatabaseSync } from "node:sqlite";
+import type { ThinkingLevelMap } from "@earendil-works/pi-ai";
 import type { ProviderConfigInput } from "./provider-composer.ts";
 
 const DEFAULT_CONTEXT_WINDOW = 128_000;
@@ -9,6 +10,32 @@ const PROVIDER_ID_PATTERN = /^[a-z0-9](?:[a-z0-9._-]*[a-z0-9])?$/u;
 export const DEFAULT_CUSTOM_PROVIDER_API = "openai-completions" as const;
 export const CUSTOM_PROVIDER_APIS = ["openai-completions", "openai-responses", "anthropic-messages"] as const;
 export type CustomProviderApi = (typeof CUSTOM_PROVIDER_APIS)[number];
+
+const THINKING_LEVEL_ORDER = ["off", "minimal", "low", "medium", "high", "xhigh", "max"] as const;
+
+/**
+ * Thinking levels Pi derives for each custom-provider API protocol. Custom providers
+ * have no model metadata, so the selected protocol decides which levels the endpoint
+ * is assumed to understand. `off` is left absent so thinking can always be disabled:
+ * the request code then simply omits the effort field instead of sending a value the
+ * server may not accept. `xhigh` and `max` stay absent because they are model-specific.
+ */
+export const CUSTOM_PROVIDER_THINKING_LEVELS: Record<CustomProviderApi, ThinkingLevelMap> = {
+	"openai-completions": { minimal: null, low: "low", medium: "medium", high: "high" },
+	"openai-responses": { minimal: "minimal", low: "low", medium: "medium", high: "high" },
+	"anthropic-messages": { minimal: null, low: "low", medium: "medium", high: "high" },
+};
+
+/** Ordered list of thinking levels enabled by a custom provider protocol. */
+export function customProviderThinkingLevels(api: CustomProviderApi): string[] {
+	const map = CUSTOM_PROVIDER_THINKING_LEVELS[api];
+	return THINKING_LEVEL_ORDER.filter((level) => {
+		const mapped = map[level];
+		if (mapped === null) return false;
+		if (level === "xhigh" || level === "max") return mapped !== undefined;
+		return true;
+	});
+}
 
 type DatabaseSyncConstructor = new (path: string) => DatabaseSync;
 
@@ -122,10 +149,14 @@ export function customProviderToConfig(provider: CustomProvider): ProviderConfig
 		baseUrl: provider.baseUrl,
 		apiKey: provider.apiKey,
 		api: provider.api,
+		// The Anthropic client sends the key as x-api-key, but many
+		// Anthropic-compatible gateways only read Authorization: Bearer. Send both.
+		authHeader: provider.api === "anthropic-messages",
 		models: provider.models.map((model) => ({
 			id: model.id,
 			name: model.id,
-			reasoning: false,
+			reasoning: true,
+			thinkingLevelMap: CUSTOM_PROVIDER_THINKING_LEVELS[provider.api],
 			input: ["text"],
 			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
 			contextWindow: model.contextWindow,
