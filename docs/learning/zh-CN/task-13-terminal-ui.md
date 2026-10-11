@@ -1,518 +1,243 @@
 # 13. 终端 UI、输入和宽度
 
-今天独立研究终端“显示列数”与字符串长度的差别，并写一个无需模型和交互终端的复现测试。只用本篇和源码即可完成，预计 2 小时。
+> 预计时间：2 小时
+> 先修：SDK 与进程级协议（`print`、`json`、`rpc` 三种非交互模式）。本篇只需要知道 pi 有 `interactive` 模式，不需要先读 `AgentSession` 的内部实现。
 
-## 今日准备
+## 本篇你会学到
 
-需要 Node.js >= 22.19.0 和仓库依赖；未安装时在根目录执行 `npm install --ignore-scripts`。在 `packages/tui/test/` 新建 `task-13-learning.test.ts`，从 `packages/tui` 运行：
+- 解释终端程序的输入与输出：程序收到的是字节，输出的是文字和控制码。
+- 说明 `pi-tui` 的组件如何把状态变成"给定宽度下的若干行字符串"，以及渲染器如何只更新变化的行。
+- 用 `visibleWidth`、`truncateToWidth`、`sliceByColumn` 处理中文、颜色码等宽度问题，并能写一个无需模型的组件级检查。
 
-```powershell
-node --test test/task-13-learning.test.ts
+## 先用一个例子理解
+
+假设你在 80 列的终端里运行 pi，输入了一段中英文混排的长提示，然后把窗口缩小到 40 列。
+
+没有宽度处理时会发生这样的事：
+
+```text
+组件按字符数截断：text.slice(0, 40)
+"A中文B..." 的前 4 个 JS 字符是 "A中文B"，
+但它在终端里占 6 列；这一行超过了 40 列的预期，
+边框向右溢出，下一行的内容被挤乱。
 ```
 
-本篇只做组件与宽度函数测试，不运行 pi 交互模式，因此无需模型账号、tmux 或真实终端截图。
+pi 的做法是：组件收到的是"当前宽度"这个数字；它返回的每一行都必须不超过这个宽度。判断"有多宽"要用终端列数，而不是字符串长度。
 
-## 学习内容
+所以本篇的主线是：
 
-TUI 的组件把状态渲染为给定终端宽度下的字符串行。字符个数、UTF-16 字符串长度和终端占用列数并不相等；中文、组合字符、emoji、ANSI 样式会放大这个差别。输入还牵涉焦点、键位、IME 组合输入和窗口缩放。应用交互层负责把 Agent 事件变成视图，`pi-tui` 负责布局与终端渲染。排查错位时先判断是组件生成的行已超宽，还是终端显示/光标状态异常。
+1. 终端只认字节和控制码，pi 要自己把界面画出来。
+2. 组件按宽度返回行；渲染器比较前后两帧，只写变化的部分。
+3. 宽度计算要用专门的函数。
+4. 按键不能写死，要通过键位表查询。
+5. 交互模式启动时有固定的顺序，顺序错了就会出现"界面还没出来，对话框已经想弹出"之类的问题。
 
-例子：`"A中文B".length` 是 4，但可见宽度通常是 6 列：A 与 B 各 1 列，两个汉字各 2 列。再给它加 ANSI 颜色码，JS 字符串更长，可见宽度却仍应是 6。用 `slice(0, 4)` 裁剪会按 UTF-16 单元切，可能截断 emoji 或保留不完整的颜色控制序列；组件应按终端列数使用 `truncateToWidth`。
+## 核心概念
 
-## 核心源码
+**终端（terminal）**：屏幕加键盘的程序接口。程序向标准输出写入文字和控制码，从标准输入读取按键字节。终端本身不理解"组件"或"布局"，这些都要程序自己算。
 
-核心源码及问题：`packages/tui/src/utils.ts` 的 `visibleWidth`、`truncateToWidth` 怎样处理字素与控制码；`packages/tui/src/layout.ts` 如何给组件宽度；`packages/tui/src/tui.ts` 如何刷新终端；`packages/tui/src/editor-component.ts` 如何处理输入与光标；`packages/tui/src/keybindings.ts` 怎样映射按键；`packages/coding-agent/src/modes/interactive/` 怎样组合应用视图。今天先精读前两个，后几个用来给故障定位分层。
+例子：下面这行命令让终端把 `红` 显示成红色，然后恢复默认颜色。终端只是执行这些字节，并不知道它在画一个"按钮"。
 
-## TypeScript 语法小课：数组映射与渲染契约
+```text
+输出字节：ESC [ 3 1 m 红 ESC [ 0 m LF
+终端动作：切到红色 -> 写入 "红" -> 恢复默认颜色 -> 换行
+```
 
-TUI 的 `render(width)` 返回若干行字符串。TypeScript 能约束返回的是 `string[]`，却不能证明字符串的终端可见宽度；运行时还要调用 `visibleWidth`。
+**转义序列与 ANSI 码（escape sequence）**：以 `\x1b`（ESC 字符）开头的一串字节，用来控制终端，例如颜色、光标移动、同步输出。`\x1b[31m` 表示"之后的文字用红色"，`\x1b[0m` 表示"恢复默认样式"。这些字节在屏幕上不占列，但会让 JS 字符串变长。
 
-```typescript
-type Renderer = { render(width: number): string[] }; // 只描述返回形状
-const renderer: Renderer = {
-  render(width) {
-    const label = "A中文B"; // JS length 与终端列宽可能不同
-    return [width > 0 ? label : ""]; // 返回一行，真实布局仍需测量宽度
-  },
+为什么需要：如果颜色码不被识别为"不占列"，每个带颜色的字符串都会被算成很宽，边框就会对不齐。所以 pi 的宽度函数要能跳过这些字节。
+
+**组件（component）**：有 `render(width)` 方法的对象，返回一个字符串数组，每个元素是一行。它可以有 `invalidate()`，用来在状态或主题变化后清掉缓存。`pi-tui` 的 `Component` 接口定义在 `packages/tui/src/tui.ts`。
+
+为什么需要：如果每个界面片段都直接往终端写字，窗口一变宽或一变窄，就要人工改每一处。让组件只返回"给定宽度下的行"，布局变化就只需要再调用一次 `render`。
+
+例子：一个只显示一行状态的组件，宽度 8 和宽度 4 会返回不同的行。下面的 `status.render(4)` 只返回不超过 4 列的文字。这个形状就是 pi 要求的组件契约，不需要继承任何基类。
+
+**差分渲染（differential rendering）**：渲染器保存上一帧的行，新一帧出来后找出第一行和最后一行变化的位置，只重写这一段。它的目的是减少闪烁和写入量。实现主要在 `packages/tui/src/tui-main-screen.ts`，里面用 `firstChanged`、`lastChanged` 等变量记录范围。
+
+为什么需要：如果 50 行界面里只有 1 行变了，全量重写会把 50 行都送进终端。差分渲染只送那 1 行。下面"深入一点"中的例子展示了这个比较过程。
+
+**显示宽度（display width）**：文字在终端中占的列数。ASCII 字母通常占 1 列，常见中文占 2 列，ANSI 码占 0 列，有些 emoji 占 2 列。`visibleWidth` 计算的就是这个值。
+
+例子：`"A中文B"` 的 JS 长度是 4，显示宽度是 6。如果用 `.length` 判断"能不能放进 5 列"，会误判为"能放下"，实际上超出了一列。
+
+**键位表（keybindings）**：把"动作名"映射到"按键"的表。例如动作 `app.clear` 默认是 `ctrl+c`。代码查询的是动作名，用户可以在配置里改键。`pi-tui` 的表叫 `TUI_KEYBINDINGS`，`coding-agent` 的合并表叫 `KEYBINDINGS`。
+
+为什么需要：如果代码里写的是 `if (data === "\x03")`，用户就无法改键，而且 Windows 与 macOS 的默认键不同时，每个平台都要改代码。查动作名可以把差异留在键位表里。
+
+## 深入一点：组件、宽度、按键怎样配合
+
+本节不引入新概念，只把上面的六个概念连起来。
+
+### 组件的三条规则
+
+`packages/coding-agent/docs/tui.md` 对组件的要求可以归纳为三条：
+
+```text
+1. 每一行都不能超过传入的 width。
+2. 测量"可见列数"，不要测字符串长度。ANSI 码、宽字符、emoji、组合字符都会改变列数。
+3. 每一行的样式要自己带上。pi 在每行末尾会重置样式，所以下一行不会继承上一行的颜色。
+```
+
+第 3 条的意思是：每一行都要自己写 `\x1b[...m` 和对应的 `\x1b[0m`，不能指望前一行的颜色延续。
+
+三条规则的文字来自 `packages/coding-agent/docs/tui.md` 的 "Understand the component model" 一节。下面用一个例子说明每条为什么重要。
+
+- 第 1 条。组件收到 `width = 4`，内容是 `ABCDEFG`。返回 `ABCD` 是对的；返回 `ABCDEFG` 会让这一行超过 4 列，终端会自动折行，下一行的内容被挤乱。
+- 第 2 条。内容 `中文` 的 `.length` 是 2，但占 4 列。如果组件用 `.length <= width` 判断，宽度 3 时会错误地认为"放得下"。
+- 第 3 条。第 1 行写了 `\x1b[31m` 但没有写 `\x1b[0m`。第 2 行没有任何颜色码，但终端仍显示红色。pi 在每行末尾重置样式，所以第 2 行不会变红；如果组件自己不写 `\x1b[0m`，它依赖的是上一行的状态，这种依赖在行被单独重绘时就会失效。
+
+### 一帧是怎样产生的
+
+```text
+状态变化
+  -> 相关组件 invalidate()（清掉缓存）
+  -> tui.requestRender()（请求一帧，多次请求会合并）
+  -> doRender() 调用每个组件的 render(width)，得到新行数组
+  -> 与上一帧比较，找出 firstChanged 与 lastChanged
+  -> 输出 \x1b[?2026h（开始同步输出）
+  -> 只重写 firstChanged 到 lastChanged 之间的行
+  -> 输出 \x1b[?2026l（结束同步输出）
+```
+
+同步输出（`\x1b[?2026h` 与 `\x1b[?2026l`）让终端把这一段写入当作一次原子更新。它解决的是"写到一半被看到"的撕裂问题。差分渲染解决的是"每帧全量重写导致闪烁"的问题。两者一起用：只写变化的部分，并且写完整再显示。
+
+调用方不需要自己防抖。多次 `requestRender()` 会合并成一次渲染。
+
+### 一帧的逐步例子
+
+下面的组件只有两行。它不是 pi 的真实组件，只是为了看清楚"状态 -> 行 -> 比较 -> 输出"这条路。代码与输出都在本地运行过（实验 7 保存的脚本就是这份代码）。
+
+```js
+const { truncateToWidth, visibleWidth } = await import("file:///D:/Github/pi/packages/tui/src/utils.ts");
+const status = {
+  items: ["A中文B🙂", "idle"],
+  render(width) { return this.items.map((text) => truncateToWidth(text, width)); },
+  invalidate() {},
 };
-console.assert(renderer.render(8).length === 1);
+const prev = status.render(8);            // 阶段 1：用宽度 8 渲染上一帧
+status.items[1] = "running 3 tools";      // 阶段 2：状态变化
+status.invalidate();
+const next = status.render(8);            // 阶段 2：重新渲染下一帧
+let firstChanged = -1;                    // 阶段 3：找第一行和最后一行变化
+let lastChanged = -1;
+for (let i = 0; i < Math.max(prev.length, next.length); i++) {
+  const oldLine = i < prev.length ? prev[i] : "";
+  const newLine = i < next.length ? next[i] : "";
+  if (oldLine !== newLine) {
+    if (firstChanged === -1) firstChanged = i;
+    lastChanged = i;
+  }
+}
+const rows = next.slice(firstChanged, lastChanged + 1);   // 阶段 4：只取要重写的行
+console.log("stage 1 prev frame:", JSON.stringify(prev));
+console.log("stage 2 next frame:", JSON.stringify(next));
+console.log("stage 2 visible widths:", JSON.stringify(next.map((l) => visibleWidth(l))));
+console.log("stage 3 firstChanged:", firstChanged, "lastChanged:", lastChanged);
+console.log("stage 4 rows to rewrite:", JSON.stringify(rows));
+console.log("stage 4 bytes:", JSON.stringify("\x1b[?2026h" + rows.join("\r\n") + "\x1b[?2026l"));
 ```
 
-练习：记录 `"A中文B".length` 与本篇 `visibleWidth("A中文B")` 的结果；解释为什么类型正确仍会出现界面错位。
-
-
-## 完整学习资料
-
-先按下列正文完成学习，再执行本篇的动手任务。正文中原书的实验与验收题先作为案例阅读，实际动手统一放到文末；只运行本篇“今日准备”和动手任务明确指定的离线命令。章节编号保留知识主题的原编号；源码精读、示例、边界条件、常见错误和参考答案均直接收录在本文件中。开头的预计用时仅指核心主线，完整源码精读需另留时间。
-
-### 本篇共同基础
-
-以下运行图和术语均在本文件内。学习正文保留原手册的知识主题编号，但那些编号不构成本任务的阅读前置；实际操作按本篇的动手任务与验收标准执行。学习正文基于原手册注明的 `200387122ca450d6387f033949423114a270b96c` 源码基线，当前工作区若有差异，以当前源码为准。
-
-### 15 分钟主线：pi 怎样完成一件事
-
-假设用户输入“读取 demo.txt，并总结三点”。模型自己不能读取你电脑里的文件。pi 把用户问题和可用工具告诉模型；模型提出 `read` 调用；pi 在本地执行；模型拿到文件内容后才生成总结。这就是全书反复使用的同一个例子。
-
-**先看不带 TypeScript 细节的主流程（教学伪代码）：**
+本地输出（逐阶段）：
 
 ```text
-收到用户输入，把它加入当前会话
-重复：
-    用当前上下文向模型发起请求
-    收集模型的回答并把过程通知界面
-    如果回答要求执行工具：
-        校验参数，在本地执行工具，记录结果
-        继续循环，让模型看到工具结果
-    否则，检查是否还有排队输入或明确的继续决定
-    如果都没有：结束本次运行
+stage 1 prev frame: ["A中文B🙂","idle"]
+stage 2 next frame: ["A中文B🙂","runni\u001b[0m...\u001b[0m"]
+stage 2 visible widths: [8,8]
+stage 3 firstChanged: 1 lastChanged: 1
+stage 4 rows to rewrite: ["runni\u001b[0m...\u001b[0m"]
+stage 4 bytes: "\u001b[?2026hrunni\u001b[0m...\u001b[0m\u001b[?2026l"
 ```
 
-第一行确定这次任务和已有历史。模型请求只负责生成回答或提出工具调用。工具校验与执行由 pi 负责，结果回到对话后才可能有下一轮模型请求。界面接收运行事件，历史保存完成的消息；它们都与“模型请求”有关，但不是同一种数据。真实实现还处理工具并发、错误、取消、重试和压缩，后面分别讲。
+每个阶段的意思：
 
-**先分清四对容易混淆的词：**
+1. 阶段 1：`render(8)` 把 `A中文B🙂` 放进 8 列。它正好 8 列，所以不截断。`idle` 不超宽，原样返回。
+2. 阶段 2：`running 3 tools` 超过 8 列，`truncateToWidth` 截成 `runni` 加 `...`。截断后的文字外面包了重置码 `\u001b[0m`，这是 `truncateToWidth` 的行为，保证省略号不继承前面的颜色。
+3. 阶段 3：逐行比较。第 0 行相同，第 1 行不同，所以 `firstChanged = 1`、`lastChanged = 1`。
+4. 阶段 4：只把第 1 行放进输出，前后加同步输出标记。第 0 行不写入终端，终端保留原来的内容。
 
-| 两个词                | 直观区别                                           | 在“读文件并总结”中的例子                   |
-| --------------------- | -------------------------------------------------- | -------------------------------------------- |
-| 模型请求 / 用户输入   | 用户只说一次话，pi 可以多次询问模型                | 先请模型选择工具，读完文件后再请模型总结     |
-| 事件 / 消息           | 事件告诉界面过程；消息承载一次完整的对话内容       | “正在输出第几个字”是事件；完成的总结是消息 |
-| 工具调用 / 工具结果   | 调用提出想做什么；结果记录本地执行所得             | `read("demo.txt")` 是调用；文件文字是结果  |
-| 会话历史 / 模型上下文 | 历史保留记录；上下文是这一次请求实际送给模型的内容 | 分支 C 仍在文件里，沿分支 D 继续时不必送 C   |
-
+画成图，两帧的差别如下：
 
 ```text
-一次用户输入
-  → 第一次模型请求：请调用 read("demo.txt")
-  → 本地工具执行：读出文件文本
-  → 第二次模型请求：根据工具结果总结三点
-  → 没有后续工作：结束
+行  上一帧 prev（宽 8）     下一帧 next（宽 8）         是否重写
+0   A中文B🙂                A中文B🙂                    否（相同）
+1   idle                    runni...（省略号在末尾）    是（firstChanged=1, lastChanged=1）
+
+写入终端的内容：ESC[?2026h + 第 1 行 + ESC[?2026l
 ```
 
-### 附录 A：术语表
-
-> 用法：每个术语给出"一句话解释 + 首次出现的章节"。读代码遇到不认识的词，先查这里；查不到再搜源码（用英文名搜）。
-
-
-#### A.1 核心概念
-
-| 中文                  | 英文                    | 一句话                                                                                                             | 章节      |
-| --------------------- | ----------------------- | ------------------------------------------------------------------------------------------------------------------ | --------- |
-| 智能体外壳 / 运行框架 | agent harness           | 组织模型、工具、状态、界面的框架，本身不"聪明"                                                                     | 0.1       |
-| 智能体                | agent                   | "模型 + 工具 + 循环"组成的执行体                                                                                   | 0.1       |
-| 轮次                  | turn                    | 一次助手响应 + 它引发的工具执行                                                                                    | 3.3.3     |
-| 低层运行              | Agent run               | 一次`Agent.prompt()` 或 `Agent.continue()` 调用建立的生命周期；以 `agent_end` 和已等待的 listener 收尾为边界 | 3.3.3、D2 |
-| 会话 prompt 编排      | session prompt workflow | `AgentSession.prompt()` 在 `started` 后进入 `_runAgentPrompt()`；可串起 retry、压缩恢复和多个低层 Agent run  | 8、D27    |
-| 用户请求              | user request            | 用户提交一次输入；与模型请求不等价                                                                                 | 3.3.3     |
-| 模型请求              | model request           | 真正发给供应商 API 的一次请求                                                                                      | 3.3.3     |
-| 转录                  | transcript              | 发给模型看/被记录的消息序列                                                                                        | 4.1       |
-| 投影                  | projection              | 从会话树/文档到"模型实际看到的内容"的计算过程                                                                      | 9.4       |
-| 活动分支              | active branch           | 从根到当前叶子的一条路径                                                                                           | 9.1       |
-| 叶子                  | leaf                    | 会话树中的"当前位置"                                                                                               | 4.7.3     |
-| 条目                  | entry                   | 会话文件里的一行（JSONL）                                                                                          | 4.7       |
-| 会话                  | session                 | 一次对话的全部记录与状态                                                                                           | 8.1       |
-| 压缩                  | compaction              | 用摘要替换旧上下文表示的机制                                                                                       | 10        |
-| 上下文窗口            | context window          | 模型一次能接受的最大 token 量                                                                                      | 5.3       |
-| 思考级别              | thinking level          | off/minimal/low/medium/high/xhigh/max                                                                              | 5.3       |
-| 停止原因              | stop reason             | pending/stop/length/toolUse/error/aborted/deferred                                                                 | 4.3.3     |
-| 用量                  | usage                   | token 与成本统计                                                                                                   | 4.3.5     |
-
-
-#### A.2 消息与事件
-
-| 中文           | 英文                | 一句话                                             | 章节        |
-| -------------- | ------------------- | -------------------------------------------------- | ----------- |
-| Agent 消息     | AgentMessage        | 内部消息（模型消息 + 应用自定义角色）              | 4.4         |
-| 模型消息       | Message             | 供应商能理解的四角色联合                           | 4.3         |
-| 内容块         | content block       | 消息内容的最小单元（text/image/thinking/toolCall） | 4.2         |
-| 判别联合       | discriminated union | 用共同字面量字段区分成员的类型联合                 | 1.3.4       |
-| 类型收窄       | narrowing           | 判断判别字段后类型自动缩小                         | 1.3.4       |
-| 事件           | event               | 运行时广播（过程），不是消息（结果）               | 3.3.2       |
-| 队列更新       | queue update        | 排队消息变化的会话事件                             | 4.5.2       |
-| 边界（结算前） | agent_before_settle | 最后一个可行动钩子                                 | 6.2、13.3.5 |
-| 已结算         | agent_settled       | "不会再自动继续"的最终信号                         | 4.5.2、16.3 |
-| 延迟句柄       | deferred handle     | 异步应答的取回凭据                                 | 4.3.3       |
-
-
-#### A.3 工具与模型
-
-| 中文                | 英文                            | 一句话                                    | 章节  |
-| ------------------- | ------------------------------- | ----------------------------------------- | ----- |
-| 工具                | tool                            | 模型可调用的本地操作                      | 7.1   |
-| 工具定义            | ToolDefinition                  | 扩展/应用注册工具的"富"形态               | 7.1.2 |
-| 参数校验            | argument validation             | 用 typebox schema 在运行时校验调用参数    | 7.4   |
-| 前置钩子            | beforeToolCall                  | 执行前可拦截（block）的钩子               | 7.6   |
-| 后置钩子            | afterToolCall                   | 结果字段级改写的钩子                      | 7.6   |
-| 顺序 / 并行执行     | sequential / parallel execution | 工具批次的两种调度                        | 7.5   |
-| 终止提示            | terminate                       | "整批都同意时不因本批继续"的调度提示      | 7.5.4 |
-| 模型                | model                           | 模型静态元数据（api/provider/限制/价格）  | 5.2.2 |
-| 协议方言            | api                             | 供应商接口族标识（如 anthropic-messages） | 5.2.1 |
-| 供应商              | provider                        | 认证 + 模型目录 + 请求实现                | 5.2.3 |
-| 简单流式 / 完整流式 | streamSimple / stream           | 供应商无关档位 vs 协议特有选项            | 5.4   |
-| 兼容开关            | compat                          | OpenAI 兼容生态的行为微调                 | 5.5.4 |
-| 假供应商            | faux provider                   | 脚本化、离线的测试模型                    | 5.7   |
-
-
-#### A.4 会话与持久化
-
-| 中文       | 英文             | 一句话                             | 章节   |
-| ---------- | ---------------- | ---------------------------------- | ------ |
-| 会话管理器 | SessionManager   | 会话文件的对象化句柄               | 9.3    |
-| 分支会话   | branched session | 只包含"根到叶子"路径的新文件       | 9.5.2  |
-| 分支摘要   | branch summary   | 放弃某分支时生成的摘要条目         | 10.6   |
-| 上下文编辑 | context edit     | 只改"投影"、不改原始条目的追加编辑 | 9.4.4  |
-| 保留边界   | firstKeptEntryId | 压缩后从哪条开始保留               | 10.3.2 |
-| 保留预算   | keepRecentTokens | 压缩后至少保留的近期上下文         | 10.3   |
-| 预留       | reserveTokens    | 为模型回复预留的窗口               | 10.2.1 |
-| 检测点替换 | checkpoint       | 压缩条目携带的提示词/工具检查点    | 9.4.3  |
-
-
-#### A.5 扩展与集成
-
-| 中文       | 英文            | 一句话                             | 章节       |
-| ---------- | --------------- | ---------------------------------- | ---------- |
-| 上下文文件 | context files   | AGENTS.md 等纯文本指令             | 11.4.2     |
-| 项目信任   | project trust   | 允许加载项目可执行资源前的人工决定 | 11.5       |
-| 提示词模板 | prompt template | Markdown 变成`/命令`             | 12.3.2     |
-| 技能       | skill           | 目录 + SKILL.md 的按需说明书       | 12.3.3     |
-| 扩展       | extension       | 可执行 TypeScript 模块（进程权限） | 12.3.4、13 |
-| Pi 包      | Pi package      | 分发多资源的 npm/git 单元          | 12.3.6     |
-| 钳制       | clamp           | 按模型能力压低思考级别             | 5.3        |
-| 重绑       | rebind          | 会话替换后重新挂订阅/扩展绑定      | 8.6        |
-
-
-#### A.6 协议与架构（选修）
-
-| 中文     | 英文                   | 一句话                                          | 章节   |
-| -------- | ---------------------- | ----------------------------------------------- | ------ |
-| MCP      | Model Context Protocol | 外部工具/资源接入协议                           | 22     |
-| 暴露方式 | exposure               | codemode/deferred/direct 三种工具到达模型的方式 | 22.3   |
-| 工具搜索 | tool_search            | deferred 工具的"发现后再直调"机制               | 22.3   |
-| 沙箱     | codemode sandbox       | QuickJS VM + worker 的脚本执行环境              | 22.9   |
-| 面片     | facet                  | Chord 插件可独立打包到不同环境的分片            | 23.2   |
-| 服务     | service                | Chord 的类型化稳定 token（singleton/keyed）     | 23.2   |
-| 复制状态 | replicated state       | 原子发布、完整不可变值消费的状态                | 23.2   |
-| 增量跟踪 | delta tracking         | 记录/合并 JSON 操作的机制                       | 23.2   |
-| 持久执行 | durable execution      | 意图先提交、崩溃可续的执行模型                  | 23.1   |
-| 检查点   | checkpoint             | 任务每一步的持久落点                            | 23.3.1 |
-| 附着     | attachment             | 一条表现层连接绑定到一个会话                    | 24.2   |
-| 信封     | envelope               | 协议中包裹 payload 的定向记录                   | 24.3   |
-| span     | span                   | 一次操作的时间记录（遥测）                      | 25.2   |
-| lift     | lift                   | 处理组相对对照组的提升（评估）                  | 25.5   |
-| 阻断配对 | blocked pair           | 两臂未各得恰好一个分数，禁止计入头条            | 25.6   |
-
-
-#### A.7 容易混淆的成对术语
-
-| 对                                              | 区分                                                                                   |
-| ----------------------------------------------- | -------------------------------------------------------------------------------------- |
-| message vs event                                | 结果 vs 过程（3.3.2）                                                                  |
-| turn vs run                                     | 一个轮次 vs 整次运行（3.3.3）                                                          |
-| `agent_end` vs `agent_settled`              | 低层 run 结束 vs 自动工作清零（4.5.2）                                                 |
-| 声明 vs 可执行                                  | 系统消息里的工具声明 vs 运行时工具集（7.3）                                            |
-| details vs content                              | 给界面/程序 vs 给模型（14.2）                                                          |
-| 完成顺序 vs 记录顺序                            | 并发完成 vs 声明序记录（7.5.3）                                                        |
-| 停止原因`length` vs `stop`                  | 被截断 vs 正常说完（4.3.3）                                                            |
-| `AgentSession.prompt()` vs `Agent.prompt()` | 应用层输入分流/会话编排 vs 低层 Agent run 入口（8、D2、D27）                           |
-| `handled` vs `queued` vs `started`        | 输入被消费、不创建该输入自己的 run / 放入当前运行队列 / 进入会话 run 编排（8、16.5.3） |
-| 提示词模板 vs 技能                              | 一段话 vs 一套流程+文件（12.3.3）                                                      |
-| 扩展 vs Pi 包                                   | 可执行单元 vs 分发单元（12.3.6）                                                       |
-| compaction 摘要 vs branch summary               | 压缩历史 vs 放弃分支（10.6）                                                           |
-| durable cheat sheet：`replay: safe/never`     | 崩溃后重跑 vs 报 interrupted（23.4）                                                   |
-| JSONL RPC vs client/server                      | 进程内 stdio 协议 vs 跨进程服务路由（24.1）                                            |
-| 单测 vs 评估                                    | 确定性 vs 配对统计（25.1、25.6）                                                       |
+说明：
 
+- 这个例子省略了光标定位。真实的 `TuiMainScreen` 在 `packages/tui/src/tui-main-screen.ts` 中还要处理光标位置、kitty 图片和视口滚动。本例只演示"比较与范围"这一步，比较循环与真实实现的写法相同。
+- `rows.join("\r\n")` 是简化写法。真实实现在写每一行之前也会输出 `\r\n`，见 `tui-main-screen.ts` 中逐行写入的循环。
+- 阶段 4 的输出只包含变化的行。这就是"差分"的含义：没变的行不发送。
 
-#### A.8 输入与运行的层级
+### 宽度的常见陷阱
 
-不要按“用户按了一次回车”推断低层 run 或模型请求的数量。实际层级是：
+下表的数据来自实验（`visibleWidth` 的结果在本地 Node v23.9.0 上测得）。
 
-| 层级       | 代表符号                                           | 次数关系                                                                                      |
-| ---------- | -------------------------------------------------- | --------------------------------------------------------------------------------------------- |
-| 输入调用   | `AgentSession.prompt(text)`                      | 一次调用只表达一次输入尝试；结果可能是`handled`、`queued` 或 `started`                  |
-| 会话编排   | `_runAgentPrompt(messages)`                      | 只在开始处理输入时进入；在里面管理重试、压缩恢复、边界 continuation 与取消                    |
-| Agent run  | `Agent.prompt(messages)` 或 `Agent.continue()` | 一次会话编排可包含多个 run；每个低层 run 都发出自己的`agent_start` / `agent_end` 生命周期 |
-| Agent turn | `turn_start` 到 `turn_end`                     | 一个 run 可包含多个 turn；每个 turn 通常包含一次助手响应及其引发的工具执行                    |
-| 模型请求   | `streamSimple` / provider stream                 | 通常发生在助手响应阶段；自动重试会再次请求模型，压缩摘要等内部工作也可能有独立请求            |
+| 输入 | `.length` | `visibleWidth` | 说明 |
+| --- | --- | --- | --- |
+| `abc` | 3 | 3 | ASCII 每个字符 1 列 |
+| `中文` | 2 | 4 | 汉字每个 2 列 |
+| `\x1b[31m` | 5 | 0 | ANSI 码不占列 |
+| `🙂界` | 3 | 4 | emoji 2 列，汉字 2 列 |
+| `é`（e 加组合重音） | 2 | 1 | 两个码点组成一个用户看到的字符 |
 
-两个边界例子：
+结论：`.length` 只用于"有多少个 UTF-16 代码单元"这类问题，不用于布局。`slice(0, width)` 可能切断 ANSI 码或 emoji 序列，所以布局代码要用 `truncateToWidth`、`sliceByColumn`、`wrapTextWithAnsi`。
 
-- 扩展命令被消费时，`prompt()` 返回 `handled`，没有为该输入启动 `_runAgentPrompt()`；
-- `prompt()` 在 Agent 已运行时以 `steer`/`followUp` 方式排队，返回 `queued`。这条输入会影响现有流程，但它本身不是新的 `Agent.prompt()` 调用。
+下面是 8 个典型输入的测量结果（实验 8 的脚本输出）。每一列的含义：
 
-因此，统计“模型请求次数”不能数 prompt、turn 或 `agent_end`：应按 provider 请求事件/日志，或明确的测试探针计数。章节 21 的自测题也按这个区分评分。
+- `length`：JS 字符串的 `.length`，按 UTF-16 代码单元计数。
+- 码点数：`[...s].length`，按 Unicode 码点计数。
+- 字形簇数：`Intl.Segmenter` 按"用户看到的一个字符"切分后的数量。
+- `visibleWidth`：pi 计算的终端列数。
 
+| 输入（名称） | `length` | 码点数 | 字形簇数 | `visibleWidth` | 为什么是这个值 |
+| --- | --- | --- | --- | --- | --- |
+| `a`（ASCII） | 1 | 1 | 1 | 1 | 可打印 ASCII 每个 1 列 |
+| `中`（CJK） | 1 | 1 | 1 | 2 | 东亚宽字符占 2 列 |
+| `🙂`（emoji，U+1F642） | 2 | 1 | 1 | 2 | 这个 emoji 在 JS 中是一个代理对（2 个代码单元），终端占 2 列 |
+| `é`（`e` + U+0301 组合重音） | 2 | 2 | 1 | 1 | 组合重音不占列，它跟在 `e` 后面，两者合成一个字形 |
+| 家庭 emoji（三个人 + 两个 ZWJ） | 8 | 5 | 1 | 2 | ZWJ（零宽连接符，U+200D）把多个 emoji 连成一个图形，按一个 2 列图形计算 |
+| `\x1b[31m`（ANSI 颜色码） | 5 | 5 | 5 | 0 | 转义序列不显示，不占列 |
+| `Ａ`（全角 A，U+FF21） | 1 | 1 | 1 | 2 | 全角字母占 2 列 |
+| 国旗（两个区域指示符） | 4 | 2 | 1 | 2 | 两个区域指示符合成一个国旗，pi 按 2 列计算 |
 
-#### A.9 索引方式说明
+从表中可以推出两个截断错误的例子（不需要再运行）：
 
-- 想找"某行为在哪个文件" → 用 source-map；
-- 想找"某命令怎么跑" → 用 commands；
-- 想找"某现象怎么排" → 用 troubleshooting；
-- 想找"哪些练习要做" → 用 exercises-and-answers。
+- `"A中文B".slice(0, 2)` 得到 `"A中"`。`A` 占 1 列，`中` 占 2 列，共 3 列，超过了要求的 2 列。
+- `"é"` 的 `length` 是 2，但它只占 1 列。如果用 `length` 估算"有多宽"，会比实际多算一列，布局会提前换行。
 
----
+注意：表中的 `visibleWidth` 是 pi 的计算结果。真实终端对 ZWJ 家庭 emoji 与国旗的显示取决于字体与终端程序。pi 的宽度函数与终端不一致时，问题会表现为"边框偏移一列"。这一点在本地没有在真实终端上验证。
 
-### 第 17 章：终端 UI
+`sliceByColumn` 的参数是 `(line, startCol, length, strict)`：
 
-**先懂这一章**：终端屏幕会不断收到模型的新文字，也要保留用户正在编辑的输入。界面组件按照可用宽度渲染；更新时只改变必要的屏幕内容。先用一个中文长行的例子认识显示宽度，再读组件接口。
+- `startCol`：从第几列开始，从 0 计数。
+- `length`：取多少列，不是结束列。
+- `strict`：为真时，不取会超出范围的宽字符。
 
-第 15–16 章分别讲程序内和进程间的入口；本章讲人直接使用 pi 时看到的界面。入口到界面的主线到此完整，后面转向测试、排障与实际开发。
+### 宽度函数怎么选
 
-> 学完本章你能回答：
->
-> 1. `pi-tui` 的组件模型是什么？"差分渲染"与"同步输出"各解决什么问题？
-> 2. 为什么"字符长度 ≠ 终端显示宽度"？该用哪些工具函数？
-> 3. 输入、焦点与 IME（中文输入法）之间的坑在哪？
-> 4. 键位系统怎么工作？为什么不能硬编码按键判断？
-> 5. 自定义界面（widget/overlay/自定义编辑器）应该怎么做、不该怎么做？
+| 需求 | 用哪个 |
+| --- | --- |
+| 测量一行占多少列 | `visibleWidth` |
+| 把一行截到最多 N 列，超出部分用省略号 | `truncateToWidth` |
+| 取从第 `startCol` 列开始的 `length` 列 | `sliceByColumn` |
+| 按列宽换行，并保留颜色码 | `wrapTextWithAnsi` |
+| 统计字符数（不影响布局） | `.length` 或 `Array.from(text).length` |
 
-**预计学习时间**：1.5 天（偏实践：用 tmux 做交互实验）。
-**本章验证状态**：静态核对通过（`packages/coding-agent/docs/tui.md`、`keybindings.md`、`packages/tui/README.md` 与键位代码结构核对）；实验 L11 设计中。
+规则：凡是影响布局的地方，都用前四个函数。`.length` 只用于不影响屏幕位置的计算。
 
----
+### 按键：动作名、默认键和用户覆盖
 
+按键处理分三层：
 
-#### 17.1 `pi-tui`：一套独立的终端 UI 框架
+1. **动作名**：代码里只出现 `app.clear`、`app.message.followUp` 这样的名字，表示"要做什么"。
+2. **默认键**：定义在 `TUI_KEYBINDINGS`（`packages/tui/src/keybindings.ts`）和 `KEYBINDINGS`（`packages/coding-agent/src/core/keybindings.ts`）中，每项有 `defaultKeys`，平台差异也在这里处理。
+3. **用户覆盖**：用户在 agent 目录的 `keybindings.json` 中为动作指定新键。文档描述的规则是：配置值替换默认键；空数组表示禁用。
 
-`packages/tui` 是**与业务无关**的终端 UI 库（第 0 章的"核心四包"之一），`coding-agent` 的交互模式建立在它之上。它的特性清单（`packages/tui/README.md`）几乎就是"终端应用的难题列表"及其答案：
-
-| 特性                                                                        | 解决的问题                                                  |
-| --------------------------------------------------------------------------- | ----------------------------------------------------------- |
-| **可互换渲染器**（main-screen / alternate-screen，共享 `TUI` 接口） | 有的场景要保留回滚缓冲（main），有的要全屏自管（alternate） |
-| **差分渲染**（只更新变化的行/视口行）                                 | 每次全量重绘会闪烁、且浪费带宽                              |
-| **同步输出**（CSI 2026 原子更新）                                     | 帧内多行更新对用户"同时出现"，不闪                          |
-| **括号粘贴模式**（bracketed paste）                                   | 大段粘贴（>10 行）需要标记起止，避免被逐字符解释            |
-| **组件模型**（`Component.render()`）                                | 界面由可组合单元构成                                        |
-| **应用自管滚动**（alt-screen 视口支持鼠标/触控板/键盘）               | 全屏模式下回滚缓冲归应用所有                                |
-| **内联图片**（Kitty / iTerm2 图形协议）                               | 终端里显示图片                                              |
-| **自动补全**（文件路径、斜杠命令）                                    | 编辑器体验                                                  |
-
-一个最小程序（README 的 Quick Start 改写 + 注释）：
-
-```typescript
-import { ProcessTerminal, Text, TuiMainScreen, matchesKey } from "@earendil-works/pi-tui";
-
-const terminal = new ProcessTerminal();
-const tui = new TuiMainScreen(terminal);          // 具体渲染器只在这里出现
-tui.addChild(new Text("Welcome to my app!"));
-tui.setFocus(/* 某个组件 */);
-tui.addInputListener((data) => {
-	// 原始模式下 Ctrl+C 不会送 SIGINT，需要自己拦截
-	if (matchesKey(data, "ctrl+c")) { tui.stop(); process.exit(0); }
-});
-tui.start();
-```
-
-三个要点：
-
-1. **`TUI` 是共享接口**（组件管理、焦点、overlay、输入、生命周期、终端查询、渲染）；只有"构造应用"时才选具体渲染器——业务代码不绑死 main/alternate；
-2. **raw 模式下没有 SIGINT**：Ctrl+C 只是普通按键数据，必须自己拦截（这是所有终端框架的共性，不是 pi 特有）；
-3. **不要自己造第二套渲染器**（`tui.md` 原文：Do not create a second terminal renderer inside an extension）——直接画 ANSI 会与差分渲染打架。
-
-
-#### 17.2 组件模型：`render(width)` 的契约
-
-`tui.md` 的组件定义（ paraphrase + 原文要点）：
-
-- 组件为**给定宽度**渲染一个**行数组**（每行一个字符串）；
-- 可选处理键盘/鼠标输入；
-- **状态或主题变化时，必须让缓存输出失效**（`invalidate()`）。
-
-三条硬规则：
-
-```text
-1. 每一行都必须适配传入的宽度；
-2. 测量"可见终端列数"，而不是字符串长度——ANSI 转义、宽字符（CJK）、emoji、
-   组合字符都会改变显示宽度；
-3. 每一行末尾 pi 会重置样式与超链接，所以每行都要重新施加样式。
-```
-
-对应工具函数（**不要自己实现宽度处理**）：
-
-| 函数                                | 用途                                     |
-| ----------------------------------- | ---------------------------------------- |
-| `visibleWidth(text)`              | 可见列数（忽略 ANSI、按 Unicode 宽度算） |
-| `truncateToWidth(text, width)`    | 按可见宽度截断                           |
-| `sliceByColumn(text, start, end)` | 按列区间切片                             |
-| `wrapTextWithAnsi(text, width)`   | 保留 ANSI 的换行                         |
-
-渲染刷新流程：
-
-```text
-改状态 → 相关组件 invalidate() → tui.requestRender()
-（TUI 会合并多次请求，统一更新终端——不用自己防抖）
-```
-
-
-#### 17.3 内置组件库：先组合，再自造
-
-`tui.md` 点名的组件（写扩展 UI 的"标准件"）：
-
-| 分类   | 组件                                                       |
-| ------ | ---------------------------------------------------------- |
-| 内容   | `Text`、`Markdown`、`Image`、`TruncatedText`       |
-| 布局   | `Container`、`VStack`、`HStack`、`Box`、`Spacer` |
-| 输入   | `Input`、`Editor`                                      |
-| 选择   | `SelectList`（可搜索）、`SettingsList`（设置流）       |
-| 视口   | `ScrollView`（有界可滚动）                               |
-| 进行中 | `Loader`、`CancellableLoader`                          |
-| 指针   | `MouseRegion`                                            |
-
-原则：**选择、滚动、文本编辑、宽度处理都优先复用**——这些正是"看起来简单、边界极多"的模块（第 14.7 节的 `tools.ts` 示例就是 `SettingsList` + `Container` 的组合）。
-
-
-#### 17.4 输入、焦点与 IME：中文用户最关心的一节
-
-
-##### 17.4.1 按键解析与可配置键位
-
-- 用 `matchesKey()` / `Key` 解析键盘输入；解析器考虑了终端协议差异与修饰键；
-- **扩展组件应使用注入的 `KeybindingsManager`** 处理"可配置的应用动作"——而不是写死按键。
-
-
-##### 17.4.2 光标与 IME（中文输入法的正确位置）
-
-两条原文要求：
-
-```text
-A component that displays a text cursor should implement `Focusable` and place
-`CURSOR_MARKER` immediately before its visual cursor. The TUI uses that marker to position
-the hardware cursor for input method editors.
-
-Containers that wrap an `Input` or `Editor` must propagate their `focused` state to that child.
-Without propagation, Chinese, Japanese, Korean, and other IME candidate windows can appear at
-the wrong screen position.
-```
-
-翻译成场景：你自定义了一个"带边框的输入区"，把 `Input` 包在 `Box` 里。如果 `Box` 没有把"聚焦状态"传给孩子，**输入法候选框会飘到屏幕中间或左上角**——因为系统不知道真实光标在哪。修法就是两条：实现 `Focusable` + 放 `CURSOR_MARKER`；容器**传递 focused 状态**。
-
-
-##### 17.4.3 替换主编辑器：扩展 `CustomEditor`
-
-要换掉主输入框时：
-
-- **继承 `CustomEditor`**（不要从零写），它会保留应用快捷键与 agent 控制；
-- **不认识的键要转发给基类**（否则用户熟悉的快捷键失灵）；
-- 想恢复默认：清掉自定义编辑器工厂。
-
-
-#### 17.5 鼠标：全屏模式才是"应用处理"
-
-两种模式的行为差异（`tui.md`）：
-
-| 模式                     | 鼠标归属                                                    |
-| ------------------------ | ----------------------------------------------------------- |
-| 全屏（alternate screen） | 归一化事件路由到组件：可标记已处理、捕获拖拽、请求焦点/渲染 |
-| 常规模式                 | **留给终端**（终端拥有回滚缓冲），应用不要抢          |
-
-全屏内的默认路由规则：
-
-- **未处理的滚轮事件** → 滚动最近的 `ScrollView`；
-- **未处理的主键拖拽** → 保留给"转录区选择"；
-- **OSC 8 链接优先于包围它的点击区域**（点链接打开链接，不是命中父区域）。
-
-最后一条设计纪律（与你写的任何扩展交互相关）：
-
-```text
-Design every interaction with a keyboard path even when fullscreen mouse input is available.
-```
-
-**鼠标是增强，键盘是基线**——在 print/RPC/不支持鼠标的环境里，功能不能丢。
-
-#### 17.6 自定义屏幕与 overlay
-
-当内置对话框不够用时，才轮到 `ctx.ui.custom()`。它的契约（`tui.md` 原文要点）：
-
-```text
-`ctx.ui.custom()` temporarily gives one component control of the interactive area and resolves
-when that component calls the supplied completion callback.
-```
-
-一个最小形态：
-
-```typescript
-await ctx.ui.custom((tui, theme, keybindings, done) => {
-	const component = {
-		render(width: number) { return [theme.fg("accent", "按 Esc 关闭")]; },
-		invalidate() {},
-		handleInput(data: string) {
-			if (matchesKey(data, "escape")) done(undefined);   // 结束交互 → Promise resolve
-		},
-	};
-	return component;
-});
-```
-
-规则清单（全部来自官方文档，逐条重要）：
-
-| 规则                          | 说明                                                                                                       |
-| ----------------------------- | ---------------------------------------------------------------------------------------------------------- |
-| `overlay: true`             | 画在既有内容**之上**；选项控制尺寸、锚点、偏移、边距、响应式可见性                                   |
-| `OverlayHandle.setHidden()` | 临时隐藏/显示，**交互仍然活跃**（不是结束）                                                          |
-| 焦点所有权                    | 已聚焦的 overlay 会在普通渲染中**保持输入所有权**；要让别的组件收输入，必须**显式**释放/改焦点 |
-| 一实例一交互                  | 每次开始交互都**新建**组件实例；不要复用                                                             |
-| 完成方式                      | 调工厂收到的**完成回调**（它 resolve Promise 并销毁组件）                                            |
-| 禁止                          | 对`ctx.ui.custom()` 创建的 overlay 调 `OverlayHandle.hide()`                                           |
-
-定位/堆叠/焦点/响应式/动画的完整行为参考 `examples/extensions/overlay-qa-tests.ts`（仓库里最大的示例之一，专门做 QA 矩阵）——**要写复杂 overlay 前先读它**。
-
-
-#### 17.7 主题：语义色与具体色的分工
-
-
-##### 17.7.1 用传进来的 theme
-
-```typescript
-return new Text(
-	theme.style("Done!", { fg: "success", bg: "toolSuccessBg", bold: true }),
-	0, 0,
-);
-```
-
-- `theme.style()`：前景/背景 + 属性（粗体等）组合；
-- 颜色值可以是**语义 token**（accent、muted、success、warnings、errors、tool 输出、Markdown 等）或**具体 `Color`**；
-- **位置有讲究**：前景 token 放 `fg`、背景 token 放 `bg`；要"把背景色当文字色"，取具体值：`{ fg: theme.colors.userMessageBg }`；
-- 需要颜色运算用 `mixColors()`；
-- token 被主题设为"终端默认色"时，用终端自己的颜色；`theme.colors` 报"终端宣告的颜色"（没宣告则给猜测值）；`theme.appearance`（`"dark"`/`"light"`）用于决定"提亮还是压暗"；
-- pi 按终端能力把结果转成 truecolor 或 256 色；**token 每主题只转换一次**——能预算的具体色就别放进 render 路径。
-
-
-##### 17.7.2 两个"存储陷阱"
-
-```text
-Do not permanently store strings with theme colors unless invalidate() rebuilds them.
-A theme change clears render caches, but it cannot remove old ANSI colors embedded in
-application state.
-```
-
-翻译：**不要把带颜色的字符串长期存在你的状态里**——主题切换清的是渲染缓存，清不掉你状态里已固化的 ANSI 序列。要么每次渲染现算（无状态组件完全没问题），要么在 `invalidate()` 里重建。
-
-Markdown 渲染用 `getMarkdownTheme()`，保证与应用主题一致。
-
-
-#### 17.8 渲染性能与调试
-
-
-##### 17.8.1 性能纪律（`tui.md`）
-
-```text
-1. 渲染跑在交互关键路径上——把昂贵的布局/高亮按"宽度 + 内容"缓存，
-   并在 invalidate() 里清掉；
-2. 默认视图保持紧凑，细节用展开或独立屏幕呈现；
-3. 自定义工具渲染要处理 partial results，并在能安全更新时复用上一个组件。
-```
-
-
-##### 17.8.2 调试渲染问题
-
-- **`PI_TUI_WRITE_LOG` 环境变量**：捕获发给终端的原始 ANSI 流——"看得见的乱码"背后到底发了什么字节，一目了然；
-- 必测矩阵（写/改组件时）：**窄宽度、宽字符、resize 事件、主题切换、焦点迁移、常规与全屏两种模式**。
-
-
-#### 17.9 键位系统：从配置文件到代码表
-
-
-##### 17.9.1 用户视角
-
-- pi 的快捷键由**命名动作**（如 `app.session.new`）到按键的映射组成；
-- 用户在 `<agent-dir>/keybindings.json` 里覆盖：
+用户覆盖的示例（`keybindings.json` 的形式，内容为示意；它的规则已在本地验证，见下文的覆盖测试与实验 9）：
 
 ```json
 {
@@ -522,670 +247,614 @@ Markdown 渲染用 `getMarkdownTheme()`，保证与应用主题一致。
 }
 ```
 
-- 配置值**替换**该动作的默认键位；**空数组 = 禁用**；
-- `/hotkeys` 查看当前生效键位；改文件后 `/reload` 生效。
+本地运行得到的默认值（实验 5）：
 
+- `app.clear` 默认 `ctrl+c`；`app.exit` 默认 `ctrl+d`。
+- `app.message.followUp` 在 Windows 上默认 `ctrl+q`。这一点由 `useWindowsKeybindings()` 决定，Windows 与 WSL 返回真。
+- `app.suspend` 在 Windows 上默认为空数组，即禁用。
+- `app.tools.expand` 默认 `ctrl+o`。
 
-##### 17.9.2 键语法
+下表列出常用动作的默认键。"Windows 默认" 列来自实验 9 的本地运行。"非 Windows 默认" 列是读源码得到的（`packages/coding-agent/src/core/keybindings.ts` 中 `process.platform` 与 `windowsKeybindings` 分支），未在本地运行：
+
+| 动作名 | 非 Windows 默认（源码推断） | Windows 默认（本地运行） | 说明 |
+| --- | --- | --- | --- |
+| `app.interrupt` | `escape` | `escape` | 取消或中断当前操作 |
+| `app.clear` | `ctrl+c` | `ctrl+c` | 清空编辑器（启动期即可用） |
+| `app.exit` | `ctrl+d` | `ctrl+d` | 编辑器为空时退出 |
+| `app.suspend` | `ctrl+z` | `[]`（禁用） | 挂起到后台；Windows 没有这个操作 |
+| `app.message.followUp` | `alt+enter` | `ctrl+q` | 排队一条后续消息 |
+| `app.tools.expand` | `ctrl+o` | `ctrl+o` | 展开或折叠工具输出 |
+| `app.editor.external` | `ctrl+g` | `ctrl+g` | 用外部编辑器编辑输入 |
+| `app.model.select` | `ctrl+l` | `ctrl+l` | 打开模型选择器 |
+| `app.thinking.cycle` | `shift+tab` | `shift+tab` | 切换思考级别 |
+| `app.session.tree` | `[]`（无默认） | `[]`（无默认） | 打开会话树，需要用户配置 |
+| `tui.input.submit` | `enter` | `enter` | 提交输入 |
+| `tui.input.newLine` | `shift+enter`、`ctrl+j` | `shift+enter`、`ctrl+j` | 插入换行 |
+| `tui.editor.undo` | `ctrl+-` | `ctrl+z` | 撤销；Windows 分支覆盖为 `ctrl+z` |
+| `tui.select.cancel` | `escape`、`ctrl+c` | `escape`、`ctrl+c` | 取消选择 |
+| `tui.altScreen.pageUp` | `pageUp` | `pageUp` | 全屏模式向上翻一页 |
+
+读表时注意两点：
+
+- `app.session.tree` 默认是空数组。这种动作没有默认键，用户要在 `keybindings.json` 中指定，它才会生效。
+- 同一个动作名在不同平台上可能是不同的键。代码只写动作名，平台差异留在表里。
+
+覆盖测试（实验 9 的本地输出）说明了用户配置的规则：
+
+- 用户写了 `"app.exit": []`，所以 `app.exit` 的键集合为空，`matches("\x04", "app.exit")` 返回 `false`。空数组表示禁用，而不是回退到默认键。
+- 用户没有写 `app.clear`，所以它保留默认 `ctrl+c`。
+- 用户写了 `"app.session.tree": ["ctrl+shift+t", "alt+shift+t"]`，它的键集合就是这两个键。
+- 两个动作认领同一个键时，`getConflicts()` 会报告冲突。输入 `{"app.exit": "ctrl+x", "app.clear": "ctrl+x"}` 时，输出是 `[{"key":"ctrl+x","keybindings":["app.exit","app.clear"]}]`。冲突只是报告，本地运行时没有阻止加载。
+
+在代码里判断按键时，要用 `matchesKey(data, keyId)`，并且 `keyId` 应该来自动作的默认键表或键位管理器，而不是写死字符串。`AGENTS.md` 的规则是：不要写 `matchesKey(keyData, "ctrl+x")` 这样的硬编码判断，新增快捷键要加到默认键表。
+
+### 输入法与光标位置
+
+输入法（例如中文拼音）的候选框要显示在真实光标附近。终端只知道"硬件光标"的位置，所以组件要做两件事：
+
+- 实现 `Focusable` 接口（定义在 `packages/tui/src/tui.ts`）。
+- 在视觉光标前放 `CURSOR_MARKER`（同文件导出，值是 `\x1b_pi:c\x07`）。TUI 通过这个标记找到光标位置。
+
+包裹 `Input` 或 `Editor` 的容器必须把自己的 `focused` 状态传给子组件。否则候选框会出现在错误的位置。
+
+### 为什么需要原始模式（raw mode）和 SIGINT
+
+问题：终端默认是"熟模式"（cooked mode，也叫行模式）。例子：你在普通命令行里输入 `abc`，再按 Backspace 删掉 `c`。程序在你按下 Enter 之前什么都收不到，收到的是整行 `ab`。删除字符、回显文字、把 Ctrl+C 变成中断信号，都是终端驱动替程序做的。
+
+这对全屏式界面不够用。编辑器要在每个按键后立刻更新，`↑` 要用来选择历史输入，pi 要自己画光标。所以 pi 要切到原始模式（raw mode）：每个按键字节直接交给程序，驱动不再做行缓冲、不回显、也不把 Ctrl+C 变成信号。
+
+pi 的实现在 `packages/tui/src/terminal.ts` 的 `ProcessTerminal.start()`。它先保存 `process.stdin.isRaw`，再调用 `process.stdin.setRawMode(true)`，然后打开 bracketed paste。`stop()` 用保存的值恢复。`interactive-mode.ts` 的注释也写明，TUI 的 `stop()` 会恢复熟模式。
+
+最小例子（实验 10 的本地输出）：把 `\x03` 通过管道交给一个子进程。子进程的 stdin 不是终端，所以 `isTTY` 与 `setRawMode` 都是 `undefined`，`\x03` 原样到达：
 
 ```text
-modifier+key：修饰键 ctrl / shift / alt / super（可组合）
-字母 a-z；数字 0-9；
-特殊键：escape(esc) enter(return) tab space backspace delete insert clear
-        home end pageUp pageDown up down left right
-功能键 f1-f12；符号（` - = [ ] \ ; ' , . / ! @ # $ % ^ & * ( ) _ + | ~ { } : < > ?）
-示例：ctrl+shift+x、alt+ctrl+x、super+k、ctrl+1
+child isTTY: undefined setRawMode: undefined
+child got: "\u0003" [ 3 ]
 ```
 
-`super` 需要终端单独上报修饰键（通常是 Kitty 键盘协议）——不支持的终端里可能无效（第 2 章 Windows 键位配置一节也提过）。
+为什么是这个结果：管道中没有终端驱动，没有任何转换，字节 `3`（即 `\x03`）直接成为数据。这说明 `setRawMode(true)` 只在真正的终端里有作用。在真实终端的原始模式中，用户按 Ctrl+C 也会得到同一个字节，区别在于程序能不能看到它。
 
+SIGINT 是操作系统的中断信号。在熟模式下，驱动把 `\x03` 转成 SIGINT，发给前台进程。默认行为是结束进程。在原始模式下这个转换不发生，程序收到的只是字节。所以 pi 要自己用 `matchesKey` 判断 Ctrl+C，才能决定"清空编辑器"还是"退出"。
 
-##### 17.9.3 代码视角：默认表怎么组织
+Node 用 `process.on("SIGINT", handler)` 注册监听器。实验 10 的第二部分在本地 Windows 上做了一个测试：进程给自己发送 SIGINT。结果是监听器没有运行，进程以退出码 1 结束，也没有输出。这说明 Windows 上 `process.kill(process.pid, "SIGINT")` 不等于终端按下 Ctrl+C，不能用它来验证监听器。Linux、macOS 与 WSL 上真实终端的 Ctrl+C 行为未在本地验证。
 
-- `pi-tui` 提供基础表（`TUI_KEYBINDINGS`）与 `Keybindings` 接口；
-- `coding-agent` 的 `core/keybindings.ts` 合并出应用总表（`KEYBINDINGS`），其中 `app.*` 动作带 `defaultKeys` 与 `description`；
-- **平台差异**在同一处处理：`useWindowsKeybindings()` 判断 Windows 与 WSL，并调整默认值。例如：
-
-```typescript
-export const KEYBINDINGS = {
-	...TUI_KEYBINDINGS,
-	"tui.editor.undo": {
-		...TUI_KEYBINDINGS["tui.editor.undo"],
-		defaultKeys: process.platform === "win32" ? "ctrl+z" : windowsKeybindings ? "alt+z" : "ctrl+-",
-	},
-	"app.suspend": {
-		defaultKeys: process.platform === "win32" ? [] : "ctrl+z",   // Windows 上禁用挂起
-		description: "Suspend to background",
-	},
-	// ...
-};
-```
-
-
-##### 17.9.4 开发规则（来自 `AGENTS.md`）
+### 一次按键的路径
 
 ```text
-Never hardcode key checks (e.g. matchesKey(keyData, "ctrl+x")).
-Add defaults to DEFAULT_EDITOR_KEYBINDINGS or DEFAULT_APP_KEYBINDINGS so they stay configurable.
+用户按下 Ctrl+C
+  -> 终端把它作为字节 \x03 发给程序
+  -> 程序处于 raw 模式时，这只是一个字节，不会变成 SIGINT 信号
+  -> 焦点组件用 matchesKey(data, keyId) 判断字节是否命中某个动作的默认键
+  -> 命中 app.clear，调用应用层注册的处理函数
+  -> 处理函数修改状态，并调用 requestRender()
+  -> 下一帧渲染，界面更新
 ```
 
-注意：仓库规则给的是历史名称；当前代码里的实际结构是 `pi-tui` 的 `TUI_KEYBINDINGS` 与 `coding-agent` 的 `KEYBINDINGS`（见 17.9.3）。**原则不变**：新增快捷键要进默认键位表（保持可配置），代码里通过键位系统查询动作，而不是写死按键字符串。查代码时以当前表为准。
+实验 5 已验证：`matchesKey("\x03", "ctrl+c")` 为 `true`，`KEYBINDINGS["app.clear"].defaultKeys` 为 `"ctrl+c"`。
 
-Windows Terminal 可能保留或改写 Shift+Enter、Alt+Enter；从输入事件和 `packages/tui/src/keybindings.ts` 核对实际收到的键位。
+## 源码导览（按阅读顺序）
 
+| 顺序 | 文件路径（相对仓库根） | 符号 | 读的时候关注什么 |
+| --- | --- | --- | --- |
+| 1 | `packages/tui/src/utils.ts` | `visibleWidth` | 忽略 ANSI 码，按 grapheme（用户看到的一个字符）计算列数 |
+| 2 | `packages/tui/src/utils.ts` | `truncateToWidth` | 截断时保留 ANSI 码，并在末尾加省略号 `...` |
+| 3 | `packages/tui/src/utils.ts` | `sliceByColumn`、`sliceWithWidth` | 第三个参数是列数（不是结束列）；`strict` 为真时不切开超出范围的宽字符 |
+| 4 | `packages/tui/src/tui.ts` | `Component`、`Focusable`、`CURSOR_MARKER`、`TUI` | 组件契约；光标标记用于输入法候选框定位 |
+| 5 | `packages/tui/src/tui-main-screen.ts` | `TuiMainScreen` | 差分渲染；同步输出序列 `\x1b[?2026h` 与 `\x1b[?2026l` |
+| 6 | `packages/tui/src/terminal.ts` | `ProcessTerminal`、`writeLogPath` | `PI_TUI_WRITE_LOG` 如何解析为文件路径或目录 |
+| 7 | `packages/tui/src/keybindings.ts` | `TUI_KEYBINDINGS`、`Keybindings` | 基础动作表与默认键 |
+| 8 | `packages/coding-agent/src/core/keybindings.ts` | `KEYBINDINGS`、`useWindowsKeybindings`、`AppKeybindings` | 应用动作表；Windows 上 `app.message.followUp` 默认是 `ctrl+q` |
+| 9 | `packages/coding-agent/src/modes/interactive/tui-renderer.ts` | `createInteractiveTui`、`createInteractiveTuiReference` | 按模式选择渲染器；稳定引用 |
+| 10 | `packages/coding-agent/src/modes/interactive/chat-viewport.ts` | `createChatViewport` | 转录区与输入区的布局 |
+| 11 | `packages/coding-agent/src/modes/interactive/interactive-mode.ts` | `init`、`run`、`mountInteractiveTui`、`getUserInput`、`renderInitialMessages`、`rebindCurrentSession` | 启动顺序与主循环 |
 
-#### 17.10 宽度问题的本质：为什么"字符数"是错的
+建议先读 1 到 3，再读 4 和 5。第 6 到 8 读完后，用 `KEYBINDINGS` 的默认值来理解键位。第 9 到 11 只在需要理解启动顺序时读。
 
-把一段中英文混排文本按"字符数"对齐，常见三种错：
+## 走读一次完整过程
 
-| 元素                        | 字符数   | 实际列数            |
-| --------------------------- | -------- | ------------------- |
-| ASCII`abc`                | 3        | 3                   |
-| 中文`你好`                | 2        | **4**（全角） |
-| ANSI 颜色序列`\x1b31m`   | 5 个字符 | **0 列**      |
-| emoji`👨👩👧`（ZWJ 序列） | 多个码点 | 2 列                |
-| 组合音标`é`（e + ́）    | 2        | 1                   |
+下面的过程从"启动 `pi` 交互模式"开始，到"等待用户第一次输入"为止。
 
-所以：
+1. **选择渲染器。** `createInteractiveTui`（`tui-renderer.ts`）根据 `tuiMode` 返回 `TuiMainScreen` 或 `TuiAltScreen`。普通模式使用 `TuiMainScreen`，终端保留自己的滚动历史。状态变化：此时还没有任何组件挂到渲染器上。
 
-- `text.length` 只该用于"码点数量"这类场景，**不能用于布局**；
-- `slice(0, width)` 可能把 ANSI 序列或 emoji 序列**切一半**——终端显示直接坏掉；
-- 正确工具：`visibleWidth` / `truncateToWidth` / `sliceByColumn` / `wrapTextWithAnsi`（17.2 节）。
+2. **进入 `init()`。** `interactive-mode.ts` 的 `init` 先检查 `isInitialized`，已初始化则直接返回。之后注册信号处理函数，这样启动到一半按 Ctrl+C 也能退出。
 
-**测试输入清单**（写组件时固定用它们验收）：`中文标题`、`👨👩👧 家庭 emoji`、`\x1b[31m彩色\x1b[0m`、超长单行、窄宽度（如 20 列）、窗口 resize。
+3. **打印启动前的提示。** 如果有模型作用域设置，`init` 用 `console.log` 直接写到终端。此时 TUI 还没有 `start()`，这些行会留在终端的滚动历史里。
 
+4. **建组件树。** `createChatViewport`（`chat-viewport.ts`）创建转录区 `ScrollView` 与底部输入区 `VStack`。底部从上到下是待发消息、状态行、可选 widget、编辑器、可选 widget、页脚。编辑器设置了 `minSize: 3`，收缩时至少保留 3 行。状态变化：组件已创建，但还没有显示。
 
-#### 17.11 实验 L11：中文与宽度的最小复现
+5. **挂载到渲染器。** `mountInteractiveTui` 把上面的组件挂到当前渲染器。之后切换 regular 与 fullscreen 时，组件树可以重新挂到新渲染器，而组件不必重建。
 
-**实验性质**：交互实验（tmux）+ 组件级验证；不依赖真实模型。
-**验证状态**：设计中。目标（规划文档 L11）："中文、长行、缩放输入 → 终端问题最小复现"。
+6. **设置启动期按键。** 启动期间只绑定三个动作：清空或中断（`app.clear`，即 Ctrl+C）、退出（Ctrl+D）、提交（`onSubmit`）。其他键位要等后面的步骤完成后再启用。
 
+7. **启动 UI。** `ui.setFocus(...)` 设置焦点，然后 `ui.start()` 开始接收输入和渲染。代码注释说明这一步在扩展初始化之前，原因是扩展的 `session_start` 处理函数可能要弹出对话框，而对话框需要已经启动的 TUI。`isInitialized` 在这里设为 `true`。
 
-##### 材料
+8. **等待终端颜色。** 头部和启动提示会把主题色写进字符串，所以要等终端回报自己的颜色。`waitForTerminalColors` 最多等 100 毫秒，超时就用默认值，避免慢终端卡住启动。
 
-仓库自带的交互测试指引 `.pi/skills/interactive-testing.md`（AGENTS.md 要求交互测试前先读它）：
+9. **构建头部。** 头部内容由函数生成，主题变化后会重新取色。`supportsPiLogo()` 决定显示 logo 还是纯文字标题。
+
+10. **下载或定位外部工具。** `ensureTool("fd", ...)` 与 `ensureTool("rg", ...)` 并行执行。`fd` 用于自动补全，`rg` 用于 grep 工具和 bash 相关功能。下载进度通过 `showManagedToolStatus` 显示在状态行。UI 已经可见，所以下载慢也不会像"卡死"。
+
+11. **启用完整输入。** `setupKeyHandlers` 与 `setupEditorSubmitHandler` 替换启动期的按键处理。之后调用 `ui.requestRender()` 刷新一帧。
+
+12. **绑定会话和恢复历史。** `rebindCurrentSession()` 把扩展绑到当前会话，`session_start` 在这里触发。之后 `renderInitialMessages()` 把已有的会话历史渲染成组件。注释说明扩展先于历史消息显示。
+
+13. **进入 `run()` 的主循环。** `run()` 先调用 `await this.init()`，然后在后台启动模型目录刷新、版本检查和包更新检查。这些检查都不阻塞主循环。然后处理命令行传入的初始消息，最后进入 `while (true)`：`getUserInput()` 等待用户提交，再调用 `session.prompt(...)`。
+
+结果：界面可见、键位可用、会话历史已显示，程序停在 `getUserInput()` 等待第一次输入。
+
+## 动手实验
+
+以下实验都不需要模型账号，也不需要 tmux。第一个实验大约 5 分钟。
+
+### 实验 1：测量字符串长度与显示宽度
+
+目的：看到 `length` 与 `visibleWidth` 的差别。
+
+步骤：在系统临时目录写一个脚本，导入仓库里的 `utils.ts`，运行后删除脚本。
+
+PowerShell：
+
+```powershell
+$dir = Join-Path $env:TEMP ("pi-task13-" + [guid]::NewGuid())
+New-Item -ItemType Directory -Path $dir | Out-Null
+$script = Join-Path $dir "width.mjs"
+@'
+const { visibleWidth, truncateToWidth } = await import("file:///D:/Github/pi/packages/tui/src/utils.ts");
+const plain = "A中文B";
+const styled = `\x1b[31m${plain}\x1b[0m`;
+console.log("length:", plain.length, "width:", visibleWidth(plain));
+console.log("styled length:", styled.length, "width:", visibleWidth(styled));
+console.log("truncate 4:", JSON.stringify(truncateToWidth(styled, 4)), visibleWidth(truncateToWidth(styled, 4)));
+'@ | Set-Content -Path $script -Encoding utf8
+node $script 2>$null
+Remove-Item -Recurse -Force $dir
+```
+
+bash：
 
 ```bash
-tmux new-session -d -s pi-test -x 80 -y 24
-tmux send-keys -t pi-test "./pi-test.sh" Enter
-sleep 3 && tmux capture-pane -t pi-test -p
-tmux send-keys -t pi-test "输入一段中文：你好，世界 🌏" Enter
-tmux resize-window -t pi-test -x 40 -y 24   # 模拟缩放
-tmux capture-pane -t pi-test -p
-tmux kill-session -t pi-test
+D=$(mktemp -d)
+cat > "$D/width.mjs" <<'EOF'
+const { visibleWidth, truncateToWidth } = await import("file:///D:/Github/pi/packages/tui/src/utils.ts");
+const plain = "A中文B";
+const styled = `\x1b[31m${plain}\x1b[0m`;
+console.log("length:", plain.length, "width:", visibleWidth(plain));
+console.log("styled length:", styled.length, "width:", visibleWidth(styled));
+console.log("truncate 4:", JSON.stringify(truncateToWidth(styled, 4)), visibleWidth(truncateToWidth(styled, 4)));
+EOF
+node "$D/width.mjs" 2>/dev/null
+rm -rf "$D"
 ```
 
-
-##### 步骤
-
-1. 按上面流程启动、输入含中文与 emoji 的文本，观察 80 列下的换行位置；
-2. **缩放到 40 列**，再观察：文本是否重排？边框是否错位？输入光标在字中/行尾位置是否正确？
-3. 写一个**最小组件实验**（不接模型）：一个扩展，用 `visibleWidth`/`truncateToWidth` 渲染固定文本，分别用"正确工具"和"`slice` 硬切"两版对比，在 40/80 列下截图；
-4. 用 `PI_TUI_WRITE_LOG=1` 启动，找出两种实现的原始输出差异；
-5. 产出：一份"最小复现说明"——**输入文本 + 宽度 + 操作序列 + 期望/实际**（第 19 章会把这套格式用于故障报告）。
-
-
-##### 判定标准
-
-- 复现不依赖模型调用，可在组件层稳定重现；
-- 能解释错位发生在哪一层（渲染字符串生成 vs 终端显示），并给出正确工具的选择理由；
-- 缩放操作不破坏"每行必须适配宽度"的契约。
-
-
-##### 清理
-
-`tmux kill-session`；删除临时扩展；`git status` 干净。
-
-
-#### 本章源码精读
-
-> **车下内容**：本节要打开源码逐段对照，通勤（车上）时可以先跳过，直接读本章的“常见错误”和“验收题”；需要修改对应代码时再回来。 读法见[附录 L。
-
-D13 沿渲染器、视口和交互模式启动顺序读源码。读到终端宽度或输入区刷新时，再回到本章的最小复现，观察到底是布局、渲染还是键位状态发生了变化。
-
-
-
-##### D13：交互模式（TUI 装配与启动序列）精读
-
-**先懂**：交互界面启动时先创建终端组件、编辑器和会话事件订阅，然后把收到的运行事件变成屏幕更新。先找装配点和订阅点，大文件的其他渲染细节按问题定位。
+预期输出（在本地运行得到，Node v23.9.0）：
 
 ```text
-教学伪代码：准备终端与主题 → 创建消息视口和输入编辑器
-           → 绑定当前会话事件 → 接收输入并发起 prompt
-           → 用事件更新组件 → 退出时解除绑定
+length: 4 width: 6
+styled length: 13 width: 6
+truncate 4: "\u001b[31mA\u001b[0m...\u001b[0m" 4
 ```
 
-这只是启动与运行的骨架；重绘、焦点和宽度问题在第 17 章及后文独立展开。
+说明：`A中文B` 的 JS 长度是 4，但占 6 列。带颜色码后长度变成 13，宽度仍是 6。`truncateToWidth` 截到 4 列，保留了颜色码，末尾是 `...`。
 
-> 精读对象：`modes/interactive/tui-renderer.ts`、`modes/interactive/chat-viewport.ts` 与 `modes/interactive/interactive-mode.ts`（247KB！）的**装配与启动段**（`init`/`run`）与整体结构。
-> 对应主线：第 17 章（终端 UI）、第 3 章（入口）。
-> 读法：`interactive-mode.ts` 太大，**不要通读**。本篇给"结构地图 + 启动序列逐段"；其余部分（大量 selector/渲染组件）按需从地图定位。
+注意：Node 23 会打印一条 `ExperimentalWarning`（类型剥离）。上面的命令用 `2>/dev/null` 或 `2>$null` 隐藏它。Node 22.19 及以上版本也支持直接导入 `.ts` 文件。
 
----
+### 实验 2：渲染一个最小组件到字符串
 
+目的：理解"组件给定宽度返回行"的契约，并观察截断与切片。
 
-###### 0. 目录地图：交互模式由什么组成
+步骤：写一个只有 `render` 和 `invalidate` 的对象，分别用宽度 8、4、2 调用，再用 `sliceByColumn` 切几次。这个对象没有继承任何类，只要结构符合 `Component` 即可。
+
+PowerShell：
+
+```powershell
+$dir = Join-Path $env:TEMP ("pi-task13-" + [guid]::NewGuid())
+New-Item -ItemType Directory -Path $dir | Out-Null
+$script = Join-Path $dir "component.mjs"
+@'
+const { truncateToWidth, visibleWidth, sliceByColumn } = await import("file:///D:/Github/pi/packages/tui/src/utils.ts");
+const label = {
+  text: "A中文B\u{1F642}",
+  render(width) { return [truncateToWidth(this.text, width)]; },
+  invalidate() {},
+};
+for (const width of [8, 4, 2]) {
+  const [line] = label.render(width);
+  console.log(`width=${width} line=${JSON.stringify(line)} visible=${visibleWidth(line)} ok=${visibleWidth(line) <= width}`);
+}
+console.log("sliceByColumn('A中文B', 1, 2)       =", JSON.stringify(sliceByColumn("A中文B", 1, 2)));
+console.log("sliceByColumn('A中文B', 1, 1)       =", JSON.stringify(sliceByColumn("A中文B", 1, 1)));
+console.log("sliceByColumn('A中文B', 1, 1, true) =", JSON.stringify(sliceByColumn("A中文B", 1, 1, true)));
+console.log("sliceByColumn('A中文B', 0, 3, true) =", JSON.stringify(sliceByColumn("A中文B", 0, 3, true)));
+'@ | Set-Content -Path $script -Encoding utf8
+node $script 2>$null
+Remove-Item -Recurse -Force $dir
+```
+
+bash：
+
+```bash
+D=$(mktemp -d)
+cat > "$D/component.mjs" <<'EOF'
+const { truncateToWidth, visibleWidth, sliceByColumn } = await import("file:///D:/Github/pi/packages/tui/src/utils.ts");
+const label = {
+  text: "A中文B\u{1F642}",
+  render(width) { return [truncateToWidth(this.text, width)]; },
+  invalidate() {},
+};
+for (const width of [8, 4, 2]) {
+  const [line] = label.render(width);
+  console.log(`width=${width} line=${JSON.stringify(line)} visible=${visibleWidth(line)} ok=${visibleWidth(line) <= width}`);
+}
+console.log("sliceByColumn('A中文B', 1, 2)       =", JSON.stringify(sliceByColumn("A中文B", 1, 2)));
+console.log("sliceByColumn('A中文B', 1, 1)       =", JSON.stringify(sliceByColumn("A中文B", 1, 1)));
+console.log("sliceByColumn('A中文B', 1, 1, true) =", JSON.stringify(sliceByColumn("A中文B", 1, 1, true)));
+console.log("sliceByColumn('A中文B', 0, 3, true) =", JSON.stringify(sliceByColumn("A中文B", 0, 3, true)));
+EOF
+node "$D/component.mjs" 2>/dev/null
+rm -rf "$D"
+```
+
+预期输出（在本地运行得到）：
 
 ```text
-modes/interactive/
-├── interactive-mode.ts        主类（247KB）：装配、启动、编辑提交、渲染派发、选择器管理、停止
-├── tui-renderer.ts            渲染器组合根（main/alt screen + 主题样式注入 + Proxy 引用）
-├── chat-viewport.ts           布局：ScrollView 转录区 + 固定输入坞（VStack）
-├── footer-data-provider.ts    页脚数据（分支、上下文用量等）的提供者/订阅
-├── model-catalog-refresh.ts   启动时的目录刷新
-├── session-share.ts           会话分享（/share）
-├── external-editor.ts         外部编辑器（$EDITOR）
-├── components/                40+ 个 UI 组件（消息、工具、选择器、页脚、头图、主题等）
-└── theme/                     主题系统（dark/light/system、schema、控制器）
+width=8 line="A中文B🙂" visible=8 ok=true
+width=4 line="A\u001b[0m...\u001b[0m" visible=4 ok=true
+width=2 line="\u001b[0m..\u001b[0m" visible=2 ok=true
+sliceByColumn('A中文B', 1, 2)       = "中"
+sliceByColumn('A中文B', 1, 1)       = "中"
+sliceByColumn('A中文B', 1, 1, true) = ""
+sliceByColumn('A中文B', 0, 3, true) = "A中"
 ```
 
-【陷阱】"交互模式"的代码量远大于核心会话——但**职责边界很清晰**（第 17 章反复强调的"逻辑与渲染分离"）：它**只消费** `AgentSession` 的公开面（事件/状态/方法），不反向修改核心。本 D13 关注的正是这条边界的**装配方式**。
+说明：
 
----
+- 宽度 2 时，省略号只剩两个点，且所有行都满足 `visible <= width`，这就是组件契约。
+- `sliceByColumn(line, 1, 1)` 从第 1 列取 1 列。`中` 占第 1 到 2 列，非严格模式下会取出整个字符，结果宽度为 2，超过了请求的 1 列。
+- 严格模式 `strict = true` 不会切开宽字符，因此 `sliceByColumn("A中文B", 1, 1, true)` 返回空字符串。`sliceByColumn("A中文B", 0, 3, true)` 返回 `"A中"`，因为 `A` 占 1 列，`中` 占 2 列，正好 3 列。
 
+注意：这个实验只验证组件返回的字符串。它不证明真实终端的显示结果，因为终端字体、emoji 支持和 Windows Terminal 的设置都会影响最终显示。
 
-###### 第一部分：两个组合根与一个巨型类
+### 实验 3：查看 `PI_TUI_WRITE_LOG` 的解析规则
 
+目的：知道该把哪种值传给 `PI_TUI_WRITE_LOG`。
 
-##### 1. `tui-renderer.ts`：渲染器的"选择"与"注入"
+规则（来自 `packages/tui/src/terminal.ts` 的 `writeLogPath` 初始化）：
 
-【源码（完整，含重载）】
+- 如果值是一个已存在的目录，pi 会在该目录下生成 `tui-<时间戳>-<进程号>.log`。
+- 否则，值被当作文件路径直接使用。
+- 设成 `1` 不会开启任何特殊功能。`1` 会被当作文件名，pi 会在当前目录写一个名为 `1` 的文件。
 
-```typescript
-export interface InteractiveTuiOptions {
-	readonly tuiMode: "regular" | "fullscreen";
-	readonly showHardwareCursor: boolean;
-	readonly logDirectory: string;
-	readonly terminal?: Terminal;
-	readonly onRightClickPaste?: () => void;
-	readonly fullscreenCopyOnSelect?: boolean;
-	readonly fullscreenWheelScrollLines?: WheelScrollLines;
+bash 写法（指定文件路径）：
+
+```bash
+PI_TUI_WRITE_LOG="$HOME/tui-task13.log" pi
+```
+
+PowerShell 写法（指定文件路径）：
+
+```powershell
+$env:PI_TUI_WRITE_LOG = "$HOME\tui-task13.log"
+pi
+Remove-Item Env:PI_TUI_WRITE_LOG
+```
+
+bash 写法（指定目录）：
+
+```bash
+mkdir -p /tmp/pi-tui-logs && PI_TUI_WRITE_LOG=/tmp/pi-tui-logs pi
+```
+
+PowerShell 写法（指定目录）：
+
+```powershell
+New-Item -ItemType Directory -Force -Path "$env:TEMP\pi-tui-logs" | Out-Null
+$env:PI_TUI_WRITE_LOG = "$env:TEMP\pi-tui-logs"
+pi
+Remove-Item Env:PI_TUI_WRITE_LOG
+```
+
+说明：这里的 `pi` 是交互模式命令，需要模型账号才能完成一次对话。本实验只验证路径规则，没有在本地启动交互模式。若只想看原始输出，可以先启动 pi，不发送任何消息，然后退出，再打开日志文件。日志内容未在本地验证。
+
+### 实验 4：写一份最小复现说明
+
+目的：把一次界面问题写成别人能复现的格式。
+
+格式：
+
+```text
+输入文本：A中文B🙂
+终端宽度：8 列，然后缩到 4 列
+操作序列：渲染 -> 缩窄 -> 放宽
+期望：每一行的可见宽度 <= 当前宽度，省略号完整
+实际：（填写你的观察，例如某行超宽）
+层级判断：组件层（用 visibleWidth 测量）还是终端层（看 PI_TUI_WRITE_LOG 的原始字节）
+```
+
+完成后，如果组件层的测量都通过，问题更可能在布局、光标或终端状态。如果组件层就失败，先检查宽度函数的使用。
+
+### 实验 5：查看默认键位与 matchesKey
+
+目的：确认默认键位表中的值，并确认 `matchesKey` 的基本用法。
+
+步骤：在临时目录写一个脚本，导入 `KEYBINDINGS` 和 `matchesKey`，运行后删除。
+
+PowerShell：
+
+```powershell
+$dir = Join-Path $env:TEMP ("pi-task13-" + [guid]::NewGuid())
+New-Item -ItemType Directory -Path $dir | Out-Null
+$script = Join-Path $dir "keys.mjs"
+@'
+const { KEYBINDINGS } = await import("file:///D:/Github/pi/packages/coding-agent/src/core/keybindings.ts");
+const { matchesKey } = await import("file:///D:/Github/pi/packages/tui/src/keys.ts");
+console.log("platform:", process.platform);
+for (const id of ["app.clear", "app.exit", "app.message.followUp", "app.suspend", "app.tools.expand"]) {
+  console.log(id, "=>", JSON.stringify(KEYBINDINGS[id].defaultKeys));
 }
+console.log("matchesKey(ctrl+c):", matchesKey("\x03", "ctrl+c"));
+console.log("matchesKey(escape):", matchesKey("\x1b", "escape"));
+'@ | Set-Content -Path $script -Encoding utf8
+node $script 2>$null
+Remove-Item -Recurse -Force $dir
+```
 
-/** Composition root shared by coding-agent presentations. */
-// 重载把"模式→具体渲染器类型"变成编译期事实：传 tuiMode: "fullscreen" 的调用方拿到的类型就是 TuiAltScreen（能调它的特有方法）；"regular" 拿 TuiMainScreen
-export function createInteractiveTui(options: InteractiveTuiOptions & { readonly tuiMode: "fullscreen" }): TuiAltScreen;
-export function createInteractiveTui(options: InteractiveTuiOptions & { readonly tuiMode: "regular" }): TuiMainScreen;
-export function createInteractiveTui(options: InteractiveTuiOptions): TuiMainScreen | TuiAltScreen;
-export function createInteractiveTui(options: InteractiveTuiOptions): TuiMainScreen | TuiAltScreen {
-	const terminal = options.terminal ?? new ProcessTerminal();
-	if (options.tuiMode === "fullscreen") {
-		// 主题通过闭包而非参数：样式函数直接引用模块级 theme 单例（theme.bg(...)）——主题是渲染期读取的全局状态（第 17.7 节"不要在渲染路径外缓存带色字符串"的实践背景：theme 单例在切换时整体替换/失效）
-		const styleSearchMatch = (text: string) => theme.bg("searchMatchBg", theme.fg("searchMatchText", text));
-		return new TuiAltScreen(terminal, options.showHardwareCursor, options.logDirectory, {
-			searchMatchStyle: (text) => theme.underline(styleSearchMatch(text)),
-			searchCurrentMatchStyle: (text) => theme.bold(theme.inverse(styleSearchMatch(text))),
-			searchNavigationButtonStyle: (text, hovered) => (hovered ? theme.underline(text) : text),
-			scrollToEndIndicator: () => {
-				// 全屏渲染器的行为全部"依赖注入"：搜索高亮样式（用了主题的语义色 + 下划线/反显修饰）、"跳到最新"的指示器（keyDisplayText 生成快捷键提示——键位系统进 UI 文案）、打开 URL（openBrowser 平台工具）、右键粘贴、选择复制、滚轮行数、"复制成功/失败消息"的回传
-				const shortcut = keyDisplayText("tui.altScreen.bottom");
-				const label = ` ↓ Jump to latest message${shortcut ? ` · ${shortcut}` : ""} `;
-				return theme.bg("selectedBg", theme.fg("text", label));
-			},
-			openUrl: openBrowser,
-			onRightClickPaste: options.onRightClickPaste,
-			copyOnSelect: options.fullscreenCopyOnSelect,
-			wheelScrollLines: options.fullscreenWheelScrollLines ?? "auto",
-			// copySelection 返回 true 或错误字符串（成功/失败两种类型并存的返回值）——调用方（renderer 内部）据此决定提示什么
-			copySelection: async (text) => {
-				try { await copyToClipboard(text); return true; }
-				catch (error) { return error instanceof Error ? error.message : String(error); }
-			},
-		});
-	}
-	return new TuiMainScreen(terminal, options.showHardwareCursor, options.logDirectory);
+bash：
+
+```bash
+D=$(mktemp -d)
+cat > "$D/keys.mjs" <<'EOF'
+const { KEYBINDINGS } = await import("file:///D:/Github/pi/packages/coding-agent/src/core/keybindings.ts");
+const { matchesKey } = await import("file:///D:/Github/pi/packages/tui/src/keys.ts");
+console.log("platform:", process.platform);
+for (const id of ["app.clear", "app.exit", "app.message.followUp", "app.suspend", "app.tools.expand"]) {
+  console.log(id, "=>", JSON.stringify(KEYBINDINGS[id].defaultKeys));
 }
+console.log("matchesKey(ctrl+c):", matchesKey("\x03", "ctrl+c"));
+console.log("matchesKey(escape):", matchesKey("\x1b", "escape"));
+EOF
+node "$D/keys.mjs" 2>/dev/null
+rm -rf "$D"
 ```
 
-【注解（三个设计点）】
+预期输出（在 Windows 本地运行得到，`platform` 因系统而异）：
 
-1. **重载把"模式→具体渲染器类型"变成编译期事实**：传 `tuiMode: "fullscreen"` 的调用方拿到的类型就是 `TuiAltScreen`（能调它的特有方法）；`"regular"` 拿 `TuiMainScreen`。**联合返回类型让调用方各自收窄**——比"返回基接口 + 运行时断言"更安全。
-2. **全屏渲染器的行为全部"依赖注入"**：搜索高亮样式（用了主题的语义色 + 下划线/反显修饰）、"跳到最新"的指示器（`keyDisplayText` 生成快捷键提示——**键位系统进 UI 文案**）、**打开 URL**（`openBrowser` 平台工具）、右键粘贴、选择复制、滚轮行数、"复制成功/失败消息"的回传。
-   - 【陷阱】`copySelection` 返回 **`true` 或错误字符串**（成功/失败两种类型并存的返回值）——调用方（renderer 内部）据此决定提示什么。**"布尔 + 原因"的合并形态**在小接口里很常见；如果你写类似 API，注意消费端要能区分。
-3. **主题通过闭包而非参数**：样式函数直接引用模块级 `theme` 单例（`theme.bg(...)`）——**主题是渲染期读取的全局状态**（第 17.7 节"不要在渲染路径外缓存带色字符串"的实践背景：`theme` 单例在切换时整体替换/失效）。
+```text
+platform: win32
+app.clear => "ctrl+c"
+app.exit => "ctrl+d"
+app.message.followUp => "ctrl+q"
+app.suspend => []
+app.tools.expand => "ctrl+o"
+matchesKey(ctrl+c): true
+matchesKey(escape): true
+```
 
+说明：在 Linux 或 macOS 上，`app.message.followUp` 应为 `"alt+enter"`，这是按 `useWindowsKeybindings()` 分支推断的，未在本地验证。
 
-###### 1.1 `createInteractiveTuiReference`：可替换渲染器的稳定引用
+### 实验 6：检查宽度契约（组件层回归检查）
 
-【源码（节选）】
+目的：用固定的输入和宽度，验证 `truncateToWidth` 与 `wrapTextWithAnsi` 的输出都满足"每行不超过宽度"。这是写组件时最基本的回归检查。
 
-```typescript
-/** Stable reference for components while InteractiveMode replaces the active renderer. */
-// 要解决的问题：组件在构造时拿到 TUI 引用；但用户可以在运行时切换模式（regular ↔ fullscreen）——渲染器对象被整体替换，旧引用会调用到"死对象"
-export function createInteractiveTuiReference(getTui: () => TUI): TUI {
-	return new Proxy({} as TUI, {
-		get: (_target, property) => {
-			// 这是"稳定句柄 + 可变实现"模式的又一实现（对比第 23 章 Chord 的服务 facade、D5 的 extensionRunnerRef）：组件永远持有 Proxy，实现随便换
-			const tui = getTui();
-			// 非函数属性：每次读时实时取（Reflect.get）
-			const value = Reflect.get(tui, property, tui);
-			if (typeof value !== "function") return value;
-			let methodTui = tui;
-			let method = value;
-			return (...args: unknown[]) => {
-				const currentTui = getTui();
-				// 方法：返回一个闭包，每次调用时检查"渲染器是否被替换"（currentTui !== methodTui）——被替换则重新取方法并换绑 this（Reflect.apply(method, methodTui, args)）；未替换则复用上次的方法引用（少一次 Reflect.get 的微优化）
-				if (currentTui !== methodTui) {
-					// 重新取方法并换绑
-					const currentMethod = Reflect.get(currentTui, property, currentTui);
-					if (typeof currentMethod !== "function") throw new TypeError(...);
-					methodTui = currentTui;
-					method = currentMethod;
-				}
-				return Reflect.apply(method, methodTui, args);
-			};
-		},
-		set: (_target, property, value) => Reflect.set(getTui(), property, value, getTui()),
-		has: (_target, property) => Reflect.has(getTui(), property),
-		// set/has/getPrototypeOf 全部透传给当前渲染器（保持对象语义完整）
-		getPrototypeOf: () => Reflect.getPrototypeOf(getTui()),
-	});
+步骤：对 4 组输入、宽度 1 到 20 逐一截断，并检查每行的 `visibleWidth`。另外对 `wrapTextWithAnsi` 的结果做同样的检查。
+
+输入清单（与实际界面问题对应）：
+
+- `中文标题`：宽字符。
+- 家庭 emoji（由 `\u{1F468}\u200D\u{1F469}\u200D\u{1F467}` 组成，三个人加两个零宽连接符）：多码点序列。
+- `\x1b[31m彩色\x1b[0m`：带 ANSI 颜色码。
+- 一段很长的中英文混排单行：超长输入。
+
+PowerShell：
+
+```powershell
+$dir = Join-Path $env:TEMP ("pi-task13-" + [guid]::NewGuid())
+New-Item -ItemType Directory -Path $dir | Out-Null
+$script = Join-Path $dir "contract.mjs"
+@'
+const { truncateToWidth, visibleWidth, wrapTextWithAnsi } = await import("file:///D:/Github/pi/packages/tui/src/utils.ts");
+const inputs = [
+  "中文标题",
+  "\u{1F468}\u200D\u{1F469}\u200D\u{1F467} 家庭 emoji",
+  "\x1b[31m彩色\x1b[0m",
+  "这是一段很长很长的单行文本 with ASCII and 中文混排 long enough to need truncation",
+];
+let failures = 0;
+for (const text of inputs) {
+  for (let width = 1; width <= 20; width++) {
+    const line = truncateToWidth(text, width);
+    if (visibleWidth(line) > width) { failures++; console.log("FAIL", JSON.stringify(text), width, JSON.stringify(line)); }
+  }
+  for (const line of wrapTextWithAnsi(text, 10)) {
+    if (visibleWidth(line) > 10) { failures++; console.log("WRAP FAIL", JSON.stringify(line)); }
+  }
 }
+console.log("cases:", inputs.length * 20, "+ wrap checks");
+console.log("failures:", failures);
+console.log("family emoji visibleWidth:", visibleWidth("\u{1F468}\u200D\u{1F469}\u200D\u{1F467}"));
+console.log("wrap 10 of 中文标题中文:", JSON.stringify(wrapTextWithAnsi("中文标题中文", 10)));
+'@ | Set-Content -Path $script -Encoding utf8
+node $script 2>$null
+Remove-Item -Recurse -Force $dir
 ```
 
-【注解】
+bash：
 
-- **要解决的问题**：组件在构造时拿到 `TUI` 引用；但**用户可以在运行时切换模式（regular ↔ fullscreen）**——渲染器对象被整体替换，旧引用会调用到"死对象"。
-- **解法**：Proxy 包装"动态取当前渲染器"的 getter：
-  - **方法**：返回一个闭包，每次调用时检查"渲染器是否被替换"（`currentTui !== methodTui`）——被替换则**重新取方法并换绑 `this`**（`Reflect.apply(method, methodTui, args)`）；未替换则复用上次的方法引用（**少一次 Reflect.get** 的微优化）。
-  - **非函数属性**：每次读时实时取（`Reflect.get`）。
-  - `set`/`has`/`getPrototypeOf` 全部透传给当前渲染器（保持对象语义完整）。
-- 【陷阱】这是**"稳定句柄 + 可变实现"**模式的又一实现（对比第 23 章 Chord 的服务 facade、D5 的 `extensionRunnerRef`）：组件永远持有 Proxy，实现随便换。**代价**：每次属性访问多一层（热路径上的属性读会被放大——所以方法路径做了缓存）。读这一段你要能回答："为什么不能直接让组件每次去 `getTui()`？"——【答】组件是**第三方（扩展）写的**，只能收一个 TUI 对象；Proxy 让它们"不用改代码"就获得动态性。
-
-
-##### 2. `chat-viewport.ts`：转录区 + 输入坞的固定布局
-
-【源码（完整）】
-
-```typescript
-export interface ChatViewport {
-	readonly root: Component;
-	readonly transcript: ScrollView;
+```bash
+D=$(mktemp -d)
+cat > "$D/contract.mjs" <<'EOF'
+const { truncateToWidth, visibleWidth, wrapTextWithAnsi } = await import("file:///D:/Github/pi/packages/tui/src/utils.ts");
+const inputs = [
+  "中文标题",
+  "\u{1F468}\u200D\u{1F469}\u200D\u{1F467} 家庭 emoji",
+  "\x1b[31m彩色\x1b[0m",
+  "这是一段很长很长的单行文本 with ASCII and 中文混排 long enough to need truncation",
+];
+let failures = 0;
+for (const text of inputs) {
+  for (let width = 1; width <= 20; width++) {
+    const line = truncateToWidth(text, width);
+    if (visibleWidth(line) > width) { failures++; console.log("FAIL", JSON.stringify(text), width, JSON.stringify(line)); }
+  }
+  for (const line of wrapTextWithAnsi(text, 10)) {
+    if (visibleWidth(line) > 10) { failures++; console.log("WRAP FAIL", JSON.stringify(line)); }
+  }
 }
-
-/** Shared fullscreen transcript and fixed input-dock layout. */
-export function createChatViewport(options: ChatViewportOptions): ChatViewport {
-	const transcript = new ScrollView(options.document, {
-		// 顶部 = ScrollView（转录区），follow: "end"（自动跟随尾部——流式输出时滚到底）、primary: true（主视口——键盘翻页/搜索的默认目标）、overscroll: "chain"（到边界后把滚动"链"给外层——第 17.5 节的滚动语义）
-		follow: "end",
-		primary: true,
-		overscroll: "chain",
-		scrollbar: options.scrollbar ?? "auto",
-		...(options.scrollbarTrackStyle === undefined ? {} : { scrollbarTrackStyle: options.scrollbarTrackStyle }),
-		...(options.scrollbarThumbStyle === undefined ? {} : { scrollbarThumbStyle: options.scrollbarThumbStyle }),
-	});
-	const dock = new VStack([
-		// minSize: 3 是编辑器的"不可压缩底线"（别人 shrink 到 0 时它也要保住三行——收缩优先级通过 minSize 表达）
-		{ component: options.pendingMessages, shrink: 1, minSize: 0 },
-		{ component: options.status, shrink: 1, minSize: 0 },
-		...(options.widgetsAbove === undefined ? [] : [{ component: options.widgetsAbove, shrink: 1, minSize: 0 }]),
-		// 底部 = VStack（固定输入坞），顺序从上有：待发消息区 → 状态行 → 用户 widget（上）→ 编辑器（minSize: 3——至少三行） → 用户 widget（下）→ 页脚
-		{ component: options.editor, shrink: 1, minSize: 3 },
-		...(options.widgetsBelow === undefined ? [] : [{ component: options.widgetsBelow, shrink: 1, minSize: 0 }]),
-		{ component: options.footer, shrink: 1, minSize: 0 },
-	]);
-	return {
-		transcript,
-		root: new VStack([
-			// 根 = 垂直两段：转录区 grow: 1（吃掉剩余空间）+ 输入坞 basis: "auto"（按内容需要）
-			{ component: transcript, basis: 0, grow: 1, shrink: 1, minSize: 1 },
-			{ component: dock, basis: "auto", grow: 0, shrink: 1, minSize: 1 },
-		]),
-	};
-}
+console.log("cases:", inputs.length * 20, "+ wrap checks");
+console.log("failures:", failures);
+console.log("family emoji visibleWidth:", visibleWidth("\u{1F468}\u200D\u{1F469}\u200D\u{1F467}"));
+console.log("wrap 10 of 中文标题中文:", JSON.stringify(wrapTextWithAnsi("中文标题中文", 10)));
+EOF
+node "$D/contract.mjs" 2>/dev/null
+rm -rf "$D"
 ```
 
-【注解（布局的四个声明）】
+预期输出（在本地 bash 运行得到；PowerShell 版本未单独运行，脚本内容相同）：
 
-1. **顶部 = ScrollView（转录区）**，`follow: "end"`（**自动跟随尾部**——流式输出时滚到底）、`primary: true`（主视口——键盘翻页/搜索的默认目标）、`overscroll: "chain"`（到边界后把滚动"链"给外层——第 17.5 节的滚动语义）。
-2. **底部 = VStack（固定输入坞）**，顺序从上有：待发消息区 → 状态行 → 用户 widget（上）→ **编辑器（`minSize: 3`——至少三行）** → 用户 widget（下）→ 页脚。
-   - 【陷阱】`minSize: 3` 是编辑器的"不可压缩底线"（别人 shrink 到 0 时它也要保住三行——收缩优先级通过 minSize 表达）。
-   - 【陷阱】widget 的插入用**条件展开**（`...(x === undefined ? [] : [...])`）——undefined 时不占布局（不是"渲染空组件"）；**布局数组由"存在的组件"构成**。
-3. **根 = 垂直两段**：转录区 `grow: 1`（吃掉剩余空间）+ 输入坞 `basis: "auto"`（按内容需要）。**"上面弹性、下面自适应"**是聊天类 TUI 的经典骨架。
-4. 滚动条样式**由调用方注入**（track/thumb 两个可选函数——主题语义色在组合根组装，第 1 节同款）。
-
-【跳转】`ScrollView` 与 `VStack` 的完整语义（follow/primary/overscroll/个字段）在 `packages/tui`（第 17 章 + tui README）；这里只需读懂"谁在上、谁弹性、谁保底"。
-
----
-
-> D13 第一部分到此。第二部分：`InteractiveMode` 的字段总览、`init()` 的启动序列（12 步逐段）、`run()` 的主循环与异步检查、与核心的边界总结。
-
----
-
-
-###### 第二部分：`InteractiveMode` 的字段、启动序列与主循环
-
-
-##### 3. 字段总览：一个 TUI 应用的全部状态
-
-`InteractiveMode` 的字段（源码 447-501 行，按职责分组）：
-
-| 组        | 字段（节选）                                                                                                                                                                                                            | 说明                                                           |
-| --------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------- |
-| 运行时    | `runtimeHost`、`renderer`、`ui`、`mainScreenRenderState`                                                                                                                                                        | 会话运行时 + 当前渲染器 + TUI 接口 + main-screen 渲染态        |
-| 组件树    | `loadedResourcesContainer`、`chatContainer`、`documentContainer`、`transcriptScrollView`、`fullscreenLayoutRoot`、`pendingMessagesContainer`、`statusContainer`、`editorContainer`、`footerContainer` | **每个区域一个容器**（第 2 节的输入坞就是这些容器拼的）  |
-| 编辑器    | `defaultEditor`（`CustomEditor`）、`editor`（`ActiveEditor`）、`editorComponentFactory`、`autocompleteProvider(+Wrappers)`、`fdPath`                                                                      | 默认编辑器与"当前活动编辑器"分离（扩展可替换——第 17.4.3 节） |
-| 选择器    | `activeSelectorToken`、`activeSelectorDispose`                                                                                                                                                                      | "同一时刻只能有一个选择器"的令牌与释放器                       |
-| 键位/版本 | `keybindings`、`version`                                                                                                                                                                                            | 键位管理器与版本号（头部/通知用）                              |
-| 生命周期  | `isInitialized`、`onInputCallback`、`pendingUserInputs`                                                                                                                                                           | 初始化幂等 +**输入 Promise 的 resolver** + 排队输入      |
-| 状态指示  | `idleStatus`、`activeStatusIndicator`、`activeWorkingIndicatorEmbedded`、`workingMessage/Visible/IndicatorOptions`、`hiddenThinkingLabel`                                                                     | 忙碌/空闲指示器族                                              |
-| 交互计时  | `lastSigintTime`、`lastEscapeTime`                                                                                                                                                                                  | **双击检测**（Ctrl+C 两次退出、Esc 两次…）              |
-| 展示开关  | `changelogMarkdown`、`startupNoticesShown`、`anthropicSubscriptionWarningShown`、`managedToolStatusStarted`                                                                                                     | "只提示一次"的旗标族                                           |
-| 流式渲染  | `streamingComponent`、`entriesRenderedByBoundaryCompaction`（Set）                                                                                                                                                  | 当前流式组件引用 +**压缩边界已渲染条目的去重集**         |
-
-- 【陷阱】`entriesRenderedByBoundaryCompaction` 的命名与类型（Set<string></string>）暗示一个真实需求：**压缩后同一批"保留条目"可能被重复渲染**（压缩事件 + 投影刷新两条路径）——用条目 id 去重。读 UI 问题时这是"消息重复显示"类 bug 的第一嫌疑点。
-- 【陷阱】`pendingUserInputs` + `onInputCallback`：**交互循环的"输入侧"是一个 Promise 的 resolver 对**（`getUserInput` 返回新 Promise 并保存 resolve；编辑器提交时 resolve）——**把"事件驱动的提交"桥接成"顺序的 await 循环"**。这是 TUI 与异步主循环结合的经典写法（下面 `run()` 的 while 直接读它）。
-- 【陷阱】大量"只提示一次"旗标：**状态机式的 UI 一致性**（避免重复通知）；它们都是布尔/时间戳的平凡类型，但**每个都对应一个"重复触发"的坑**。
-
-
-##### 4. `init()`：十二步启动序列
-
-`init()`（932-1134 行）是全书**最长的单一函数之一**。按执行顺序拆成十二步（每步都有"为什么必须是这个顺序"）：
-
-
-###### 步骤 1-2：幂等守卫与信号处理
-
-```typescript
-	async init(): Promise<void> {
-		if (this.isInitialized) return;
-		this.registerSignalHandlers();
+```text
+cases: 80 + wrap checks
+failures: 0
+family emoji visibleWidth: 2
+wrap 10 of 中文标题中文: ["中文标题中","文"]
 ```
 
-- **幂等**（`run()` 与手动初始化可能都调）；信号处理**最早注册**（初始化中途被 Ctrl+C/SIGTERM 也要能优雅退——覆盖"启动一半"的窗口）。
+说明：
 
+- `failures: 0` 表示 80 组截断结果都满足契约。如果出现 `FAIL` 行，说明组件或宽度函数有问题，先修宽度处理，再看布局。
+- 家庭 emoji 由三个人形加两个零宽连接符（ZWJ，`\u200D`）组成，终端通常显示为一个 2 列的图形。`visibleWidth` 返回 2，与此一致。不同终端对这类序列的支持不同，所以界面测试要在目标终端上确认。
+- `wrapTextWithAnsi("中文标题中文", 10)` 第一行是 5 个汉字，占 10 列；第二行是剩下的 `文`。
 
-###### 步骤 3-4：变更日志与模型作用域提示
+## 宽度回归检查清单
 
-```typescript
-		this.changelogMarkdown = this.getChangelogForDisplay();
-		if (this.session.scopedModels.length > 0 && this.shouldShowStartupDetails()) {
-			// ...（拼模型列表 + 循环键提示 → console.log 到"启动前"的终端）
+写或改组件时，用下面的输入和宽度做检查。它们对应前面实验中出现过的问题类型。
+
+| 输入 | 宽度 | 检查什么 |
+| --- | --- | --- |
+| `中文标题` | 20、8、4 | 宽字符不超宽，不切半个汉字 |
+| 家庭 emoji 序列 | 20、4 | 不被切断，不超宽 |
+| `\x1b[31m彩色\x1b[0m` | 20、4 | 颜色码不占列，末尾样式被重置 |
+| 超长单行 | 20 | 截断后有省略号，且不超宽 |
+| 同一输入 | 20 缩到 4 再放到 20 | 缩放前后结果一致，没有残留旧行 |
+
+最后一行对应"窗口缩放"。在组件层，它可以用多次调用 `render(width)` 模拟；在真实终端中，需要人工缩放窗口观察。
+
+## 自测题
+
+1. 为什么 `"A中文B".length` 是 4，而 `visibleWidth("A中文B")` 是 6？
+2. 组件的 `render(width)` 需要满足什么规则？它为什么不能只用 `text.slice(0, width)`？
+3. 差分渲染比较的是什么？它为什么需要 `invalidate()`？
+4. 为什么代码里应该写 `KEYBINDINGS` 的动作名，而不是写 `matchesKey(data, "ctrl+c")`？
+5. 交互模式为什么先调用 `ui.start()`，再调用 `rebindCurrentSession()`？
+
+## 常见错误
+
+1. **现象**：中文行超出边框，或换行位置不对。
+   **原因**：用 `text.length` 或 `text.slice` 计算宽度。
+   **解决**：用 `visibleWidth` 测量，用 `truncateToWidth` 截断。
+2. **现象**：切换主题后，组件仍显示旧颜色。
+   **原因**：把带颜色的字符串存在了组件状态里，`invalidate()` 没有重建它。
+   **解决**：每次 `render` 时重新生成带颜色的字符串，或在 `invalidate()` 中清掉缓存。
+3. **现象**：按 Ctrl+C 没有退出，而是清空了编辑器。
+   **原因**：这是默认键位 `app.clear` 的行为（`KEYBINDINGS` 中 `app.clear` 默认 `ctrl+c`）。
+   **解决**：如果想改退出键，修改 `keybindings.json` 中 `app.exit` 或 `app.clear` 的映射。
+4. **现象**：Windows 上找不到 Alt+Enter 的 follow-up 行为。
+   **原因**：`app.message.followUp` 在 Windows 上默认是 `ctrl+q`，在其他平台是 `alt+enter`（见 `packages/coding-agent/src/core/keybindings.ts`）。
+   **解决**：在 Windows 上使用 Ctrl+Q，或在 `keybindings.json` 中自定义。
+5. **现象**：设置 `PI_TUI_WRITE_LOG=1` 后，当前目录多出一个名为 `1` 的文件，没有日志。
+   **原因**：`1` 被当作文件路径。
+   **解决**：改为完整的文件路径或已存在的目录。
+
+## 参考答案
+
+1. `length` 按 UTF-16 代码单元计数，`A` 与 `B` 各 1 个，两个汉字各 1 个，共 4。终端按列显示，两个汉字各占 2 列，共 6 列。
+2. 每一行的 `visibleWidth` 都要不大于传入的宽度。`slice(0, width)` 按字符切，会把宽字符切开，也可能切断 ANSI 码或 emoji 序列。应该用 `truncateToWidth` 或 `sliceByColumn`。
+3. 比较上一帧与当前帧的行，找出第一行和最后一行变化的位置，只重写这一段。`invalidate()` 用来清掉组件的缓存，否则组件可能继续返回旧的带颜色字符串。
+4. 用户可以在 `keybindings.json` 里改键位；写死按键会让配置失效。动作名经过键位表查询，配置生效。
+5. `ui.start()` 让 TUI 能显示并接收输入。扩展的 `session_start` 在 `rebindCurrentSession()` 中触发，可能需要弹出对话框，所以必须先启动 UI。
+
+## 选读：源码深入（交互模式装配与启动）
+
+选读，跳过不影响主线。本节放的是 `interactive-mode.ts` 的装配细节，适合需要修改启动流程时阅读。
+
+### 目录地图
+
+```text
+packages/coding-agent/src/modes/interactive/
+├── interactive-mode.ts     主类：装配、启动、提交、渲染派发、停止
+├── tui-renderer.ts         渲染器选择与稳定引用
+├── chat-viewport.ts        转录区 + 固定输入区布局
+├── model-catalog-refresh.ts 启动时的模型目录刷新
+├── external-editor.ts      外部编辑器
+├── components/             消息、工具、选择器、页脚等组件
+└── theme/                  主题系统
 ```
 
-- changelog 先拿（后面头部的"新版本提示"用）；模型作用域提示**用 `console.log` 直接打印**——【陷阱】此刻 TUI 还没 `start()`，**stdout 还是普通终端**（这行输出会留在终端回滚区，成为启动日志的一部分）；之后进入全屏就看不到了。
-- 提示文案**用键位系统生成**（`this.keybindings.getKeys("app.model.cycleForward")` + `formatKeyText`）——**按键提示永远从键位表来**（第 17.9.4 节的"不硬编码"）。
-
-
-###### 步骤 5：一次建树、可重挂
-
-```typescript
-		// Keep one component tree and remount it when changing renderers.
-		this.renderWidgets(); // Initialize with default spacer
-		const viewport = createChatViewport({ /* ... 各容器 ... */ });
-		this.transcriptScrollView = viewport.transcript;
-		this.fullscreenLayoutRoot = viewport.root;
-		this.mountInteractiveTui(this.renderer, [ /* 七个容器 */ ]);
-```
-
-- 注释就是设计：**组件树只建一次**（所有容器/编辑器/页脚都在树上），切换 regular/fullscreen 时**重挂**（`mountInteractiveTui` 把树挂到新渲染器）——配合第 1 节的 Proxy 引用，组件无需感知切换。
-- `renderWidgets()` 先跑一次（默认 spacer）——**保证布局数组里"widget 位置"始终存在**（后续更新只是替换内容）。
-
-
-###### 步骤 6-7：先用"启动期编辑器"，UI 先于扩展
-
-```typescript
-		// Accept text while startup completes, but only enable interrupt, exit, and submission feedback.
-		this.defaultEditor.onAction("app.clear", () => this.handleCtrlC());
-		this.defaultEditor.onCtrlD = () => this.handleCtrlD();
-		this.defaultEditor.onSubmit = (text) => this.handleStartupSubmit(text);
-		this.ui.setFocus(this.editor);
-
-		// Start the UI before initializing extensions so session_start handlers can use interactive dialogs
-		this.ui.start();
-		this.isInitialized = true;
-```
-
-- **启动期只绑三个动作**（清屏/退出/提交）——其余键位要等"工具与处理器就绪"（步骤 11）再启用；**启动期间允许打字但不允许乱触发**。
-- 【陷阱】**`ui.start()` 必须在扩展初始化之前**——注释原文："so session_start handlers can use interactive dialogs"。扩展的 `session_start` 可以弹选择框（第 13 章），而对话框需要已启动的 TUI。**顺序 = 能力**的又一实例。
-- `isInitialized = true` 紧跟在 `ui.start()` 后——后续异步步骤失败也不会重复初始化（但组件可能没齐……读代码时注意这个"早设旗标"的取舍）。
-
-
-###### 步骤 8：主题先于"烘烤颜色"的内容
-
-```typescript
-		this.ensurePngTranscoder();
-		this.themeController.applyFromSettings();
-		// The header and startup notices bake theme colors into their text, so build them once the terminal
-		// reported its colors. This ends at the terminal's DA1 reply, or after 100 ms if it answers nothing.
-		await this.themeController.waitForTerminalColors();
-```
-
-- `ensurePngTranscoder()`：图片转码器（内联图片，第 17.1 节）**惰性准备**。
-- **注释解释了一个纯技术依赖**：头部与启动提示会把主题色**烘进字符串**（第 17.7 节的【陷阱】：带色字符串不能事后跟随主题变化）——所以必须等**终端上报自身颜色**（DA1 查询的答复）之后才构建；终端不应答则 100ms 超时（**不让慢终端卡死启动**）。**"配色感知的 100ms 等待"**是终端 UI 的独特工程点。
-
-
-###### 步骤 9：头部构建（有 logo / 无 logo 两种）
-
-```typescript
-		if (this.shouldShowStartupHeader()) {
-			const showDetails = this.shouldShowStartupDetails();
-			const showLogo = supportsPiLogo();
-			const withLogo = (hints: string) => { /* logo 两行 + 版本 + hints；无 logo 用 piWordmark + vX */ };
-			const expandedInstructions = () => [ /* 完整快捷键清单（20 条） */ ].join("\n");
-			const compactInstructions = () => [ /* 5 条精简 */ ].join(theme.fg("muted", " · "));
-			const compactOnboarding = () => theme.fg("dim", `Press ... to show full startup help...`);
-			const onboarding = () => theme.fg("dim", `Pi can explain its own features...`);
-			const header = new BuiltInHeader(
-				() => `${withLogo(compactInstructions())}\n${compactOnboarding()}\n\n${onboarding()}`,
-				() => `${withLogo(expandedInstructions())}\n\n${onboarding()}`,
-				this.getStartupExpansionState(), 1, 0,
-			);
-			if (showLogo) header.onLogoClick = (column, row) => playPiLogo3d(this.renderer, column, row);
-			// ...（Spacer + header + Spacer 入 headerContainer）
-		} else { this.builtInHeader = new Text("", 0, 0); /* ... */ }
-		this.ui.requestRender();
-```
-
-【注解（四个要点）】
-
-1. **"按需构建"**（两个函数而不是两个字符串）：注释说 "Built on demand so the header follows theme changes"——**头部内容在渲染时求值**（主题切换后重新取色）；`BuiltInHeader(compactFn, expandedFn, expansionState, ...)` 接收的是**函数**。
-2. **指令集两档**：`compactInstructions`（5 条常用）与 `expandedInstructions`（20 条全量）——**按展开状态切换**（`app.tools.expand` 键）；快捷键提示全部来自 `hint()`/`keyHint()` 辅助（键位表驱动）。
-3. **onboarding 文案**："Pi can explain its own features... Ask it how to use or extend Pi."——**教用户"用模型回答 pi 的问题"**（第 10 章的 docs 分节为它提供知识）。
-4. **彩蛋**：`header.onLogoClick = playPiLogo3d`——点击 logo 放 3D 动画（`interactive/components/easter-egg-3d.ts` 48KB！）。【陷阱】读大仓库时遇到这类"无关正式功能"的代码——**跳过即可**，但要认出它（否则会浪费半天猜"这个 3D 模块在主链路哪里用"）。
-
-
-###### 步骤 10：先挂 UI，再下载外部工具
-
-```typescript
-		// Ensure fd and rg are available after mounting the TUI (downloads if missing, adds to PATH via getBinDir)
-		// so slow downloads do not make startup appear frozen.
-		// Both are needed: fd for autocomplete, rg for grep tool and bash commands.
-		const [fdPath] = await Promise.all([
-			ensureTool("fd", (status) => this.showManagedToolStatus(status)),
-			ensureTool("rg", (status) => this.showManagedToolStatus(status)),
-		]);
-		this.fdPath = fdPath;
-```
-
-- **托管二进制**（`fd` 用于自动补全、`rg` 用于 grep 工具与 bash）——缺失时**下载**。
-- 【陷阱】注释点明顺序原因："slow downloads do not make startup appear frozen"——**UI 先挂载**（用户立刻看到界面与下载状态——`showManagedToolStatus` 把进度显示在状态行），再等下载。**"先反馈、后等待"**的启动体验铁律。
-- 两个工具**并行下载**（`Promise.all`）。
-
-
-###### 步骤 11-12：启用完整输入、重绑、渲染、挂后台观察者
-
-```typescript
-		this.setupKeyHandlers();
-		this.setupEditorSubmitHandler();
-		this.ui.requestRender();
-
-		// Initialize extensions first so resources are shown before messages
-		await this.rebindCurrentSession();
-		this.renderInitialMessages();
-
-		onThemeChange(() => { this.ui.invalidate(); this.updateEditorBorderColor(); this.ui.requestRender(); });
-		this.footerDataProvider.onBranchChange(() => { this.ui.requestRender(); });
-		await this.updateAvailableProviderCount();
-		this.ui.renderNow();
-		void loadAllHighlightLanguages().then(() => { if (!this.isInitialized) return; this.ui.invalidate(); this.ui.requestRender(); });
-	}
-```
-
-- **输入处理在工具就绪后才全量启用**（`setupKeyHandlers`/`setupEditorSubmitHandler`）——**"编辑器可用的前提是它依赖的能力已就绪"**。
-- `rebindCurrentSession()`：把扩展绑到会话（`session_start` 在此触发——**在消息渲染之前**，注释："resources are shown before messages"）。
-- `renderInitialMessages()`：处理恢复会话的历史渲染（第 9 章的条目树 → 组件）。
-- **两类观察者**：主题变更（invalidate + 边框色 + 重渲染）与 git 分支变更（仅重渲染——数据由 `footerDataProvider` 提供，第 0 节文件）。
-- `await this.updateAvailableProviderCount()`（页脚显示可用供应商数）；`ui.renderNow()` **同步渲染一帧**（把完成态先落屏）；**语法高亮语言包异步加载**（`void ... .then`）——**重任务后台化**（加载完只 invalidate + 重渲染）。
-- 【陷阱】`loadAllHighlightLanguages` 的回调里再查 `isInitialized`（**异步回调可能发生在 stop 之后**——防御"已经关了还在刷 UI"）。
-
-
-##### 5. `run()`：启动检查 + 主循环
-
-```typescript
-	async run(): Promise<void> {
-		await this.init();
-
-		if (!process.env.PI_OFFLINE) {
-			const controller = new AbortController();
-			const timeout = setTimeout(() => controller.abort(), 15_000);
-			void refreshModelCatalogs(this.session.modelRuntime, controller.signal)
-				.then(() => this.updateAvailableProviderCount())
-				.catch(() => {})
-				.finally(() => clearTimeout(timeout));
-		}
-
-		checkForNewPiVersion(this.version).then((newRelease) => { if (newRelease) this.showNewVersionNotification(newRelease); });
-		this.checkForPackageUpdates().then((updates) => { if (updates.length > 0) this.showPackageUpdateNotification(updates); })
-			.finally(() => { if (process.platform === "win32" && this.isInitialized) this.updateTerminalTitle(); });
-		this.checkTmuxKeyboardSetup().then((warning) => { if (warning) this.showWarning(warning); });
-
-		// ...（启动警告分发：diagnostics / migratedProviders / models.json error / modelFallbackMessage / crash / anthropic 订阅）
-		void this.maybeWarnAboutAnthropicSubscriptionAuth();
-
-		if (initialMessage) { try { await this.session.prompt(initialMessage, { images: initialImages }); } catch (e) { this.showError(...); } }
-		if (initialMessages) { for (const message of initialMessages) { try { await this.session.prompt(message); } catch (e) { this.showError(...); } } }
+`interactive-mode.ts` 很大，不要从头通读。读启动序列时，从 `init` 与 `run` 开始即可。
 
-		while (true) {
-			const userInput = await this.getUserInput();
-			try { await this.session.prompt(userInput); } catch (error) { this.showError(...); }
-		}
-	}
-```
+### 稳定引用：`createInteractiveTuiReference`
 
-【注解（三段结构）】
-
-1. **四个后台检查**（全部 `void`/`.then`——**不阻塞主循环**）：
-   - 目录刷新（非离线；15 秒超时；成功后更新供应商计数；`.catch(() => {})` **吞掉刷新错误**——启动体验优先，错误已经由 `getError()` 在别处呈现）；
-   - 版本检查 → 新版通知；
-   - 包更新检查 → 通知；`.finally` 里有个 **Windows 专属修复**（注释："npm can overwrite the shared console title while checking extension package versions"——检查时 npm 可能改了控制台标题，恢复 pi 的标题）；
-   - tmux 键盘配置检查 → 警告。
-   - 【陷阱】四个都是"**发现什么就通知**"模式（`.then(if (x) show)`）——**启动路径零阻塞**；任何"启动时必须等待"的诱惑都被拒绝了（除了 init 里明确需要顺序的步骤）。
-2. **启动警告的统一分发**：`startupDiagnostics` 按级别推给 `showError`/`showWarning`/`showStatus`；`migratedProviders`（迁移过的凭据）；`models.json` 错误；`modelFallbackMessage`（模型回退）；**崩溃记录**（`takeUnnotifiedCrash()`——取一条"未通知过"的崩溃，显示时间与消息 + "Run /bug to report it"）；Anthropic 订阅鉴权提示（`maybeWarnAboutAnthropicSubscriptionAuth`——只提示一次，旗标在字段里）。**第 8.3.2 节的"诊断收集、边界裁决"在交互层的最终呈现**。
-3. **初始消息 + 主循环**：初始消息（来自 CLI 参数/管道）逐条 `prompt`（**错误就地显示、不退出**——交互模式下"报错后还能继续打字"）；主循环 `while (true)`：`getUserInput()`（等编辑器提交）→ `session.prompt`（**串行**——一次运行完再收下一个输入）→ 出错 `showError`。
-   - 【陷阱】主循环**不处理"运行中再提交"**？——那是 `getUserInput` 与编辑器/队列的领域（流式期间的回车走 steer/followUp 的交互路径，第 6 章）；**主循环只负责"空闲时的下一次提交"**。读交互输入行为时要沿着 `getUserInput` 与编辑器事件继续往组件层读（本篇止于结构与顺序，具体提交分支以源码为准）。
-
-
-##### 6. 交互模式与核心的边界（本节是结论）
-
-| 维度 | 核心（AgentSession）负责             | 交互模式负责                                                                            |
-| ---- | ------------------------------------ | --------------------------------------------------------------------------------------- |
-| 运行 | prompt 循环、工具、压缩、重试        | **触发 prompt 的时机**（编辑器/初始消息）                                         |
-| 状态 | 唯一数据源（`session.state`/事件） | 把事件变成组件更新、把状态变成页脚数字                                                  |
-| 资源 | 会话/扩展/设置的拥有与释放           | 终端的启动、恢复、`stop()`                                                            |
-| 扩展 | 扩展的运行与钩子                     | **提供交互上下文**（对话框/状态/widget/自定义编辑器）                             |
-| 失败 | 错误成"结果"、事件携带原因           | 把原因显示成`showError/showWarning/showStatus`                                        |
-| 顺序 | 不感知 UI                            | **承接全部启动顺序问题**（UI 先于扩展、颜色先于头部、工具后于挂载、消息后于资源） |
+问题：组件在构造时拿到 `TUI` 对象。用户可能在运行中切换 regular 与 fullscreen，渲染器对象会被替换。如果组件还持有旧对象，就会调用到已经停止的渲染器。
 
-【核心结论】交互模式的复杂度全在**"顺序与体验"**：把 200 行的启动序列拆成十二步后，你会发现**每一步的注释都在回答"为什么不能更早/更晚"**——这正是 247KB 文件里最应该被精读的部分（其余是大量组件的重复模式）。
+解法：`createInteractiveTuiReference(getTui)` 返回一个 `Proxy`。组件持有的是这个代理，每次调用方法时，代理通过 `getTui()` 取当前渲染器，并把方法绑定到它上面。代价是每次属性访问多一层间接调用，所以方法路径做了缓存。
 
+这样做的原因是组件可能来自扩展。扩展只拿到一个 `TUI` 对象，不需要为渲染器切换改代码。
 
-##### 7. 阅读检查清单
+### 布局：`createChatViewport`
 
-- [ ] 我能说出 `createInteractiveTuiReference` 这个 Proxy 解决的问题与代价吗？
-- [ ] 我知道 `chat-viewport` 里 `minSize: 3` 与 `grow/basis` 的分工吗？
-- [ ] 我能背出 init 十二步里"为什么 UI 必须先于扩展""颜色必须先于头部""工具必须后于挂载"的原因吗？
-- [ ] 我知道启动期编辑器只绑了哪三个动作、为什么吗？
-- [ ] 我能说出 `run()` 的四个后台检查与"零阻塞"原则吗？
-- [ ] 我知道主循环的 `while(true)` 与流式排队（steer/follow-up）的分工吗？
+`createChatViewport` 返回的根节点是垂直两段：
 
----
+- 转录区 `ScrollView`：`basis: 0`，`grow: 1`，占据剩余空间。`follow: "end"` 让流式输出自动滚到底部。
+- 输入区 `VStack`：`basis: "auto"`，按内容高度。编辑器的 `minSize: 3` 保证至少 3 行。
 
-> D13 完。精读篇（D1-D13）覆盖：循环、Agent、会话（投影/本体）、提示与压缩（读/写）、SDK、CLI、工具、扩展、模型层、协议模式、交互模式。
+widget 通过条件展开加入布局。没有 widget 时，布局数组里根本不存在对应项，而不是插入一个空组件。
 
-#### 17.12 常见错误
+### 启动序列的顺序约束
 
-| 现象                     | 原因                                                              | 处理                                        |
-| ------------------------ | ----------------------------------------------------------------- | ------------------------------------------- |
-| 中文/emoji 行错位        | 用`length`/`slice` 处理宽度                                   | 一律用 pi-tui 宽度工具（17.10）             |
-| 界面闪烁/撕裂            | 绕过差分渲染自己画 ANSI                                           | 只通过组件与`requestRender`               |
-| UI 不更新                | 改了状态没`invalidate()`                                        | 状态变化的组件必须失效缓存                  |
-| 切换主题后旧颜色残留     | 把带色字符串存进了状态                                            | 渲染现算，或在`invalidate()` 重建         |
-| 输入法候选框位置飘       | 容器没把`focused` 传给 `Input/Editor`，或缺 `CURSOR_MARKER` | 17.4.2 两条要求                             |
-| overlay 关了但交互没结束 | 调了`hide()` 而不是完成回调                                     | `ctx.ui.custom` 的 overlay 用完成回调结束 |
-| overlay 复用导致状态串   | 一个实例跑了多次交互                                              | 一交互一实例                                |
-| 新增快捷键改键位文件无效 | 代码写死了`matchesKey`                                          | 进默认键位表 + 通过键位系统查询（17.9.4）   |
-| 常规模式下鼠标不生效     | 常规模式鼠标归终端                                                | 设计键盘路径；只有全屏才路由组件            |
-| Windows 下某些键不工作   | 终端保留/改写了组合键（super 需 Kitty 协议）                      | 查`terminal-setup.md` 与平台默认键位表    |
+下表列出几个顺序约束，以及代码注释给出的原因。
 
+| 顺序 | 原因 |
+| --- | --- |
+| 信号处理最先注册 | 启动到一半按 Ctrl+C 也要能退出 |
+| `ui.start()` 早于扩展初始化 | 扩展的 `session_start` 可能弹对话框 |
+| 等终端颜色回报后再建头部 | 头部把主题色写进字符串，颜色未知会错 |
+| UI 挂载后再下载 `fd`、`rg` | 下载慢时用户仍能看到界面 |
+| `rebindCurrentSession()` 早于 `renderInitialMessages()` | 扩展资源先显示，历史消息后显示 |
+| 后台检查都用 `void` 或 `.then` | 启动路径不被网络检查阻塞 |
 
-#### 17.13 验收题
+### 主循环与输入
 
-1. 差分渲染与同步输出（CSI 2026）分别解决什么问题？两者为什么互补？
-2. 列出"每行适配宽度"的四个工具函数，并解释为什么不能按字符数算。
-3. 自定义带边框输入区时，为了中文输入法位置正确，必须做哪三件事？
-4. `ctx.ui.custom()` overlay 的结束方式？为什么不能对 Hide 调用 `hide()`？焦点如何交还？
-5. `theme.style()` 中"前景 token 与背景 token"的互换怎么做？为什么不能长期存储带色字符串？
-6. 新增一个快捷键的完整步骤（用户配置、代码默认表、平台差异、验证命令）？
-7. 复现一个宽度问题的实验流程（tmux 会话、缩放、最小组件、原始日志）？
+`run()` 的主循环是串行的：`getUserInput()` 等待一次提交，然后 `session.prompt(...)` 完成后再等待下一次提交。运行中的输入（流式期间按回车）由编辑器与队列处理，走 steer 或 follow-up 路径，不经过这个循环。具体分支需要从编辑器事件继续往下读。
 
+### 交互模式与核心的边界
 
-##### 参考答案（要点）
+| 维度 | `AgentSession` 负责 | 交互模式负责 |
+| --- | --- | --- |
+| 运行 | prompt 循环、工具、压缩、重试 | 决定何时调用 `prompt`（编辑器提交或初始消息） |
+| 状态 | 唯一数据源（状态与事件） | 把事件变成组件更新 |
+| 资源 | 会话、扩展、设置的生命周期 | 终端的启动与停止 |
+| 失败 | 以结果或事件的形式报告 | 用 `showError`、`showWarning` 显示 |
 
-1. 差分渲染减少更新量、避免重绘闪烁；同步输出让"一帧的多次写"在终端上原子呈现；两者结合=只写变化且写到一半不会被看到。
-2. `visibleWidth`、`truncateToWidth`、`sliceByColumn`、`wrapTextWithAnsi`；ANSI 零宽、CJK 双宽、emoji/组合字符长度不定，字符数不等于列数。
-3. 组件实现 `Focusable` 并在视觉光标前放 `CURSOR_MARKER`；容器把 `focused` 状态传给子组件；使用内置 `Input/Editor`（而非自绘光标）。
-4. 调工厂给的完成回调（resolve Promise 并销毁）；`hide()` 只是临时隐藏、交互仍活跃；焦点通过 overlay handle 显式释放/改焦点。
-5. `{ fg: theme.colors.someBgToken }`（取具体色值放另一位置）；主题切换只能清渲染缓存，清不掉状态里固化的 ANSI。
-6. 在 `keybindings.json` 支持覆盖（无需改代码即可生效）→ 代码里把默认值加进默认键位表（`TUI_KEYBINDINGS`/`KEYBINDINGS` 对应条目，含平台差异）→ `/reload` 或重启 → `/hotkeys` 验证；不要硬编码按键判断。
-7. tmux 起 80x24 → 输入中文/emoji/长行 → `resize-window` 到 40 → 组件级最小复现（两版实现对照）→ `PI_TUI_WRITE_LOG` 看原始字节 → 产出"输入+宽度+序列+期望/实际"说明。
+交互模式只消费 `AgentSession` 的公开接口，不修改核心。
 
+### 未在本地验证的内容
 
-#### 17.14 源码依据
+- 启动序列的完整 12 步细节来自对 `interactive-mode.ts` 的阅读，只核对了符号（`init`、`run`、`ensureTool`、`rebindCurrentSession`、`renderInitialMessages`、`getUserInput`、`mountInteractiveTui`、`createChatViewport`、`handleStartupSubmit`）存在，没有在本地启动交互模式。
+- `footer-data-provider.ts` 在旧笔记中出现过，但当前目录列表中没有它，本篇不引用。
+- tmux 交互测试只在 Linux、macOS 或 WSL 中可用，本篇没有运行。`.pi/skills/interactive-testing.md` 中有 tmux 步骤，需要时再读。
 
-- `packages/coding-agent/docs/tui.md`（集成点、组件模型、宽度、键盘/IME、鼠标、overlay、主题、性能）；
-- `packages/coding-agent/docs/keybindings.md`、`docs/themes.md`、`docs/terminal-setup.md`、`docs/windows.md`；
-- `packages/tui/README.md` 与 `packages/tui/src/index.ts`（组件与工具导出）；
-- `packages/coding-agent/src/core/keybindings.ts`（`KEYBINDINGS`、`useWindowsKeybindings`、`AppKeybinding`）；
-- 示例：`examples/extensions/preset.ts`、`tools.ts`、`qna.ts`、`modal-editor.ts`、`custom-footer.ts`、`widget-placement.ts`、`overlay-qa-tests.ts`、`doom-overlay/`；
-- `.pi/skills/interactive-testing.md`（tmux 交互测试指引）。
+## 下一篇
 
+下一篇讲测试与调试。我们会学习如何运行单个测试文件、如何为组件写回归测试、以及如何提交一个可评审的小改动。
 
----
+## 术语小结
 
-## 动手任务 A：构造错位。
-
-在自己的新测试文件写入下面的基线。运行后再加入 `"🙂界🙂"`、组合字符 `"e\u0301"`，把宽度改为 4、8、40 分别比较。
-
-```typescript
-import assert from "node:assert/strict";
-import { it } from "node:test";
-import { truncateToWidth, visibleWidth } from "../src/utils.ts";
-
-it("measures terminal columns rather than string length", () => {
-  const plain = "A中文B";
-  const styled = `\x1b[31m${plain}\x1b[0m`;
-  assert.equal(plain.length, 4);
-  assert.equal(visibleWidth(plain), 6);
-  assert.equal(visibleWidth(styled), 6);
-  assert.ok(visibleWidth(truncateToWidth(styled, 4)) <= 4);
-});
-```
-
-另外故意实现一版 `text.slice(0, width)`，给相同输入写断言；预期它至少在一个中文、emoji 或 ANSI 用例上不能同时保持宽度与完整字符。保留失败输入作为最小复现。
-
-## 动手任务 B：交互复现。
-
-写一个最小组件，其 `render(width)` 只返回 `truncateToWidth("A中文B🙂", width)` 这一行。用 8→4→8 三次调用模拟窗口缩放，逐次断言 `visibleWidth(line) <= width`，记录每次返回的行与光标预期列。再给组件加 ANSI 样式，重复测试。若纯组件通过而真实界面仍错位，排查方向应转到布局、overlay、光标或终端状态；若纯组件失败，先修宽度处理。
-
-## 实验记录
-
-1. 对同一个输入分别测量 JS 字符串长度和 `visibleWidth`。给出至少一个两者不相等的例子，写下“组件能占用多少列”的计算方法。
-2. 在固定宽度下先渲染、再缩窄、再放宽，记录每次行数、每行可见宽度、光标位置。检查 ANSI 色彩控制序列是否错误地占用显示列。
-3. 用只含文字的最小组件重复实验，再加入输入框或 overlay。如果仅后者出错，缩小到布局或焦点层；如果两者都出错，先查通用宽度函数。
-4. 交付一个无需模型的回归测试和一页复现说明，写明终端尺寸、输入文本、操作顺序、期望与实际。
-
-若测试文件无法加载，先确认 Node 版本与本包测试使用的 `node --test` 入口；若你所在平台对 emoji 显示宽度不同，以 `visibleWidth` 的仓库契约和当前测试为准，记录平台差异。实验结束只处理自己新建的测试文件。
-
-## 验收标准
-
-能复现并定位一类宽度错误；能说明哪个工具处理“显示列数”，哪个层处理“键盘输入”；测试不依赖真实模型。
+| 术语 | 一句话定义 | 首次出现的小节 |
+| --- | --- | --- |
+| 终端（terminal） | 程序通过字节与屏幕、键盘交互的接口 | 核心概念 |
+| 转义序列（escape sequence） | 以 ESC 开头、控制终端的字节串 | 核心概念 |
+| 组件（component） | 有 `render(width)` 的对象，返回若干行字符串 | 核心概念 |
+| 差分渲染（differential rendering） | 只重写与上一帧不同的行 | 核心概念 |
+| 显示宽度（display width） | 文字在终端中占的列数 | 核心概念 |
+| 键位表（keybindings） | 动作名到按键的映射 | 核心概念 |
+| 同步输出（synchronized output） | 用 `\x1b[?2026h` 与 `\x1b[?2026l` 包住一帧，让终端一次性显示 | 源码导览 |
+| 光标标记（CURSOR_MARKER） | 放在可见光标前的标记，用于定位输入法候选框 | 源码导览 |
+| 稳定引用（Proxy 引用） | 组件持有的代理，每次调用时取当前渲染器 | 选读 |

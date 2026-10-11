@@ -1,30 +1,869 @@
-# 09. 系统提示、上下文预算与压缩
+# 09. 上下文预算、系统提示与压缩
 
-今天独立研究系统提示与压缩。先用纯函数验证触发条件，再用离线 faux 会话观察摘要怎样改变模型输入。无需其他任务和模型账号；预计 2–3 小时。
+> 预计时间：2 小时（不含选读）
+> 先修：消息、事件与状态（会话消息如何记录和回放），会话树与恢复（会话如何写入磁盘）
 
-## 今日准备
+## 本篇你会学到
 
-需要 Node.js >= 22.19.0、已安装依赖。缺失时在根目录执行 `npm install --ignore-scripts`。在 `packages/coding-agent/test/suite/` 新建 `task-09-learning.test.ts`；单文件命令（工作目录 `packages/coding-agent`）：
+- 说出模型每次请求实际收到什么：系统提示的分节，加上当前会话的投影。
+- 判断什么时候自动压缩，并用一个离线实验对照压缩前后的模型输入。
+- 解释溢出后 pi 为什么只重试一次，失败时保留什么。
 
-```powershell
-node ../../node_modules/vitest/dist/cli.js --run test/suite/task-09-learning.test.ts
+## 先用一个例子理解
+
+假设你在同一个会话里连续让 pi 做三件事：读文件、解释一段代码、再读另一个文件。每一轮，pi 都会把之前的消息再发一遍给模型，所以输入每轮都变长。
+
+每个模型都有一个**上下文窗口**，也就是它一次请求能接收的上限。本文用一个很小的 2600 token 窗口做演示，真实模型通常大得多。
+
+没有压缩时：第三轮的输入超过窗口。供应商返回溢出错误，或者回答被截断。这次请求失败，之后每一轮也都更难继续。
+
+有压缩时：pi 发现用量超过阈值，就请模型把较早的几轮写成一段摘要，然后只保留摘要和最近的回答。之后的请求用“系统提示 + 摘要 + 最近回答”。磁盘上的原始消息仍然存在，只是不再发送给模型。
+
+模型每次请求收到的输入由三块组成：
+
+```text
+[系统提示]   preamble、tools、rules、docs、project_context、cwd 等分节
+[投影]       会话中仍然有效的历史消息，压缩后可能以摘要开头
+[新输入]     本次用户发送的消息
 ```
 
-测试用 `createHarness()` 获得内存会话与 faux 假模型，最后调用 `h.cleanup()`。为了稳定触发压缩，要同时控制模型的 `contextWindow`、预留量和实际响应长度，不能只写一句短 prompt。
+只有投影会因为压缩而变短。系统提示每次都要计入预算。
 
-## 学习内容
+下面的数字来自本篇第 4 个实验，不是估计：
 
-模型每次收到的是当前系统提示加上会话投影，而系统提示由多段内容组成，包括工具、项目上下文和技能等。上下文窗口是模型可处理的输入上限；长会话需要保留近期消息，把较早消息压成摘要。压缩要选切点，确保工具调用与结果不被拆成不完整片段。摘要调用本身也会用模型；压缩记录写入会话树，原始历史仍保留。自动压缩的失败与普通回答的失败，恢复策略并不完全相同。
+- 窗口 2600，预留 400，所以阈值是 2600 - 400 = 2200。
+- 第一轮结束时，供应商报告的用量是 2051，没有超过阈值。
+- 第二轮结束时，用量是 2360，超过阈值，触发压缩。
+- 压缩后，投影从 5 条消息变成 3 条（系统提示、摘要、保留的回答）。用户再发一条新输入时，请求从 6 条变成 4 条。
 
-先算一个例子：窗口 1000 token，预留 200，当前上下文估算 850；`shouldCompact` 判断 850 > 800，应触发。若 `enabled: false` 则不触发。触发后保留近期消息、用摘要替代较早消息；这改变下一次给模型的投影，但不删除会话文件里的原始条目。
+实验用的是假模型（faux），它按字符数估算用量。pi 判断是否压缩的代码路径和真实供应商完全相同。
 
-## 核心源码
+## 核心概念
 
-`packages/coding-agent/src/core/system-prompt.ts` 的 `buildSystemPromptSections` 说明提示由哪些 section 构成；`core/compaction/compaction.ts` 的 `shouldCompact` 判阈值，`findCutPoint` 选择边界，`compact` 生成摘要；`core/compaction/utils.ts` 的 `serializeConversation` 把历史给摘要请求；`core/agent-session.ts` 负责把压缩事件、存储和续跑连起来。按此顺序阅读，分别记下输入、输出、失败分支。
+### 1. 上下文窗口是预算
 
-## TypeScript 语法小课：可选链与空值合并
+**上下文窗口（context window）** 是模型一次请求能接收的 **token** 上限。token 是模型计量文本的单位，大致相当于几个英文字母，或者一个汉字的一部分。
 
-`?.` 在左侧为空时停止读取，`??` 只在值为 `null` 或 `undefined` 时使用默认值。压缩配置里 `0` 可能是有效数值，不能用 `||` 把它误当成“未设置”。
+为什么需要：窗口是硬上限。每一轮都要重发完整历史，所以用量随轮次增长，直到超出窗口。
+
+pi 把窗口当预算来用。它先留出一部分给模型的回答，叫做**预留（reserveTokens）**。默认值在 `DEFAULT_COMPACTION_SETTINGS` 中定义：
+
+```text
+enabled: true, reserveTokens: 16384, keepRecentTokens: 20000
+```
+
+小例子：窗口 200000，预留 16384，那么可用于输入的上限是 183616。用量达到 183617 时才会触发压缩（实验 1 验证了这个边界）。
+
+预算表（实验 4 的真实运行，窗口 2600，预留 400，阈值 2200）：
+
+| 项目 | 数值 | 来源 |
+| ---- | ---- | ---- |
+| 第 1 轮 usage：input 1426 + output 625 | 2051 | 假模型报告的 `totalTokens` |
+| 第 2 轮 usage：input 2060 + output 300 | 2360 | 超过 2200，触发压缩 |
+| 系统提示 5 个分节的估算之和（preamble 43、tools 85、rules 210、docs 311、cwd 21） | 670 | `estimateTokens`，结果等于字符数除以 4 向上取整 |
+| 两轮后非系统消息的估算之和 | 934 | `estimateTokens` |
+| 压缩后的 `estimatedTokensAfter` | 1735 | 本地估算（另一次运行为 1736） |
+| 压缩后第 3 轮的 usage：input 1781 + output 4 | 1785 | 压缩后的真实请求 |
+
+读表的方法：`_checkCompaction` 在有 usage 时用 usage 做阈值比较（第 1、2 轮），估算只用于压缩后的数字，以及没有 usage 的情况。假模型的 `input` 与 `estimateTokens` 之和不相等（第 1 轮 1426 对 670 加 4）。假模型的计数规则没有读取，未在本地验证具体规则。
+
+### 2. 系统提示由分节组成
+
+系统提示不是一整段字符串。`buildSystemPromptSections` 返回一组有名字的段，叫做**分节（section）**。
+
+为什么需要：分节让系统提示可以按名字局部更新。会话里记录的不是整段提示，而是**补丁（patch）**：只包含变化的分节，值为 `null` 表示删除该分节。如果没有分节，任何一个字符变化都要整段重发。
+
+每个分节都包在同名标签里，例如 `<rules>...</rules>`，只有 `preamble`（开场白）不加标签。标签让模型能把后来的更新和原来的分节对应起来。
+
+内置分节：
+
+- `preamble`：身份与职责，不加标签。
+- `tools`：只列出有 snippet 的工具。
+- `rules`：由工具准则和通用规则去重后生成。
+- `docs`：pi 自身文档的位置。
+- `addendum`：用户追加的文本，只在 `appendSystemPrompt` 非空时出现。
+- `project_context`：AGENTS.md 等上下文文件，每个文件包在 `<project_instructions path="...">` 中，只在有文件时出现。
+- `skills`：技能清单，只在已选工具包含 `read` 或 `bash` 且有技能时出现。
+- `cwd`：工作目录，反斜杠统一改为正斜杠。
+
+小例子：实验 2 中，去掉 AGENTS.md 后补丁是 `{"project_context":null}`，只有这一个分节被删除，其他分节不变。
+
+分节渲染后就是模型看到的文本。实验 2 中 `project_context` 分节的真实输出如下：
+
+```text
+<project_context>
+Project-specific instructions and guidelines:
+
+<project_instructions path="C:/demo/AGENTS.md">
+请只读当前目录
+</project_instructions>
+</project_context>
+```
+
+另一条路径是 `forceSystemPrompt`。它给出一整段文本，没有分节，因此不能打补丁，每次变化都是整段替换。这是扩展完全接管提示时使用的逃生口。
+
+完整组装示例（实验 s，假输入：`cwd` 为 `C:\demo`，工具为 read、bash、edit、write，`appendSystemPrompt` 为 `Reply in Chinese.`，一个 AGENTS.md，以及 `sections: { team_rules: "Use pnpm, not npm." }`）。
+
+分节顺序（`buildSystemPromptSections` 的返回顺序）：
+
+```text
+preamble > tools > rules > docs > addendum > project_context > cwd > team_rules
+```
+
+`addendum` 来自 `appendSystemPrompt`。`project_context` 来自 AGENTS.md。`team_rules` 不是内置分节，而是调用方在 `sections` 中给出的。构建函数在 `cwd` 之后才合并自定义分节（`promptSections[name] = content` 在 `cwd` 赋值之后执行），所以它排在最后。
+
+`buildSystemPrompt` 按上面的顺序拼接，分节之间用一个空行分隔。每个分节在最终文本中的起始位置（字符偏移，实验 s 的真实输出）：
+
+| 分节 | 起始偏移 | 字符数 | 估算 token |
+| ---- | ---- | ---- | ---- |
+| preamble | 0 | 169 | 43 |
+| tools | 171 | 236 | 59 |
+| rules | 409 | 146 | 37 |
+| docs | 557 | 1244 | 311 |
+| addendum | 1803 | 40 | 10 |
+| project_context | 1845 | 163 | 41 |
+| cwd | 2010 | 20 | 5 |
+| team_rules | 2032 | 45 | 12 |
+
+整段提示共 2077 字符，估算 520 token。`docs` 分节包含本机的文档路径，所以它的长度随安装位置变化。
+
+最终文本的末尾是：
+
+```text
+<cwd>
+C:/demo
+</cwd>
+
+<team_rules>
+Use pnpm, not npm.
+</team_rules>
+```
+
+如果之后删除 `team_rules`，补丁就是 `{"team_rules":null}`（实验 s 的 s5）。补丁只包含这一个键，其他分节都不变。
+
+### 3. 压缩阈值
+
+**压缩阈值（threshold）** 是判断要不要压缩的一条不等式：
+
+```text
+上下文 token 数 > 上下文窗口 - reserveTokens   →  触发自动压缩
+```
+
+注意是严格大于。`enabled: false` 时永远不自动压缩，但 `/compact` 仍可手动使用。
+
+为什么需要：阈值要在窗口真正装满之前触发，给回答留出空间。
+
+小例子：实验 1 中 `shouldCompact(850, 1000, { reserveTokens: 200 })` 返回 `true`，`shouldCompact(800, 1000, ...)` 返回 `false`，因为 800 等于阈值，不是大于。
+
+“上下文 token 数”有三个来源，由 `_checkCompaction` 按情况选择：
+
+- 正常情况：上一条助手消息的供应商用量，即 `calculateContextTokens`（用 `totalTokens`）。
+- 出错或用量为零：用消息估算，即 `estimateContextTokens`，粗略地按字符数除以 4 计算。
+- 有 `context_edit` 编辑记录：用投影估算，即 `estimateProjectedContextTokens`。
+
+不同模型可以有不同的预留和保留值，通过 `compaction.modelOverrides` 配置，键必须是精确的 `provider/modelId`，例如 `faux/faux-1`。
+
+### 4. 切点与摘要请求
+
+**切点（cut point）** 是保留区和摘要区的分界。切点之前的消息进入摘要，切点及之后的消息原样保留。
+
+合法切点只能是这些消息：用户消息、助手消息、bash 执行记录、自定义消息、分支摘要、压缩摘要。**工具结果永远不是切点。**
+
+为什么需要：工具结果必须和发出它的工具调用放在一起。如果切点落在工具结果上，保留下来的结果就没有对应的调用。模型会看到一段“文件内容”，却不知道它回应的是哪一次 `read`。
+
+切点的选择方法：pi 从最新消息往前累计估算的 token。累计到 `keepRecentTokens` 时，选择不早于该位置的第一个合法切点。如果找不到这样的切点，就取最后一个合法切点。如果整段历史都没有达到预算，切点就是第一个合法点，几乎全部保留。
+
+小例子（实验 4）：`keepRecentTokens` 设为 300。从后往前看，最后一条助手回答约 300 token，累计达到 300，于是切点选在这条回答上。这条回答前面的用户消息属于同一轮，所以这是**分裂跨度（split turn）**：切点不在用户消息上，历史被拆成两部分，分别摘要。
+
+`findCutPoint` 的小例子（实验 g，四条消息，每条 40 个字符，估算为 10 token）。
+
+消息顺序是 `u1`（用户）、`a1`（助手）、`u2`（用户）、`a2`（助手）。从最新的消息往前累计：`a2` 为 10，加上 `u2` 为 20，加上 `a1` 为 30，加上 `u1` 为 40。
+
+- `keepRecentTokens` 为 25：累计到 `a1` 时达到 30，已经大于等于 25。切点取不早于 `a1` 的第一个合法点，就是 `a1`。结果是 `{"firstKeptEntryIndex":1,"turnStartIndex":0,"isSplitTurn":true}`。切点落在助手消息上，所以是分裂跨度，`u1` 进入前缀摘要。
+- `keepRecentTokens` 为 35：累计到 `a1` 时只有 30，不够；累计到 `u1` 时是 40，达到 35。切点是 `u1`，结果是 `{"firstKeptEntryIndex":0,"turnStartIndex":-1,"isSplitTurn":false}`。这次不是分裂跨度。
+
+代码中的 `for` 循环逐条累计，遇到第一个达到预算的条目就停止，然后用 `cutPoints.find((candidate) => candidate >= i)` 取切点。如果累计始终达不到预算，切点就是第一个合法点（`cutPoints[0]`）。
+
+`findCutPoint` 处理原始条目。它在 `packages/coding-agent/src/index.ts` 中被导出（已用 Grep 确认），测试直接调用它。会话主路径用的是 `findProjectedCutPoint`，它的累计和切点规则相同，只是作用于投影（已用 Read 确认）。
+
+分裂跨度时，pi 发出两次摘要请求，合并结果如下（实验 4 的真实输出，假模型的回答被原样当作摘要）：
+
+```text
+## Goal
+summary of the older turns
+
+---
+
+**Turn Context (split turn):**
+
+answer for the split turn
+```
+
+**摘要请求（summary request）** 是压缩时发给模型的一次专用调用，它的形式很特别：
+
+- 系统提示是 `SUMMARIZATION_SYSTEM_PROMPT`，限定模型只能输出摘要，不能继续对话。
+- 只有一条用户消息。消息里先是 `<conversation>...</conversation>` 包住的历史，再是可选的 `<previous-summary>`，最后是固定指令。
+- 历史用 `serializeConversation` 转成带前缀的文本：`[User]:`、`[Assistant]:`、`[Assistant tool calls]:`、`[Tool result]:`。工具结果超过 2000 字符会被截断。
+- 不提供任何工具。如果模型的回答里有工具调用，pi 把它当作失败。
+- 输出上限是 `min(0.8 × reserveTokens, 模型的 maxTokens)`。
+- 输出结构固定为 Goal、Constraints & Preferences、Progress、Key Decisions、Next Steps、Critical Context。文件列表在末尾用 `<read-files>` 和 `<modified-files>` 追加。
+
+为什么要用前缀格式：如果把历史原样发给模型并说“请总结”，模型可能把它当成一段要继续回答的对话。前缀让历史变成“待处理的材料”。
+
+摘要请求的用户消息按固定顺序拼接（源码 `generateSummaryWithUsage`）：
+
+```text
+<conversation>
+（serializeConversation 的结果）
+</conversation>
+
+<previous-summary>
+（上一次压缩的摘要，只有存在时才有）
+</previous-summary>
+
+（SUMMARIZATION_PROMPT；有旧摘要时换成 UPDATE_SUMMARIZATION_PROMPT；
+  如果用户给了 /compact 指令，末尾追加 "Additional focus: ..."）
+```
+
+提示词开头的 “The messages above...” 指的就是上面的 `<conversation>` 块，所以顺序不能随意调整。
+
+实验 4 中，第一次摘要请求的开头是：
+
+```text
+<conversation>
+[User]: seed old history
+```
+
+### 5. 压缩条目与投影
+
+**压缩条目（compaction entry）** 是会话文件里追加的一行记录。它保存摘要文本、保留边界 `firstKeptEntryId`、压缩前的 token 数 `tokensBefore`，以及用量和文件详情。它不删除任何旧条目。
+
+**投影（projection）** 是模型实际看到的历史，由 `buildSessionProjection` 从条目计算得出。最新的压缩条目会用它的摘要替代保留边界之前的条目；从 `firstKeptEntryId` 开始的条目保留。
+
+为什么需要：原始历史要保留，因为导出、回放和分支都要用。但发给模型的输入要变小。把“存什么”和“发什么”分开，就能既省上下文，又不丢事实。
+
+小例子：实验 3 中，调用 `appendCompaction` 后，`getEntries()` 仍然有 4 条消息加 1 条压缩条目；只有 `buildSessionContext()` 的结果变短了。
+
+### 6. 溢出恢复
+
+**溢出恢复（overflow recovery）** 是事后补救。它在两种情况下触发：供应商明确报告上下文溢出，或者回答因为长度被截断（`stopReason: "length"`），而且输出没有达到模型的 `maxTokens`。
+
+threshold 是事前检查，overflow 是事后补救。两者都调用同一个压缩过程，但触发条件、是否重试不同。
+
+`_checkCompaction` 中的判断：
+
+- 溢出：`stopReason` 为 `error` 且 `isContextOverflow` 为真；或者回答是完整的（`stop`），而且 `usage.input + usage.cacheRead` 超过窗口。后一种由 `isContextOverflow` 的第二条规则判断（推断溢出）。
+- 可恢复截断：`stopReason` 为 `length`，且 `usage.output` 小于模型的 `maxTokens`（`isRecoverableLength`）。这里的 `maxTokens` 是模型配置的上限，不是被上下文裁剪后的值。
+
+是否重试由 `willRetry` 决定，它等于 `stopReason !== "stop"`：
+
+- 回答已经完整（`stop`），但用量超过窗口：只压缩，不重试。原因是 `continue` 不能接在一条已完成的助手回答后面。实验 6（见动手实验）中，回答是 2500 字符并正常结束，输入 2922 超过窗口 2600，事件是 `overflow`，`willRetry` 为 `false`，没有重试。
+- 回答是错误或截断：先用 `context_edit` 把失败的助手消息（和它的工具结果）从投影中省略，再压缩，然后自动重试一次。实验 5 中，截断的回答被省略，压缩后重试得到 `completed response`。
+
+长度截断的一次完整恢复（实验 5 的真实顺序）：
+
+1. 第一次请求得到 `partial response`，`stopReason` 为 `length`。
+2. `_checkCompaction` 判定为可恢复截断，并把 `_overflowRecoveryAttempted` 设为 `true`。
+3. `_omitRecoveryAttempt` 追加一条 `context_edit`，把截断的回答从投影中省略。
+4. `_runAutoCompaction("overflow", true)` 发出摘要请求（第二次请求），压缩条目写入。
+5. `_handlePostAgentRun` 返回 `true`，`_runAgentPrompt` 调用 `agent.continue()`，发出第三次请求，得到 `completed response`。
+
+溢出恢复只能用一次。`_overflowRecoveryAttempted` 标记记录是否已经尝试过。第二次溢出时，pi 直接报错，文案是：
+
+```text
+Context overflow recovery failed after one compact-and-retry attempt. Try reducing context or switching to a larger-context model.
+```
+
+这个标记在收到新的用户消息时清零，在收到非错误、非截断的助手回答时也清零。
+
+如果恢复压缩失败，省略编辑仍然保留，因此失败的回答不会回到上下文中。pi 不写压缩条目，也不安排内部重试。用户需要自己缩短输入或换用更大窗口的模型。
+
+恢复路径的标志位和调用顺序（名字均来自 `packages/coding-agent/src/core/agent-session.ts`）：
+
+1. `_handlePostAgentRun` 在一次运行结束后调用 `_checkCompaction(message, true, toolResults)`。
+2. `_checkCompaction` 先检查 `sameModel`（回答由当前模型产生），再检查 `assistantIsFromBeforeCompaction`（回答早于最近的压缩条目，直接返回 `false`）。
+3. 计算 `contextOverflow` 与 `recoverableLength`。两者都为假时，进入阈值判断（`contextTokens` 与 `shouldCompact`）。
+4. 为真时，计算 `willRetry = assistantMessage.stopReason !== "stop"`。为 `false` 时直接执行 `_runAutoCompaction("overflow", false)`，不重试。
+5. 为 `true` 时，先看 `this._overflowRecoveryAttempted`。已经是 `true` 时，发出 `compaction_end`（`errorMessage` 为 `Context overflow recovery failed after one compact-and-retry attempt. ...`，截断时是另一句文案）和 `session_compact_failed`，返回 `false`。
+6. 否则设置 `this._overflowRecoveryAttempted = true`，调用 `_omitRecoveryAttempt(assistantMessage, toolResults)`。它为失败的回答和它的工具结果各写入一条 `context_edit`（`replacement` 为 `null`）。如果某条消息在投影中却没有源条目，它会抛出错误。
+7. 调用 `_runAutoCompaction("overflow", willRetry)`。成功时它发出 `compaction_end`（`willRetry` 为 `true`）并返回 `true`。
+8. `_runAgentPrompt` 的循环看到 `true`，调用 `this.agent.continue()`，也就是重试一次。
+9. `_overflowRecoveryAttempted` 回到 `false`，有两个时机：收到 `message_start`（角色为 `user` 的消息），或收到的助手消息既不是 `error` 也不是 `length`。
+
+顺序的理由：`_omitRecoveryAttempt` 在压缩之前写入省略编辑，所以即使压缩失败，失败的回答也不会再进入上下文。标志位保证第二次溢出时直接报错，不会无限重试。
+
+## 源码导览（按阅读顺序）
+
+| 顺序 | 文件路径（相对仓库根） | 符号 | 读的时候关注什么 |
+| ---- | ---------------------- | ---- | ---------------- |
+| 1 | `packages/coding-agent/src/core/system-prompt.ts` | `buildSystemPromptSections` | 八类分节各自的生成条件 |
+| 2 | `packages/coding-agent/src/core/system-prompt.ts` | `buildSystemPromptState`、`buildSystemPrompt`、`diffSystemPromptSections` | `forceSystemPrompt` 的两态；补丁里 `null` 表示删除 |
+| 3 | `packages/coding-agent/src/core/agent-session.ts` | `_preparePromptAndToolLoadout` | 新分节与转录中当前分节做 diff，生成本次系统消息补丁 |
+| 4 | `packages/ai/src/utils/transcript.ts` | `getCurrentSystemMessage` | 重放所有系统消息补丁，得到当前分节 |
+| 5 | `packages/ai/src/utils/text.ts` | `getSystemMessageText` | 分节如何拼接成最终的系统提示文本 |
+| 6 | `packages/coding-agent/src/core/compaction/compaction.ts` | `DEFAULT_COMPACTION_SETTINGS`、`shouldCompact` | 阈值公式与三个默认值；严格大于 |
+| 7 | `packages/coding-agent/src/core/compaction/compaction.ts` | `calculateContextTokens`、`estimateContextTokens`、`estimateProjectedContextTokens` | 三种 token 来源 |
+| 8 | `packages/coding-agent/src/core/agent-session.ts` | `_handlePostAgentRun`、`_checkCompaction` | 每轮结束后的判断链，以及溢出与截断分支 |
+| 9 | `packages/coding-agent/src/core/agent-session.ts` | `_runAutoCompaction` | 压缩执行：事件、扩展钩子、写入、失败记录 |
+| 10 | `packages/coding-agent/src/core/agent-session.ts` | `_omitRecoveryAttempt`、`_overflowRecoveryAttempted` | 省略编辑与一次性标记 |
+| 11 | `packages/coding-agent/src/core/compaction/compaction.ts` | `prepareCompaction`、`findProjectedCutPoint` | 切点、摘要区间和保留区间的计算（`findProjectedCutPoint` 未导出） |
+| 12 | `packages/coding-agent/src/core/compaction/compaction.ts` | `findCutPoint` | 原始条目版切点。它被 `packages/coding-agent/src/index.ts` 导出，测试直接调用；会话主路径用的是投影版 |
+| 13 | `packages/coding-agent/src/core/compaction/compaction.ts` | `compact`、`generateSummaryWithUsage`、`generateTurnPrefixSummary` | 摘要请求的提示词组装与分裂跨度的合并 |
+| 14 | `packages/coding-agent/src/core/compaction/compaction.ts` | `completeSummarization`、`getSummarizationFailure` | 摘要调用的共享入口与失败判定 |
+| 15 | `packages/coding-agent/src/core/compaction/utils.ts` | `serializeConversation`、`SUMMARIZATION_SYSTEM_PROMPT` | 历史如何变成“待处理材料”的文本 |
+| 16 | `packages/coding-agent/src/core/session-manager.ts` | `buildSessionProjection`、`appendCompaction` | 投影如何被压缩条目改写，以及条目如何追加 |
+| 17 | `packages/coding-agent/src/core/messages.ts` | `convertToLlm`、`COMPACTION_SUMMARY_PREFIX` | 压缩摘要发给模型时的包装文本 |
+| 18 | `packages/ai/src/utils/overflow.ts` | `isContextOverflow`、`isRecoverableLength` | 溢出与可恢复截断的判定依据 |
+| 19 | `packages/coding-agent/test/suite/harness.ts` | `createHarness`（异步函数） | 离线会话与假模型，实验中使用 |
+
+## 走读一次完整过程
+
+下面按实验 4 的真实运行顺序，描述一次阈值压缩。每一步写明发生了什么，对应哪个函数，状态有什么变化。
+
+1. 用户发送 `seed old history`。`AgentSession.prompt` 进入 `_runAgentPrompt`。在发请求前，`_preparePromptAndToolLoadout` 调用 `buildSystemPromptSections` 生成新分节，并与转录中的当前分节 diff。首次运行时，它产生一条系统消息补丁，写入条目（条目 1）。
+2. 助手回答 2500 字符。`_handlePostAgentRun` 调用 `_checkCompaction(message, true, toolResults)`。用量 2051，`shouldCompact(2051, 2600, ...)` 返回 `false`，因为阈值是 2200。
+3. 用户发送 `seed recent history`，助手回答 1200 字符，用量 2360。`_handlePostAgentRun` 再次调用 `_checkCompaction`，这次 `shouldCompact` 返回 `true`。`_runAutoCompaction("threshold", false)` 发出 `compaction_start`，`reason` 为 `threshold`。
+4. `prepareCompaction(pathEntries, settings)` 在投影上计算。它从后往前累计，在最后一条助手回答处达到 300 token，选择它作为切点，即 `firstKeptEntryId`。因为切点不是用户消息，所以是分裂跨度：`messagesToSummarize` 为第一轮的用户和助手消息，`turnPrefixMessages` 为第二轮的用户消息。
+5. 发出 `session_before_compact` 扩展事件。本例没有扩展，因此使用默认摘要器。
+6. `_runDefaultCompaction` 调用 `compact`。它先对历史发一次摘要请求，再对前缀发一次摘要请求，两次结果用分隔线合并。本例没有文件操作，因此不追加文件列表。
+7. `sessionManager.appendCompaction(summary, firstKeptEntryId, tokensBefore, ...)` 追加压缩条目。前 5 个条目保持不变。发出 `compaction_end`：`tokensBefore` 为 2360，`estimatedTokensAfter` 为约 1735。
+8. `_checkCompaction` 返回 `false`，`willRetry` 为 `false`，并且没有排队的消息。本次运行结束。
+9. 之后的请求，投影是“系统提示、摘要、助手的回答”，再加上新的消息。
+
+### 失败路径（源码路径，未单独运行）
+
+如果摘要请求失败，例如模型返回 `error`，或摘要因为长度被截断：
+
+1. `_runAutoCompaction` 的 `catch` 发出 `compaction_end`，`aborted` 为 `false`，`errorMessage` 为 `Auto-compaction failed: ...`（阈值压缩）或 `Context overflow recovery failed: ...`（溢出压缩）。
+2. 同时发出 `session_compact_failed`。
+3. 没有调用 `appendCompaction`，所以磁盘上没有新条目，投影也不变。
+4. 阈值压缩不重试。下一次 `prompt` 开始时，`_checkCompaction` 会再检查一次。
+
+### 溢出但回答完整（2500 字符案例）
+
+实验 6 的 `d` 模式：提示是 6000 个 `x`，回答是 2500 个 `a`，模型正常结束（`stop`）。
+
+输出（真实运行结果）：
+
+```text
+requests: 2 pending: 0
+compaction_start: ["overflow"]
+compaction_end: {"reason":"overflow","willRetry":false,"tokensBefore":3547,"estimatedTokensAfter":2058}
+assistant input/output: 2922 625
+```
+
+过程：回答完整，所以 `willRetry` 为 `false`，代码不进入恢复分支（第 4 步）。`isContextOverflow` 的第二条规则发现 `input` 2922 超过窗口 2600，于是执行 `_runAutoCompaction("overflow", false)`。请求只有 2 次：回答本身，以及一次摘要请求。因为不走恢复分支，所以不写 `context_edit`，也不重试。
+
+### 压缩前后：模型输入对照
+
+下面是“如果不压缩”与“实际压缩后”两种情况下，下一次请求中模型看到的历史。
+
+| 位置 | 压缩前（投影的 5 条消息） | 压缩后（投影的 3 条消息） |
+| ---- | ------------------------- | ------------------------- |
+| 1 | 系统提示（分节） | 同一份系统提示，分节未变 |
+| 2 | 用户：`seed old history` | 被摘要替代 |
+| 3 | 助手：2500 个字符 `a` | 被摘要替代 |
+| 4 | 用户：`seed recent history` | 被摘要替代（分裂跨度的前缀） |
+| 5 | 助手：1200 个字符 `b` | 助手：1200 个字符 `b`，即 `firstKeptEntryId` |
+| 新增 | 无 | 压缩摘要（`compactionSummary`）：摘要文本 |
+| 新输入（`next question`）后的请求 | 6 条：系统提示 + 4 条历史 + 新输入（实验 k） | 4 条：系统提示 + 摘要 + 保留的回答 + 新输入（实验 t） |
+| 用量 | 约 2360 token（上一次用量） | 估算 1735（`estimatedTokensAfter`）；压缩后真实请求的 `input` 为 1781 |
+
+发给模型时，压缩摘要会被 `convertToLlm` 包装成一条用户文本，前面是 `COMPACTION_SUMMARY_PREFIX`：
+
+```text
+The conversation history before this point was compacted into the following summary:
+
+<summary>
+...摘要文本...
+</summary>
+```
+
+磁盘上的条目对照：
+
+- 压缩前：`message:system`、`message:user`、`message:assistant`、`message:user`、`message:assistant`。
+- 压缩后：同样 5 条，再加一条 `compaction`。原始消息没有被删除。
+
+注意：实验输出中 `tokensBefore` 与 `estimatedTokensAfter` 在两次运行间可能相差 1 到 2 个 token，因为系统提示里有路径等与环境有关的内容。
+
+## 动手实验
+
+本篇所有实验都使用假模型（faux），不调用真实 API，也不需要密钥。
+
+准备：
+
+- 需要支持 `.mts` 与类型剥离的 Node。本地用 Node v23.9.0 验证。输出开头可能有一行 `ExperimentalWarning`（类型剥离的提示），可以忽略。
+- 依赖缺失时，在仓库根执行 `npm install --ignore-scripts`。不要运行 `npm run build` 或完整测试套件。
+- 脚本需要在仓库根目录运行，因为它用 `process.cwd()` 找到源码。
+
+把下面的脚本保存为系统临时目录中的 `task09-exp/exp.mts`。Windows 上是 `$env:TEMP\task09-exp\exp.mts`，bash 中是 `$TEMP/task09-exp/exp.mts`。实验结束后按本节末尾的命令删除。
+
+```ts
+import { join } from "node:path";
+import { pathToFileURL } from "node:url";
+
+const mode = process.argv[2];
+const load = (rel: string) => import(pathToFileURL(join(process.cwd(), rel)).href);
+
+if (mode === "a") {
+  const comp = await load("packages/coding-agent/src/core/compaction/compaction.ts");
+  const sp = await load("packages/coding-agent/src/core/system-prompt.ts");
+  const sm = await load("packages/coding-agent/src/core/session-manager.ts");
+
+  const s = { enabled: true, reserveTokens: 200, keepRecentTokens: 100 };
+  console.log("1a shouldCompact(850, 1000, s):", comp.shouldCompact(850, 1000, s));
+  console.log("1b enabled=false:", comp.shouldCompact(850, 1000, { ...s, enabled: false }));
+  console.log("1c at the boundary 800:", comp.shouldCompact(800, 1000, s));
+  console.log("1d defaults:", JSON.stringify(comp.DEFAULT_COMPACTION_SETTINGS));
+  console.log("1e window 200000, 183616:", comp.shouldCompact(183616, 200000, comp.DEFAULT_COMPACTION_SETTINGS));
+  console.log("1f window 200000, 183617:", comp.shouldCompact(183617, 200000, comp.DEFAULT_COMPACTION_SETTINGS));
+
+  const input = {
+    cwd: "C:/demo",
+    selectedTools: ["read", "bash", "edit", "write"],
+    toolSnippets: { read: "Read file contents", bash: "Execute bash commands", edit: "Make precise edits", write: "Create or overwrite files" },
+    contextFiles: [{ path: "C:/demo/AGENTS.md", content: "请只读当前目录" }],
+  };
+  const withFile = sp.buildSystemPromptSections(input);
+  const withoutFile = sp.buildSystemPromptSections({ ...input, contextFiles: [] });
+  console.log("2a sections:", Object.keys(withFile).join(", "));
+  console.log("2b cwd section:", JSON.stringify(withFile.cwd));
+  console.log("2c patch after removing AGENTS.md:", JSON.stringify(sp.diffSystemPromptSections(withFile, withoutFile)));
+  console.log("2d patch when nothing changed:", sp.diffSystemPromptSections(withFile, withFile));
+  console.log("2e forced prompt state:", JSON.stringify(sp.buildSystemPromptState({ cwd: "C:/demo", forceSystemPrompt: "FORCED" })));
+
+  const m = sm.SessionManager.inMemory("C:/demo");
+  const usage = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } };
+  const user = (text: string, t: number) => ({ role: "user", content: text, timestamp: t });
+  const asst = (text: string, t: number) => ({ role: "assistant", content: [{ type: "text", text }], api: "faux", provider: "faux", model: "faux-1", usage, stopReason: "stop", timestamp: t });
+  m.appendMessage(user("early question", 1));
+  m.appendMessage(asst("early answer", 2));
+  const keep = m.appendMessage(user("recent question", 3));
+  m.appendMessage(asst("recent answer", 4));
+  const show = (label: string) =>
+    console.log(label, JSON.stringify(m.buildSessionContext().messages.map((x: any) =>
+      x.role === "compactionSummary" ? ["compactionSummary", x.summary] : [x.role, typeof x.content === "string" ? x.content : x.content.map((c: any) => c.text).join("")])));
+  show("3a before:");
+  m.appendCompaction("## Goal\nsummary of early turn", keep, 1234);
+  show("3b after:");
+  console.log("3c entry types:", m.getEntries().map((e: any) => e.type).join(","));
+  console.log("3d early question still stored:", m.getEntries().some((e: any) => e.message?.content === "early question"));
+} else if (mode === "b") {
+  const { createHarness } = await load("packages/coding-agent/test/suite/harness.ts");
+  const { fauxAssistantMessage } = await load("packages/ai/dist/compat.js");
+
+  // Window 2600 - reserve 400 = 2200 allowed. Turn 2 usage is 2360, so the threshold fires.
+  const h = await createHarness({
+    models: [{ id: "faux-1", contextWindow: 2600, maxTokens: 100 }],
+    settings: { compaction: { enabled: true, reserveTokens: 400, keepRecentTokens: 300 } },
+  });
+  const requests: string[] = [];
+  const replies = [
+    "a".repeat(2500),
+    "b".repeat(1200),
+    "## Goal\nsummary of the older turns",
+    "answer for the split turn",
+    "fourth answer",
+  ];
+  h.setResponses(
+    replies.map((text) => (context: any) => {
+      const last = context.messages.at(-1);
+      const body = typeof last?.content === "string" ? last.content : last?.content?.[0]?.text ?? "";
+      requests.push(`${context.messages.length} messages, last ${last?.role}: ${JSON.stringify(body.slice(0, 40))}`);
+      return fauxAssistantMessage(text);
+    }),
+  );
+  await h.session.prompt("seed old history");
+  await h.session.prompt("seed recent history");
+
+  console.log("faux requests:", requests.length, "pending:", h.getPendingResponseCount());
+  requests.forEach((line, i) => console.log(`request ${i + 1}: ${line}`));
+  console.log("compaction_start:", JSON.stringify(h.eventsOfType("compaction_start").map((e: any) => e.reason)));
+  const end: any = h.eventsOfType("compaction_end").at(-1);
+  console.log("compaction_end:", JSON.stringify({ reason: end?.reason, aborted: end?.aborted, willRetry: end?.willRetry, tokensBefore: end?.result?.tokensBefore, estimatedTokensAfter: end?.result?.estimatedTokensAfter }));
+  const entries: any[] = h.sessionManager.getEntries();
+  console.log("entries:", entries.map((e) => e.type + (e.type === "message" ? ":" + e.message.role : "")).join(" | "));
+  const comp = entries.find((e) => e.type === "compaction");
+  if (comp) {
+    console.log("firstKeptEntry role:", entries.find((e) => e.id === comp.firstKeptEntryId)?.message?.role);
+    console.log("summary:", JSON.stringify(comp.summary));
+  }
+  console.log("projection roles:", h.sessionManager.buildSessionContext().messages.map((x: any) => x.role).join(","));
+  h.cleanup();
+} else if (mode === "c") {
+  const { createHarness } = await load("packages/coding-agent/test/suite/harness.ts");
+  const { fauxAssistantMessage } = await load("packages/ai/dist/compat.js");
+
+  // A length stop below the desired max output is a recoverable overflow.
+  const h = await createHarness({
+    models: [{ id: "faux-1", contextWindow: 1000, maxTokens: 100 }],
+    settings: { compaction: { keepRecentTokens: 1, reserveTokens: 0 } },
+  });
+  h.setResponses([
+    fauxAssistantMessage("partial response", { stopReason: "length" }),
+    fauxAssistantMessage("## Goal\nsummary of the long prompt"),
+    fauxAssistantMessage("completed response"),
+  ]);
+  await h.session.prompt("x".repeat(5000));
+  console.log("faux requests:", h.faux.state.callCount);
+  console.log("compaction_start:", JSON.stringify(h.eventsOfType("compaction_start").map((e: any) => e.reason)));
+  const end: any = h.eventsOfType("compaction_end").at(-1);
+  console.log("compaction_end:", JSON.stringify({ reason: end?.reason, aborted: end?.aborted, willRetry: end?.willRetry, tokensBefore: end?.result?.tokensBefore }));
+  console.log("entries:", h.sessionManager.getEntries().map((e: any) => e.type + (e.type === "message" ? ":" + e.message.role : "")).join(" | "));
+  console.log("last assistant:", h.session.getLastAssistantText());
+  h.cleanup();
+} else {
+  throw new Error("usage: node exp.mts a|b|c");
+}
+```
+
+### 实验 1：阈值判断（5 分钟）
+
+目的：确认阈值公式、严格大于和默认值。
+
+步骤：PowerShell 中执行 `node "$env:TEMP\task09-exp\exp.mts" a`，bash 中执行 `node "$TEMP/task09-exp/exp.mts" a`。只看以 `1` 开头的几行。
+
+预期输出（前 6 行，真实运行结果）：
+
+```text
+1a shouldCompact(850, 1000, s): true
+1b enabled=false: false
+1c at the boundary 800: false
+1d defaults: {"enabled":true,"reserveTokens":16384,"keepRecentTokens":20000}
+1e window 200000, 183616: false
+1f window 200000, 183617: true
+```
+
+观察：`800` 恰好等于 `1000 - 200`，不触发。这说明判断是严格大于。
+
+### 实验 2：系统提示的分节与补丁
+
+目的：看到分节名字、补丁形状和 `forceSystemPrompt` 的区别。
+
+步骤：同一命令 `a`，看以 `2` 开头的几行。
+
+预期输出（真实运行结果）：
+
+```text
+2a sections: preamble, tools, rules, docs, project_context, cwd
+2b cwd section: "<cwd>\nC:/demo\n</cwd>"
+2c patch after removing AGENTS.md: {"project_context":null}
+2d patch when nothing changed: undefined
+2e forced prompt state: {"content":"FORCED"}
+```
+
+观察与思考：
+
+- 2c 只删除了 `project_context`。其余分节没有出现在补丁里。
+- 2d 没有变化时返回 `undefined`，因此没有新的系统消息写入转录。
+- 2e 的 `forceSystemPrompt` 只有 `content`，没有分节，无法打补丁。
+- 字符数不能直接当作 token 数。`estimateTokens` 用字符数除以 4 粗估，中文可能偏差较大（见选读）。
+
+### 实验 3：压缩前后的投影对照（不调用模型）
+
+目的：确认压缩条目只改变投影，不删除原始条目。
+
+步骤：命令 `a`，看以 `3` 开头的几行。
+
+预期输出（真实运行结果）：
+
+```text
+3a before: [["user","early question"],["assistant","early answer"],["user","recent question"],["assistant","recent answer"]]
+3b after: [["compactionSummary","## Goal\nsummary of early turn"],["user","recent question"],["assistant","recent answer"]]
+3c entry types: message,message,message,message,compaction
+3d early question still stored: true
+```
+
+观察：压缩条目的 `firstKeptEntryId` 指向 `recent question`。之前的两条消息被摘要替代，但仍在条目列表中。
+
+### 实验 4：假模型触发阈值压缩
+
+目的：从真实的会话 `prompt()` 流程看到阈值压缩，并数清模型请求。
+
+步骤：命令 `b`。
+
+预期输出（真实运行结果；数值可能有 1 到 2 个 token 的波动）：
+
+```text
+faux requests: 4 pending: 1
+request 1: 2 messages, last user: "seed old history"
+request 2: 4 messages, last user: "seed recent history"
+request 3: 2 messages, last user: "<conversation>\n[User]: seed old history\n"
+request 4: 2 messages, last user: "# Conversation\n[User]: seed recent histo"
+compaction_start: ["threshold"]
+compaction_end: {"reason":"threshold","aborted":false,"willRetry":false,"tokensBefore":2360,"estimatedTokensAfter":1735}
+entries: message:system | message:user | message:assistant | message:user | message:assistant | compaction
+firstKeptEntry role: assistant
+summary: "## Goal\nsummary of the older turns\n\n---\n\n**Turn Context (split turn):**\n\nanswer for the split turn"
+projection roles: system,compactionSummary,assistant
+```
+
+观察与思考：
+
+- 请求 3 是历史摘要，请求 4 是分裂跨度前缀的摘要。它们的提示词格式不同：前者以 `<conversation>` 开头，后者以 `# Conversation` 开头。这两次调用都经过同一个 `completeSummarization`。
+- 第 5 个假回答没有被消费，因为压缩后没有新的模型请求。
+- 把 `keepRecentTokens` 改为 1750 再运行一次：2360 的用量仍超过阈值，但没有任何压缩事件。原因是非系统消息的估算总量只有 934 token，低于 1750。`findProjectedCutPoint` 从后往前累计时达不到预算，切点停在第一个合法点，摘要区为空，`prepareCompaction` 返回 `undefined`，不发任何事件（实验 6 的 `e` 模式复现了这一点）。
+
+### 实验 5：长度截断的溢出恢复
+
+目的：看到截断回答触发的恢复压缩，并确认失败的回答被省略，而不是删除。
+
+步骤：命令 `c`。
+
+预期输出（真实运行结果）：
+
+```text
+faux requests: 3
+compaction_start: ["overflow"]
+compaction_end: {"reason":"overflow","aborted":false,"willRetry":true,"tokensBefore":2661}
+entries: message:system | message:user | message:assistant | context_edit | compaction | message:assistant
+last assistant: completed response
+```
+
+观察与思考：
+
+- 三次请求分别是：被截断的回答、摘要请求、重试的回答。
+- `context_edit` 排在压缩条目之前。它把被截断的回答从投影中省略，但它仍在条目列表里。
+- `willRetry` 为 `true`，所以压缩结束后 pi 会自动重试一次。
+
+### 实验 6：保存的边界脚本（溢出完整回答、无事件、新输入后的请求数）
+
+目的：复现两个边界。`d` 模式：回答完整，但输入超过窗口。`e` 模式：用量超过阈值，但历史太短，没有压缩事件。`t` 与 `k` 对照新输入后的请求消息数：压缩后 4 条，压缩前 6 条。
+
+步骤：把下面的脚本保存为系统临时目录中的 `task09-exp/exp-boundary.mts`。在仓库根执行。PowerShell 中是 `node "$env:TEMP\task09-exp\exp-boundary.mts" d`；bash 中是 `node "$TEMP/task09-exp/exp-boundary.mts" d`。把最后的 `d` 换成 `e`、`t` 或 `k` 即可运行其他模式。
+
+```ts
+import { join } from "node:path";
+import { pathToFileURL } from "node:url";
+
+// Run from the repository root: node exp-boundary.mts t|k|d|e
+const mode = process.argv[2];
+const load = (rel: string) => import(pathToFileURL(join(process.cwd(), rel)).href);
+const { createHarness } = await load("packages/coding-agent/test/suite/harness.ts");
+const { fauxAssistantMessage } = await load("packages/ai/dist/compat.js");
+
+// Context window 2600 and reserveTokens 400, so the threshold is 2200.
+const models = [{ id: "faux-1", contextWindow: 2600, maxTokens: 100 }];
+const compaction = (enabled: boolean, keepRecentTokens: number) => ({ compaction: { enabled, reserveTokens: 400, keepRecentTokens } });
+
+// Each reply logs how many messages (system included) the model received.
+const logged = (replies: string[]) =>
+  replies.map((text, i) => (context: any) => {
+    console.log(`request ${i + 1}: ${context.messages.length} messages`);
+    return fauxAssistantMessage(text);
+  });
+
+const report = (h: any) => {
+  console.log("requests:", h.faux.state.callCount, "pending:", h.getPendingResponseCount());
+  console.log("compaction_start:", JSON.stringify(h.eventsOfType("compaction_start").map((e: any) => e.reason)));
+  const end: any = h.eventsOfType("compaction_end").at(-1);
+  console.log("compaction_end:", JSON.stringify({ reason: end?.reason, willRetry: end?.willRetry, tokensBefore: end?.result?.tokensBefore, estimatedTokensAfter: end?.result?.estimatedTokensAfter }));
+  for (const e of h.sessionManager.getEntries().filter((x: any) => x.type === "message" && x.message.role === "assistant")) {
+    console.log("assistant input/output:", e.message.usage.input, e.message.usage.output);
+  }
+  h.cleanup();
+};
+
+if (mode === "t" || mode === "k") {
+  // t: threshold compaction (keepRecentTokens 300), then a third prompt. k: same prompts, compaction disabled.
+  const enabled = mode === "t";
+  const h = await createHarness({ models, settings: compaction(enabled, 300) });
+  h.setResponses(logged(enabled ? ["a".repeat(2500), "b".repeat(1200), "## Goal\nsummary of the older turns", "answer for the split turn", "fourth answer"] : ["a".repeat(2500), "b".repeat(1200), "next answer"]));
+  await h.session.prompt("seed old history");
+  await h.session.prompt("seed recent history");
+  await h.session.prompt("next question");
+  report(h);
+  console.log("projection roles:", h.sessionManager.buildSessionContext().messages.map((x: any) => x.role).join(","));
+} else if (mode === "d") {
+  // A 2500-character reply that completes (stop) while the input alone is over 2600 tokens.
+  const h = await createHarness({ models, settings: compaction(true, 300) });
+  h.setResponses([fauxAssistantMessage("a".repeat(2500)), fauxAssistantMessage("## Goal\nsummary of the long prompt")]);
+  await h.session.prompt("x".repeat(6000));
+  report(h);
+} else if (mode === "e") {
+  // Usage crosses 2200, but keepRecentTokens (1750) is larger than all message tokens, so no event.
+  const h = await createHarness({ models, settings: compaction(true, 1750) });
+  h.setResponses([fauxAssistantMessage("a".repeat(2500)), fauxAssistantMessage("b".repeat(1200))]);
+  await h.session.prompt("seed old history");
+  await h.session.prompt("seed recent history");
+  report(h);
+} else {
+  throw new Error("usage: node exp-boundary.mts t|k|d|e");
+}
+```
+
+预期输出（真实运行结果，即本次运行的输出）：
+
+```text
+# t
+request 1: 2 messages
+request 2: 4 messages
+request 3: 2 messages
+request 4: 2 messages
+request 5: 4 messages
+requests: 5 pending: 0
+compaction_start: ["threshold"]
+compaction_end: {"reason":"threshold","willRetry":false,"tokensBefore":2360,"estimatedTokensAfter":1735}
+assistant input/output: 1426 625
+assistant input/output: 2060 300
+assistant input/output: 1781 4
+projection roles: system,compactionSummary,assistant,user,assistant
+# k
+request 1: 2 messages
+request 2: 4 messages
+request 3: 6 messages
+requests: 3 pending: 0
+compaction_start: []
+compaction_end: {}
+assistant input/output: 1426 625
+assistant input/output: 2060 300
+assistant input/output: 2368 3
+projection roles: system,user,assistant,user,assistant,user,assistant
+# d
+requests: 2 pending: 0
+compaction_start: ["overflow"]
+compaction_end: {"reason":"overflow","willRetry":false,"tokensBefore":3547,"estimatedTokensAfter":2058}
+assistant input/output: 2922 625
+# e
+requests: 2 pending: 0
+compaction_start: []
+compaction_end: {}
+assistant input/output: 1426 625
+assistant input/output: 2060 300
+```
+
+观察与思考：
+
+- `t` 中新输入的请求有 4 条消息；`k` 中同一位置有 6 条。压缩后投影变短，但原始消息仍在磁盘上。
+- `d` 中 `input` 为 2922，超过 2600，所以 `reason` 是 `overflow`，`willRetry` 为 `false`。
+- `e` 中第二次用量为 2360，超过 2200，但没有 `compaction_start` 事件，原因见实验 4 之后的 `keepRecentTokens` 说明。
+- 这些数字来自本地运行。`estimatedTokensAfter` 在两次运行间可能有 1 个 token 的波动（另一次运行得到 1736）。
+
+### 清理
+
+PowerShell：
+
+```powershell
+Remove-Item -Recurse -Force "$env:TEMP\task09-exp"
+```
+
+bash：
+
+```bash
+rm -rf "$TEMP/task09-exp"
+```
+
+## 自测题
+
+1. 窗口 8000，预留 1000，上下文用量 7000。会触发自动压缩吗？为什么？
+2. 系统提示为什么要分节？如果把整段提示当成一个字符串，会出现什么问题？
+3. 切点为什么不能落在工具结果上？请举一个模型会看错的例子。
+4. 压缩之后，磁盘上的原始消息还在吗？模型下一次请求看到的是什么？
+5. 溢出后 pi 最多重试几次？如果恢复压缩失败，省略编辑还保留吗？
+
+### 参考答案
+
+1. 不会。阈值是 `8000 - 1000 = 7000`，判断是严格大于，7000 不大于 7000。
+2. 分节让每个部分有名字，可以单独替换或删除。会话只记录补丁，不必每次重发整段。如果是一整个字符串，任何变化都要整段重发，也无法知道哪一部分变了。
+3. 工具结果必须和发出它的调用在一起。如果切点落在结果上，保留下来的结果没有对应的调用。例如模型看到“文件内容是 X”，却不知道是哪次 `read` 得到的。
+4. 还在。压缩只追加一条压缩条目，并改写投影。模型下一次请求看到的是系统提示、摘要和保留边界之后的消息。
+5. 只重试一次。恢复失败时，省略编辑保留，因此失败的回答不会回到上下文中；pi 不写压缩条目，也不安排内部重试。
+
+## 常见错误
+
+- 现象：窗口还没满，却触发了压缩。
+  原因：默认 `reserveTokens` 为 16384，阈值是窗口减去它。小窗口模型的阈值会很低。
+  解决：调整 `compaction.reserveTokens`，或在 `compaction.modelOverrides` 中为该模型设置精确的 `provider/modelId`。不要修改判断代码。
+
+- 现象：用量超过阈值，但没有任何压缩事件。
+  原因：历史总量比 `keepRecentTokens` 还小，`prepareCompaction` 找不到可摘要的消息，于是返回 `undefined`，不发任何事件（实验 4 的对照）。
+  解决：降低 `keepRecentTokens`，或确认历史确实足够长。
+
+- 现象：压缩事件的 `reason` 是 `overflow`，而不是 `threshold`，并且没有重试。
+  原因：最后一条回答已经完整（`stopReason` 为 `stop`），但它的用量超过了窗口。这是推断溢出，压缩后不重试，因为 `continue` 不能接在完整回答后面。
+  解决：这不是错误。减少输入，或换用窗口更大的模型。
+
+- 现象：压缩后模型忘了某个细节。
+  原因：摘要是按固定骨架写的，没有进入摘要的细节会丢失。
+  解决：把需要长期保留的事实写入文件（例如 AGENTS.md），或用 `/compact <指令>` 指定摘要的重点。可以检查摘要末尾的 `<read-files>` 和 `<modified-files>` 是否包含需要的文件。
+
+- 现象：`modelOverrides` 写了，但没有生效。
+  原因：键必须是精确的 `provider/modelId`，例如 `faux/faux-1`。大小写或前缀不对就不会匹配。
+  解决：使用 `packages/coding-agent/docs/settings.md` 中描述的完整键名。
+
+## 选读：源码深入（可选，跳过不影响主线）
+
+以下内容超出主线，供需要时查阅。每一段都标明了对应的源码符号。
+
+### A. 系统提示的细节
+
+- `normalizeBuildSystemPromptOptions` 对数组和对象做拷贝。扩展的 `before_agent_start` 处理器可以修改这些集合，但不会影响调用方传入的原对象。
+- `buildRules` 用 `Set` 去重，比较时先 `trim()`。只要 `grep`、`find`、`ls` 中有一个被选中，就不加“用 shell 做文件操作”的规则。因此禁用 `grep` 会改变 `rules` 分节。这是规则组合变化的结果，不是 bug。
+- 调用方传入的 `sections` 可以覆盖内置分节（例如 `rules`）。构建函数只校验名字是否匹配 `^[a-z][a-z0-9_-]*$`，并且不能叫 `preamble`，不做其他保护。
+- `renderProjectContext` 不转义内容。如果 AGENTS.md 中写了 `</project_instructions>`，标签会提前闭合。标签是给模型的结构提示，不是安全边界。
+- `buildSystemPromptState` 用 `forceSystemPrompt !== undefined` 判断，因此空字符串也算强制覆盖。
+- `diffSystemPromptSections` 按字符串全等比较。分节中只要有一个字符变化，整段都会进入补丁。把每轮都变的内容（例如当前时间）放进分节，会让每一轮都整段重发。
+
+### B. token 估算
+
+- `calculateContextTokens` 写作 `usage.totalTokens || 分项之和`。`totalTokens` 为 0 时也会走分项求和。
+- `estimateTokens` 用字符数除以 4，图片固定按 4800 字符计算。源码注释说它偏保守。对中文文本，一个汉字通常不止 0.25 个 token，因此中文估算可能偏小。未在本地验证，需要用真实用量校对。
+- `estimateContextTokens` 有用量时，用“最后一条用量 + 之后消息的估算”。
+- `estimateProjectedContextTokens` 在有编辑时使用。如果最后一条用量早于某次编辑或压缩，它不信任这条用量。
+
+### C. `_checkCompaction` 的判断链
+
+按顺序：
+
+1. `settings.enabled` 为 `false` 时直接返回。
+2. 用户取消的回答（`aborted`）不触发压缩。`skipAbortedCheck` 在 turn 结束后为 `true`，在 prompt 前为 `false`，因为新输入即将发出，必须检查。
+3. `sameModel`：消息的模型与当前模型不同，就不做溢出判断。旧模型的溢出错误不应触发新模型的压缩。
+4. `assistantIsFromBeforeCompaction`：消息时间戳早于最近的压缩条目，直接返回 `false`。
+5. `assistantIsProjected` 与 `hasPostAssistantContextEdit`：已被省略或之后有编辑的消息，用量不再可信。
+6. `assistantRetainedForExplicitRecovery`：显式错误只有在失败消息仍在上下文中时才恢复。
+7. 三种 token 口径（见核心概念 3）。
+
+### D. `_runAutoCompaction` 的执行过程
+
+- 发出 `compaction_start`，创建 `AbortController`。`abortCompaction()` 可以取消它。
+- 发出 `session_before_compact` 扩展事件，载荷包括 `preparation`、`branchEntries`、`reason`、`willRetry` 和 `signal`。扩展可以返回 `cancel`（按取消处理），也可以返回自定义的 `compaction`，此时跳过默认摘要器。
+- 默认路径调用 `_runDefaultCompaction`，它与手动 `/compact` 共用。
+- `appendCompaction` 写入条目。然后发出 `session_compact`（扩展视角，带条目对象），再发出 `compaction_end`（界面视角，带结果）。
+- 失败时，`compaction_end` 的 `errorMessage` 按 `reason` 区分，文案分别是 “Context overflow recovery failed: ...” 和 “Auto-compaction failed: ...”。同时发出 `session_compact_failed`。
+- 返回值有两种含义：`willRetry` 为真时，调用方续跑（溢出恢复）；否则，如果有排队的消息（`hasQueuedMessages()`），续跑一次把它们交付。
+- `finally` 只清理自己的 `AbortController`，并唤醒等待空闲的调用方。
+
+### E. 切点的细节
+
+- `findCutPoint`（原始条目）与 `findProjectedCutPoint`（投影条目）的累计与切点规则相同。投影版还处理溢出恢复后的省略尾部：只有当尾部全是被省略的不可见条目、包含被省略的助手尝试、并且没有外部替换时，切点才前移一格。
+- 紧挨切点之前的元数据条目（例如模型切换）会并入保留区，不会出现在保留区开头。
+- 压缩条目既不是切点，也不作为新摘要的素材。新摘要的起点是上一次的保留边界，而不是压缩条目本身。
+
+### F. 摘要的合并与用量
+
+- 分裂跨度时，如果没有更早的历史，`historyText` 默认为字符串 `"No prior history."`。如果有旧摘要，就用旧摘要。
+- 前缀摘要的提示词要求只概括切点之前的内容，不要重造后面的消息。它没有“更新”版本，因为前缀是一次性切出来的。
+- 两次摘要的用量用 `combineUsage` 相加。
+- `/compact` 的指令只传给历史摘要，不传给前缀摘要。
+- 需要纯文本时，`generateSummary` 返回摘要文本，`generateSummaryWithUsage` 返回 `{ text, usage }`。
+
+### G. 文件列表
+
+- `extractFileOperations` 先从上一次压缩的详情中继承 `readFiles` 与 `modifiedFiles`。前提是上一次压缩不是扩展生成的（`fromHook` 为假）。
+- `extractFileOpsFromMessage` 只识别 `read`、`write`、`edit` 三个工具名，并且参数中要有字符串 `path`。`bash` 的 `command` 不会被追踪。
+- `computeFileLists` 中，只读列表等于 `read` 减去 `modified`，两个列表都排序，输出确定。
+- 被修改过的文件只出现在 `modifiedFiles`。这样下一轮模型不会以为它看到的是最新内容。
+
+### H. 扩展钩子与分支摘要
+
+- 扩展事件类型 `session_before_compact`、`session_compact_failed`、`session_before_tree` 定义在 `packages/coding-agent/src/core/extensions/types.ts`。
+- 分支摘要：`/tree` 切换分支时，可以对被放弃的路径生成摘要。实现在 `packages/coding-agent/src/core/compaction/branch-summarization.ts`，符号包括 `collectEntriesForBranchSummary`、`prepareBranchEntries`、`generateBranchSummary`。本篇只确认了这些符号存在，没有逐行阅读其行为，未在本地验证。
+
+### I. TypeScript 小课：`?.`、`??` 与 `||`
+
+`?.` 在左侧为 `null` 或 `undefined` 时停止读取属性，结果为 `undefined`。`??` 只在值为 `null` 或 `undefined` 时使用默认值。`||` 对所有假值（包括 `0`）都使用默认值。
+
+压缩设置里 `0` 可能是有效值，比如 `reserveTokens: 0`。这时要用 `??`，不能用 `||`：
 
 ```typescript
 type Config = { compaction?: { reserveTokens?: number } };
@@ -34,2987 +873,27 @@ const wrong = config.compaction?.reserveTokens || 200; // 0 被错误替换成 2
 console.assert(reserve === 0 && wrong === 200);
 ```
 
-练习：把配置改为 `{}`，观察两个表达式都得到 200；再在 `shouldCompact` 的输入中区分默认值与显式值。
-
-
-## 完整学习资料
-
-先按下列正文完成学习，再执行本篇的动手任务。正文中原书的实验与验收题先作为案例阅读，实际动手统一放到文末；只运行本篇“今日准备”和动手任务明确指定的离线命令。章节编号保留知识主题的原编号；源码精读、示例、边界条件、常见错误和参考答案均直接收录在本文件中。开头的预计用时仅指核心主线，完整源码精读需另留时间。
-
-### 本篇共同基础
-
-以下运行图和术语均在本文件内。学习正文保留原手册的知识主题编号，但那些编号不构成本任务的阅读前置；实际操作按本篇的动手任务与验收标准执行。学习正文基于原手册注明的 `200387122ca450d6387f033949423114a270b96c` 源码基线，当前工作区若有差异，以当前源码为准。
-
-### 15 分钟主线：pi 怎样完成一件事
-
-假设用户输入“读取 demo.txt，并总结三点”。模型自己不能读取你电脑里的文件。pi 把用户问题和可用工具告诉模型；模型提出 `read` 调用；pi 在本地执行；模型拿到文件内容后才生成总结。这就是全书反复使用的同一个例子。
-
-**先看不带 TypeScript 细节的主流程（教学伪代码）：**
-
-```text
-收到用户输入，把它加入当前会话
-重复：
-    用当前上下文向模型发起请求
-    收集模型的回答并把过程通知界面
-    如果回答要求执行工具：
-        校验参数，在本地执行工具，记录结果
-        继续循环，让模型看到工具结果
-    否则，检查是否还有排队输入或明确的继续决定
-    如果都没有：结束本次运行
-```
-
-第一行确定这次任务和已有历史。模型请求只负责生成回答或提出工具调用。工具校验与执行由 pi 负责，结果回到对话后才可能有下一轮模型请求。界面接收运行事件，历史保存完成的消息；它们都与“模型请求”有关，但不是同一种数据。真实实现还处理工具并发、错误、取消、重试和压缩，后面分别讲。
-
-**先分清四对容易混淆的词：**
-
-| 两个词                | 直观区别                                           | 在“读文件并总结”中的例子                   |
-| --------------------- | -------------------------------------------------- | -------------------------------------------- |
-| 模型请求 / 用户输入   | 用户只说一次话，pi 可以多次询问模型                | 先请模型选择工具，读完文件后再请模型总结     |
-| 事件 / 消息           | 事件告诉界面过程；消息承载一次完整的对话内容       | “正在输出第几个字”是事件；完成的总结是消息 |
-| 工具调用 / 工具结果   | 调用提出想做什么；结果记录本地执行所得             | `read("demo.txt")` 是调用；文件文字是结果  |
-| 会话历史 / 模型上下文 | 历史保留记录；上下文是这一次请求实际送给模型的内容 | 分支 C 仍在文件里，沿分支 D 继续时不必送 C   |
-
-
-```text
-一次用户输入
-  → 第一次模型请求：请调用 read("demo.txt")
-  → 本地工具执行：读出文件文本
-  → 第二次模型请求：根据工具结果总结三点
-  → 没有后续工作：结束
-```
-
-### 附录 A：术语表
-
-> 用法：每个术语给出"一句话解释 + 首次出现的章节"。读代码遇到不认识的词，先查这里；查不到再搜源码（用英文名搜）。
-
-
-#### A.1 核心概念
-
-| 中文                  | 英文                    | 一句话                                                                                                             | 章节      |
-| --------------------- | ----------------------- | ------------------------------------------------------------------------------------------------------------------ | --------- |
-| 智能体外壳 / 运行框架 | agent harness           | 组织模型、工具、状态、界面的框架，本身不"聪明"                                                                     | 0.1       |
-| 智能体                | agent                   | "模型 + 工具 + 循环"组成的执行体                                                                                   | 0.1       |
-| 轮次                  | turn                    | 一次助手响应 + 它引发的工具执行                                                                                    | 3.3.3     |
-| 低层运行              | Agent run               | 一次`Agent.prompt()` 或 `Agent.continue()` 调用建立的生命周期；以 `agent_end` 和已等待的 listener 收尾为边界 | 3.3.3、D2 |
-| 会话 prompt 编排      | session prompt workflow | `AgentSession.prompt()` 在 `started` 后进入 `_runAgentPrompt()`；可串起 retry、压缩恢复和多个低层 Agent run  | 8、D27    |
-| 用户请求              | user request            | 用户提交一次输入；与模型请求不等价                                                                                 | 3.3.3     |
-| 模型请求              | model request           | 真正发给供应商 API 的一次请求                                                                                      | 3.3.3     |
-| 转录                  | transcript              | 发给模型看/被记录的消息序列                                                                                        | 4.1       |
-| 投影                  | projection              | 从会话树/文档到"模型实际看到的内容"的计算过程                                                                      | 9.4       |
-| 活动分支              | active branch           | 从根到当前叶子的一条路径                                                                                           | 9.1       |
-| 叶子                  | leaf                    | 会话树中的"当前位置"                                                                                               | 4.7.3     |
-| 条目                  | entry                   | 会话文件里的一行（JSONL）                                                                                          | 4.7       |
-| 会话                  | session                 | 一次对话的全部记录与状态                                                                                           | 8.1       |
-| 压缩                  | compaction              | 用摘要替换旧上下文表示的机制                                                                                       | 10        |
-| 上下文窗口            | context window          | 模型一次能接受的最大 token 量                                                                                      | 5.3       |
-| 思考级别              | thinking level          | off/minimal/low/medium/high/xhigh/max                                                                              | 5.3       |
-| 停止原因              | stop reason             | pending/stop/length/toolUse/error/aborted/deferred                                                                 | 4.3.3     |
-| 用量                  | usage                   | token 与成本统计                                                                                                   | 4.3.5     |
-
-
-#### A.2 消息与事件
-
-| 中文           | 英文                | 一句话                                             | 章节        |
-| -------------- | ------------------- | -------------------------------------------------- | ----------- |
-| Agent 消息     | AgentMessage        | 内部消息（模型消息 + 应用自定义角色）              | 4.4         |
-| 模型消息       | Message             | 供应商能理解的四角色联合                           | 4.3         |
-| 内容块         | content block       | 消息内容的最小单元（text/image/thinking/toolCall） | 4.2         |
-| 判别联合       | discriminated union | 用共同字面量字段区分成员的类型联合                 | 1.3.4       |
-| 类型收窄       | narrowing           | 判断判别字段后类型自动缩小                         | 1.3.4       |
-| 事件           | event               | 运行时广播（过程），不是消息（结果）               | 3.3.2       |
-| 队列更新       | queue update        | 排队消息变化的会话事件                             | 4.5.2       |
-| 边界（结算前） | agent_before_settle | 最后一个可行动钩子                                 | 6.2、13.3.5 |
-| 已结算         | agent_settled       | "不会再自动继续"的最终信号                         | 4.5.2、16.3 |
-| 延迟句柄       | deferred handle     | 异步应答的取回凭据                                 | 4.3.3       |
-
-
-#### A.3 工具与模型
-
-| 中文                | 英文                            | 一句话                                    | 章节  |
-| ------------------- | ------------------------------- | ----------------------------------------- | ----- |
-| 工具                | tool                            | 模型可调用的本地操作                      | 7.1   |
-| 工具定义            | ToolDefinition                  | 扩展/应用注册工具的"富"形态               | 7.1.2 |
-| 参数校验            | argument validation             | 用 typebox schema 在运行时校验调用参数    | 7.4   |
-| 前置钩子            | beforeToolCall                  | 执行前可拦截（block）的钩子               | 7.6   |
-| 后置钩子            | afterToolCall                   | 结果字段级改写的钩子                      | 7.6   |
-| 顺序 / 并行执行     | sequential / parallel execution | 工具批次的两种调度                        | 7.5   |
-| 终止提示            | terminate                       | "整批都同意时不因本批继续"的调度提示      | 7.5.4 |
-| 模型                | model                           | 模型静态元数据（api/provider/限制/价格）  | 5.2.2 |
-| 协议方言            | api                             | 供应商接口族标识（如 anthropic-messages） | 5.2.1 |
-| 供应商              | provider                        | 认证 + 模型目录 + 请求实现                | 5.2.3 |
-| 简单流式 / 完整流式 | streamSimple / stream           | 供应商无关档位 vs 协议特有选项            | 5.4   |
-| 兼容开关            | compat                          | OpenAI 兼容生态的行为微调                 | 5.5.4 |
-| 假供应商            | faux provider                   | 脚本化、离线的测试模型                    | 5.7   |
-
-
-#### A.4 会话与持久化
-
-| 中文       | 英文             | 一句话                             | 章节   |
-| ---------- | ---------------- | ---------------------------------- | ------ |
-| 会话管理器 | SessionManager   | 会话文件的对象化句柄               | 9.3    |
-| 分支会话   | branched session | 只包含"根到叶子"路径的新文件       | 9.5.2  |
-| 分支摘要   | branch summary   | 放弃某分支时生成的摘要条目         | 10.6   |
-| 上下文编辑 | context edit     | 只改"投影"、不改原始条目的追加编辑 | 9.4.4  |
-| 保留边界   | firstKeptEntryId | 压缩后从哪条开始保留               | 10.3.2 |
-| 保留预算   | keepRecentTokens | 压缩后至少保留的近期上下文         | 10.3   |
-| 预留       | reserveTokens    | 为模型回复预留的窗口               | 10.2.1 |
-| 检测点替换 | checkpoint       | 压缩条目携带的提示词/工具检查点    | 9.4.3  |
-
-
-#### A.5 扩展与集成
-
-| 中文       | 英文            | 一句话                             | 章节       |
-| ---------- | --------------- | ---------------------------------- | ---------- |
-| 上下文文件 | context files   | AGENTS.md 等纯文本指令             | 11.4.2     |
-| 项目信任   | project trust   | 允许加载项目可执行资源前的人工决定 | 11.5       |
-| 提示词模板 | prompt template | Markdown 变成`/命令`             | 12.3.2     |
-| 技能       | skill           | 目录 + SKILL.md 的按需说明书       | 12.3.3     |
-| 扩展       | extension       | 可执行 TypeScript 模块（进程权限） | 12.3.4、13 |
-| Pi 包      | Pi package      | 分发多资源的 npm/git 单元          | 12.3.6     |
-| 钳制       | clamp           | 按模型能力压低思考级别             | 5.3        |
-| 重绑       | rebind          | 会话替换后重新挂订阅/扩展绑定      | 8.6        |
-
-
-#### A.6 协议与架构（选修）
-
-| 中文     | 英文                   | 一句话                                          | 章节   |
-| -------- | ---------------------- | ----------------------------------------------- | ------ |
-| MCP      | Model Context Protocol | 外部工具/资源接入协议                           | 22     |
-| 暴露方式 | exposure               | codemode/deferred/direct 三种工具到达模型的方式 | 22.3   |
-| 工具搜索 | tool_search            | deferred 工具的"发现后再直调"机制               | 22.3   |
-| 沙箱     | codemode sandbox       | QuickJS VM + worker 的脚本执行环境              | 22.9   |
-| 面片     | facet                  | Chord 插件可独立打包到不同环境的分片            | 23.2   |
-| 服务     | service                | Chord 的类型化稳定 token（singleton/keyed）     | 23.2   |
-| 复制状态 | replicated state       | 原子发布、完整不可变值消费的状态                | 23.2   |
-| 增量跟踪 | delta tracking         | 记录/合并 JSON 操作的机制                       | 23.2   |
-| 持久执行 | durable execution      | 意图先提交、崩溃可续的执行模型                  | 23.1   |
-| 检查点   | checkpoint             | 任务每一步的持久落点                            | 23.3.1 |
-| 附着     | attachment             | 一条表现层连接绑定到一个会话                    | 24.2   |
-| 信封     | envelope               | 协议中包裹 payload 的定向记录                   | 24.3   |
-| span     | span                   | 一次操作的时间记录（遥测）                      | 25.2   |
-| lift     | lift                   | 处理组相对对照组的提升（评估）                  | 25.5   |
-| 阻断配对 | blocked pair           | 两臂未各得恰好一个分数，禁止计入头条            | 25.6   |
-
-
-#### A.7 容易混淆的成对术语
-
-| 对                                              | 区分                                                                                   |
-| ----------------------------------------------- | -------------------------------------------------------------------------------------- |
-| message vs event                                | 结果 vs 过程（3.3.2）                                                                  |
-| turn vs run                                     | 一个轮次 vs 整次运行（3.3.3）                                                          |
-| `agent_end` vs `agent_settled`              | 低层 run 结束 vs 自动工作清零（4.5.2）                                                 |
-| 声明 vs 可执行                                  | 系统消息里的工具声明 vs 运行时工具集（7.3）                                            |
-| details vs content                              | 给界面/程序 vs 给模型（14.2）                                                          |
-| 完成顺序 vs 记录顺序                            | 并发完成 vs 声明序记录（7.5.3）                                                        |
-| 停止原因`length` vs `stop`                  | 被截断 vs 正常说完（4.3.3）                                                            |
-| `AgentSession.prompt()` vs `Agent.prompt()` | 应用层输入分流/会话编排 vs 低层 Agent run 入口（8、D2、D27）                           |
-| `handled` vs `queued` vs `started`        | 输入被消费、不创建该输入自己的 run / 放入当前运行队列 / 进入会话 run 编排（8、16.5.3） |
-| 提示词模板 vs 技能                              | 一段话 vs 一套流程+文件（12.3.3）                                                      |
-| 扩展 vs Pi 包                                   | 可执行单元 vs 分发单元（12.3.6）                                                       |
-| compaction 摘要 vs branch summary               | 压缩历史 vs 放弃分支（10.6）                                                           |
-| durable cheat sheet：`replay: safe/never`     | 崩溃后重跑 vs 报 interrupted（23.4）                                                   |
-| JSONL RPC vs client/server                      | 进程内 stdio 协议 vs 跨进程服务路由（24.1）                                            |
-| 单测 vs 评估                                    | 确定性 vs 配对统计（25.1、25.6）                                                       |
-
-
-#### A.8 输入与运行的层级
-
-不要按“用户按了一次回车”推断低层 run 或模型请求的数量。实际层级是：
-
-| 层级       | 代表符号                                           | 次数关系                                                                                      |
-| ---------- | -------------------------------------------------- | --------------------------------------------------------------------------------------------- |
-| 输入调用   | `AgentSession.prompt(text)`                      | 一次调用只表达一次输入尝试；结果可能是`handled`、`queued` 或 `started`                  |
-| 会话编排   | `_runAgentPrompt(messages)`                      | 只在开始处理输入时进入；在里面管理重试、压缩恢复、边界 continuation 与取消                    |
-| Agent run  | `Agent.prompt(messages)` 或 `Agent.continue()` | 一次会话编排可包含多个 run；每个低层 run 都发出自己的`agent_start` / `agent_end` 生命周期 |
-| Agent turn | `turn_start` 到 `turn_end`                     | 一个 run 可包含多个 turn；每个 turn 通常包含一次助手响应及其引发的工具执行                    |
-| 模型请求   | `streamSimple` / provider stream                 | 通常发生在助手响应阶段；自动重试会再次请求模型，压缩摘要等内部工作也可能有独立请求            |
-
-两个边界例子：
-
-- 扩展命令被消费时，`prompt()` 返回 `handled`，没有为该输入启动 `_runAgentPrompt()`；
-- `prompt()` 在 Agent 已运行时以 `steer`/`followUp` 方式排队，返回 `queued`。这条输入会影响现有流程，但它本身不是新的 `Agent.prompt()` 调用。
-
-因此，统计“模型请求次数”不能数 prompt、turn 或 `agent_end`：应按 provider 请求事件/日志，或明确的测试探针计数。章节 21 的自测题也按这个区分评分。
-
-
-#### A.9 索引方式说明
-
-- 想找"某行为在哪个文件" → 用 source-map；
-- 想找"某命令怎么跑" → 用 commands；
-- 想找"某现象怎么排" → 用 troubleshooting；
-- 想找"哪些练习要做" → 用 exercises-and-answers。
-
----
-
-### 第 10 章：上下文构造、系统提示与压缩
-
-
-**先懂这一章**：模型能接收的上下文有限。pi 要决定本次请求放入哪些指令和历史；历史过长时生成摘要，让后续请求仍能继续。摘要改变模型接下来看到的内容，原始会话记录仍可保留。
-
-```text
-教学伪代码：组装系统提示与活动历史 → 估算可用空间
-           → 空间足够则正常请求模型
-           → 空间紧张则选取旧历史、生成摘要、写入压缩条目
-           → 用新的上下文继续
-```
-
-“何时检查”“切点怎样选择”“失败后怎样恢复”各有条件，正文逐段解释，不能把伪代码当作精确算法。
-
-第 9 章解决“从会话树取哪条历史”；本章解决“这条历史怎样装进有限的模型上下文”。两章都在构造请求输入，但压缩增加了摘要和保留边界，不改变原始条目的存在。
-
-> 学完本章你能回答：
->
-> 1. 系统提示是怎么"分节组装"的？为什么它能被增量补丁修改？
-> 2. 上下文什么时候算"告急"？触发条件用哪个公式、哪个默认值？
-> 3. 一次压缩的完整流程是什么？"切点"如何选、`firstKeptEntryId` 如何定？
-> 4. 摘要请求长什么样？为什么它不会被模型当成"对话继续"？
-> 5. 溢出恢复与自动重试的顺序是什么？失败了会怎样？
-
-**预计学习时间**：2 天（压缩是"长会话可用性"的核心机制，值得精读）。
-**本章验证状态**：静态核对通过（`system-prompt.ts`、`compaction/compaction.ts` 关键函数与 `compaction.md` 核对）；实验 L06 设计中。
-
----
-
-
-#### 10.1 系统提示：分节组装，而不是"一个大字符串"
-
-模型请求里的系统提示不是常量，而是每次按"输入状态"现算的**分节结构**。入口在 `packages/coding-agent/src/core/system-prompt.ts`。
-
-
-##### 10.1.1 输入：`BuildSystemPromptOptions`
-
-```typescript
-export interface BuildSystemPromptOptions {
-	/** Custom system prompt (replaces the default prefix). */
-	customPrompt?: string;
-	/** Exact full prompt replacement set by a before_agent_start handler. */
-	forceSystemPrompt?: string;
-	/** Tools to include in prompt. Default: [read, bash, edit, write]. */
-	selectedTools?: string[];
-	/** Optional one-line tool snippets keyed by tool name. */
-	toolSnippets?: Record<string, string>;
-	/** Guideline bullets contributed by each tool, keyed by tool name. */
-	toolGuidelines?: Record<string, string[]>;
-	/** Additional guideline bullets appended to the default system prompt rules. */
-	promptGuidelines?: string[];
-	/** Text appended from user configuration before project context, skills, and cwd. */
-	appendSystemPrompt?: string;
-	/** Additional XML-wrapped prompt sections keyed by tag name. */
-	sections?: Record<string, string>;
-	/** Working directory. */
-	cwd: string;
-	/** Pre-loaded context files. */
-	contextFiles?: Array<{ path: string; content: string }>;
-	/** Pre-loaded skills. */
-	skills?: Skill[];
-}
-```
-
-注意 `toolSnippets` 与 `toolGuidelines`**按工具名索引**——第 7 章 `read.ts` 里的 `readToolSystemPromptContribution` 就是数据来源。**提示词是工具定义的投影**：工具写得好，提示词自然到位；这是"单一来源"的又一例。
-
-
-##### 10.1.2 组装：`buildSystemPromptSections`
-
-核心函数逐段读（节选 + 注释）：
-
-```typescript
-const SYSTEM_PROMPT_SECTION_NAME = /^[a-z][a-z0-9_-]*$/;
-
-export function buildSystemPromptSections(input: BuildSystemPromptOptions): SystemPromptSections {
-	const options = normalizeBuildSystemPromptOptions(input);
-	// ... 解构 ...
-
-	// ① 自定义 section 名必须合法（小写字母开头，字母数字下划线连字符）；preamble 是保留名
-	for (const name of Object.keys(customSections)) {
-		if (!SYSTEM_PROMPT_SECTION_NAME.test(name) || name === "preamble") {
-			throw new Error(`Invalid system prompt section name: ${name}`);
-		}
-	}
-
-	const promptSections: Record<string, string> = {};
-	if (customPrompt) {
-		promptSections.preamble = customPrompt;      // 用户完全替换开头段
-	} else {
-		// ② 默认 preamble：身份与总体职责
-		promptSections.preamble =
-			"You are an expert coding assistant operating inside pi, a coding agent harness. You help users by reading files, executing commands, editing code, and writing new files.";
-		// ③ 工具速览：只列出"有 snippet"的工具
-		const visibleTools = selectedTools.filter((name) => !!toolSnippets[name]);
-		const tools = visibleTools.length > 0
-			? visibleTools.map((name) => `- ${name}: ${toolSnippets[name]}`).join("\n")
-			: "(none)";
-		promptSections.tools = `${tools}\n\nIn addition to the tools above, you may have access to other custom tools depending on the project.`;
-		// ④ 规则：按已选工具生成（含一些"没有 grep 时用 bash 找文件"的条件规则）
-		promptSections.rules = buildRules(selectedTools, toolGuidelines, promptGuidelines);
-		// ⑤ pi 自身文档的索引（让模型能回答"pi 怎么用"）
-		promptSections.docs = `Pi documentation (read only when the user asks about pi itself, ...): ...`;
-	}
-
-	if (appendSystemPrompt) promptSections.addendum = appendSystemPrompt;
-	// ⑥ 项目上下文文件（AGENTS.md 等）包在 <project_instructions path="..."> 标签里
-	if (contextFiles.length > 0) promptSections.project_context = renderProjectContext(contextFiles);
-	// ⑦ 技能：按"有 read 或 bash 可读技能文件"为条件生成
-	const skillFileReadTool = (["read", "bash"] as const).find((tool) => selectedTools.includes(tool));
-	if (skillFileReadTool && skills.length > 0) {
-		const skillsPrompt = formatSkillsForPrompt(skills, skillFileReadTool).trim();
-		if (skillsPrompt) promptSections.skills = skillsPrompt;
-	}
-	// ⑧ 工作目录（统一用正斜杠）
-	promptSections.cwd = cwd.replace(/\\/g, "/");
-	// ⑨ 自定义 sections 最后覆盖
-	for (const [name, content] of Object.entries(customSections)) {
-		if (content) promptSections[name] = content;
-	}
-
-	// ⑩ 除 preamble 外，每个 section 都包一层与名字相同的标签
-	const sections: SystemPromptSections = { preamble: promptSections.preamble };
-	for (const [name, content] of Object.entries(promptSections)) {
-		if (name !== "preamble") sections[name] = `<${name}>\n${content}\n</${name}>`;
-	}
-	return sections;
-}
-```
-
-七种内置 section 一览：
-
-| section             | 内容                 | 关键点                                       |
-| ------------------- | -------------------- | -------------------------------------------- |
-| `preamble`        | 身份与总职责         | **唯一不加标签**的 section             |
-| `tools`           | 工具速览             | 只列有 snippet 的；提示"可能还有自定义工具"  |
-| `rules`           | 行为准则             | 由工具 guidelines + 通用规则去重生成         |
-| `docs`            | pi 文档索引          | 让模型知道去哪里读 pi 自己的文档             |
-| `addendum`        | 用户追加文本         | 来自设置                                     |
-| `project_context` | AGENTS.md 等项目指令 | 包`<project_instructions path="...">` 标签 |
-| `skills`          | 技能清单             | 条件：已选 read 或 bash 工具                 |
-| `cwd`             | 工作目录             | 反斜杠统一转正斜杠                           |
-
-**为什么每个 section 都包标签？** 因为第 4 章的补丁机制靠"按名字替换"工作：`<skills>...</skills>` 这样的自定界标签让模型能把"后来的更新"与"原来的内容"对应起来（`message-types.md` 的注释也提醒过：section 要自定界，避免用纯数字名）。
-
-
-##### 10.1.3 两种形态：结构化 vs 强制覆盖
-
-```typescript
-export function buildSystemPromptState(input: BuildSystemPromptOptions): { content: string; sections?: SystemPromptSections } {
-	if (input.forceSystemPrompt !== undefined) return { content: input.forceSystemPrompt };  // 整体覆盖，无 sections
-	return { content: "", sections: buildSystemPromptSections(input) };
-}
-```
-
-- **普通形态**：`content` 为空，prompt 全部在 `sections` 里 → 可以增量打补丁；
-- **强制形态**（`forceSystemPrompt`，扩展在 `before_agent_start` 里设置）：`content` 是完整提示词、没有 sections → **不可分节补丁**，每次变化都是整段替换。这是"扩展想要完全控制"的逃生门。
-
-`buildSystemPrompt` 则把状态渲染成与转录回放完全一致的文本（`getSystemMessageText`）——保证"你看到的就是模型看到的"。
-
-
-##### 10.1.4 增量演化：`diffSystemPromptSections`
-
-系统提示随会话演化（技能启用、工具变化、追加指令……）。会话不需要重发全部，而是算补丁：
-
-```typescript
-export function diffSystemPromptSections(
-	previous: Record<string, string | null>,
-	current: SystemPromptSections,
-): Record<string, string | null> | undefined {
-	const patch: Record<string, string | null> = {};
-	for (const [name, text] of Object.entries(current)) {
-		if (previous[name] !== text) patch[name] = text;          // 变了的：新内容
-	}
-	for (const name of Object.keys(previous)) {
-		if (current[name] === undefined) patch[name] = null;      // 消失的：null 表示删除
-	}
-	return Object.keys(patch).length > 0 ? patch : undefined;      // 没变：undefined（不写历史）
-}
-```
-
-这与第 3 章 `declareToolChanges` 对工具做的是同一件事，只是对象换成提示词分节。**"可回放 + 增量补丁"是本仓库贯穿一致的模式。**
-
-
-#### 10.2 上下文什么时候"告急"
-
-
-##### 10.2.1 判定公式与默认值
-
-`core/compaction/compaction.ts`：
-
-```typescript
-export interface CompactionSettings {
-	enabled: boolean;
-	reserveTokens: number;
-	keepRecentTokens: number;
-}
-
-export const DEFAULT_COMPACTION_SETTINGS: CompactionSettings = {
-	enabled: true,
-	reserveTokens: 16384,     // 给模型回复预留的空间
-	keepRecentTokens: 20000,  // 压缩后至少保留的近期上下文
-};
-
-export function shouldCompact(contextTokens: number, contextWindow: number, settings: CompactionSettings): boolean {
-	if (!settings.enabled) return false;
-	return contextTokens > contextWindow - settings.reserveTokens;
-}
-```
-
-记住这个不等式：
-
-```text
-上下文 token 数 > 模型上下文窗口 - 16384  → 触发自动压缩
-```
-
-`contextWindow` 来自 `Model` 元数据（第 5.3 节），`reserveTokens`/`keepRecentTokens` 可在设置里覆盖（全局或项目级，`settings.json`）。
-
-
-##### 10.2.2 token 数怎么估
-
-两个来源，优先级不同：
-
-1. **真实用量**（`calculateContextTokens`）：
-
-```typescript
-export function calculateContextTokens(usage: Usage): number {
-	return usage.totalTokens || usage.input + usage.output + usage.cacheRead + usage.cacheWrite;
-}
-```
-
-   来自**上一次助手消息的 `usage`**——这是供应商报的真实数字，最可信；
-
-2. **字符估算**（`estimateTokens`，注释明确说 "conservative (overestimates tokens)"）：按 `chars / 4` 的启发式；图片按固定字符数（`ESTIMATED_IMAGE_CHARS = 4800`）折算。
-
-对新手的重要提醒：**压缩判定是"估算 + 真实值"的混合**，所以你会看到"明明感觉没超也触发了"。要精调就调设置，而不是怀疑代码。
-
-
-##### 10.2.3 四个检查时机（`compaction.md` 官方口径）
-
-```text
-1. 每次新用户 prompt 之前
-2. 多轮运行的轮间：工具结果追加后、下一次模型请求前（发生在 prepareNextTurn）
-3. 低层 run 结束后的"最后补救"（overflow recovery）
-4. 手动：/compact [instructions]
-```
-
-第 2 条有个细节**值得画星号**：轮间检查发生在 `prepareNextTurn` 里（第 6.2 节读过这个钩子），而且"这批工具结果将终止 run 且没有排队消息"时**跳过**——因为不会再发请求，压缩纯属浪费。
-
-还有两类"事后补救"：
-
-- **供应商报上下文溢出错误**：可以选择"压缩一次再重试"的单次恢复；
-- **`stopReason: "length"`（截断）**：同样可能触发恢复；带工具调用的 length 响应保留"合成的失败工具结果"，然后按普通调度继续（第 3.14 节的轨迹 D）。
-
-
-#### 10.3 压缩流水线：五个步骤与"切点"算法
-
-**先懂**：旧历史太长时，不能任意砍掉一半。pi 先决定最近哪些消息必须原样保留，再把更早的内容提炼成摘要；下一次请求把摘要和保留段接起来。
-
-```text
-教学伪代码：估算当前历史 → 找到最近消息的保留边界
-           → 提取更早的摘要素材 → 生成摘要
-           → 记录摘要和首个保留条目 → 重建上下文
-```
-
-“切点”是保留和摘要之间的边界，不能随意切断一组有关联的工具消息；具体约束由后文的源码决定。
-
-`compaction.md` 给出的五步流程：
-
-```text
-1. Find cut point       在"最终投影"上从最新往回走，累计 token 估算，直到 keepRecentTokens
-2. Extract messages     收集"上一个保留边界（或会话开头）→ 切点"之间的投影消息
-3. Generate summary     调 LLM 生成结构化摘要（有旧摘要时作为迭代上下文传入）
-4. Append entry         写入 CompactionEntry（含 summary 与 firstKeptEntryId）
-5. Rebuilds context     下一次请求用"摘要 + firstKeptEntryId 起的消息"重建
-```
-
-第 5 步的视觉效果（官方示意图翻译）：
-
-```text
-压缩前（条目序）：
-  hdr  usr  ass  tool | usr  ass  tool  tool  ass  tool
-      └── 将被摘要 ──┘ └──────── 保留 ────────┘
-                          ↑ firstKeptEntryId
-
-压缩后（追加 cmp 条目）：
-  ...                                       cmp
-
-模型看到：
-  system  summary  usr  ass  tool  tool  ass  tool
-     ↑       ↑      └──────── firstKeptEntryId 起 ────────┘
-   提示词   压缩摘要
-```
-
-**暂停预测：** `demo.txt` 的旧问答已经很长，最近一轮助手刚调用 `read` 并收到工具结果。压缩完成后，原始会话文件里的旧问答是否被删？如果要保留这次工具调用，能只保留工具结果、把对应的助手调用放进摘要吗？
-
-**对照答案：** 压缩是追加 `CompactionEntry`，旧条目仍在文件里；下一次模型请求才通过投影用摘要替代较早的内容。工具结果不能成为孤立的保留起点，否则模型只看见“文件内容”，看不见它回应了哪个调用。切点只能落在合法条目上，必要时会多保留一点；下面的 `findCutPoint` 就是在确定这个边界。这里不假定具体切在哪条消息，实际位置还取决于 token 估算和 `keepRecentTokens`。
-
-
-##### 10.3.1 切点（cut point）规则
-
-**合法切点**（从 `compaction.md` 的 "Cut Point Rules"）：
-
-- 用户消息；
-- 助手消息；
-- `bashExecution` 消息；
-- 自定义消息（`custom_message`、`branch_summary`）。
-
-**永不切在工具结果上**——工具结果必须跟它的工具调用在一起（否则模型看到"孤儿结果"）。从"投影后"而非"原始文件"上找切点也很关键：**被 `context_edit` 省略的条目不影响切点与摘要**（`compaction.md` 原话："Omitted raw entries remain stored but do not affect cut selection, summaries, checkpoints, or token estimates."）。
-
-
-##### 10.3.2 `findCutPoint` 精读
-
-```typescript
-export function findCutPoint(entries, startIndex, endIndex, keepRecentTokens): CutPointResult {
-	const cutPoints = findValidCutPoints(entries, startIndex, endIndex);
-	if (cutPoints.length === 0) {
-		return { firstKeptEntryIndex: startIndex, turnStartIndex: -1, isSplitTurn: false };
-	}
-
-	// 从最新往回走，累计"投影消息"的 token 估算
-	let accumulatedTokens = 0;
-	let cutIndex = cutPoints[0];      // 默认：从最早的消息保留
-	for (let i = endIndex - 1; i >= startIndex; i--) {
-		const entry = entries[i];
-		const messageTokens = sessionEntryToContextMessages(entry).reduce(
-			(sum, message) => sum + estimateTokens(message), 0);
-		if (messageTokens === 0) continue;
-		accumulatedTokens += messageTokens;
-
-		if (accumulatedTokens >= keepRecentTokens) {
-			// 取"不早于当前位置"的最近合法切点；若尾部工具结果自身就超预算，
-			// 就保留它们前面的助手工具调用，而不是退回到第一条消息
-			cutIndex = cutPoints.find((candidate) => candidate >= i) ?? cutPoints[cutPoints.length - 1];
-			break;
-		}
-	}
-
-	// 再往前吞掉"不产生上下文"的元数据条目（model_change 等）
-	while (cutIndex > startIndex) {
-		const prevEntry = entries[cutIndex - 1];
-		if (prevEntry.type === "compaction" || sessionEntryToContextMessages(prevEntry).length > 0) break;
-		cutIndex--;
-	}
-
-	// 判断是否"切进了用户消息跨度"（split turn）
-	const cutEntry = entries[cutIndex];
-	const startsTurn = isTurnStartEntry(cutEntry);
-	const turnStartIndex = startsTurn ? -1 : findTurnStartIndex(entries, cutIndex, startIndex);
-	return { firstKeptEntryIndex: cutIndex, turnStartIndex, isSplitTurn: !startsTurn && turnStartIndex !== -1 };
-}
-```
-
-三个设计细节：
-
-1. **"从新往旧"累计**：保证保留的是**最近** `keepRecentTokens` 量级的内容——最新上下文最重要；
-2. **倾向合法切点**：宁可多保留一点，也不切出"半截工具对"；
-3. **元数据前吞**：`model_change` 这类不产生消息的条目会被并入保留区间（它影响解释但不占 token），避免"保留区从一条设置变更开始"的怪异边界。
-
-
-##### 10.3.3 切进用户消息跨度（split user-message span）
-
-用户的一个请求可能引发很多轮工具往返（一次"跨度"）。如果**单个跨度本身就超过 `keepRecentTokens`**，切点只能落在跨度中间——此时生成**两份摘要再合并**（官方文档）：
-
-1. **历史摘要**：更早的上下文（如果有）；
-2. **跨度前缀摘要**：这个跨度前半段（从它的用户消息到切点之前）。
-
-图解（`compaction.md` 示意）：
-
-```text
-usr │ ass tool ass tool tool ass tool
- ↑                                    ↑
-turnStartIndex = 切点所在跨度的起点    firstKeptEntryId
- └──── turnPrefixMessages（前缀）────┘ └── kept ──┘
-```
-
-
-##### 10.3.4 重复压缩与 `tokensBefore` 的"重算"
-
-会话被压缩多次时，第二次摘要的起点是**上一次压缩的保留边界**（`firstKeptEntryId`），而不是压缩条目本身——注释原话：
-
-```text
-On repeated compactions, the summarized span starts at the previous compaction's kept boundary
-(firstKeptEntryId), not at the compaction entry itself ... This preserves messages that survived
-the earlier compaction by including them in the next summarization pass as well.
-```
-
-并且 `tokensBefore` 会**在写入前重算**：从"重建后的、应用过 context_edit 的投影"计算，而不是照抄某个旧数字——保证"本次替换掉的上下文规模"是真实的。
-
-
-#### 10.4 摘要请求：一次"特殊的模型调用"
-
-
-##### 10.4.1 结构化格式
-
-摘要不是自由发挥，而是固定骨架（`compaction.md`）。压缩摘要：
-
-```markdown
-## Goal
-[用户想达成什么]
-
-## Constraints & Preferences
-- [用户提出的要求]
-
-## Progress
-### Done
-- [x] [已完成]
-### In Progress
-- [ ] [进行中]
-### Blocked
-- [阻塞项]
-
-## Key Decisions
-- **[决策]**：[理由]
-
-## Next Steps
-1. [接下来该做什么]
-
-## Critical Context
-- [继续工作所需的数据]
-
-<read-files>
-path/to/file1.ts
-</read-files>
-
-<modified-files>
-path/to/changed.ts
-</modified-files>
-```
-
-分支摘要同骨架，但**停在 Next Steps**（没有 Critical Context）。文件列表在需要时附加。
-
-为什么要有固定骨架？因为摘要要给**后续的模型**看：结构化让"目标、决策、进度"不随叙述风格丢失；`<read-files>`/`<modified-files>` 标签让文件轨迹可机读、可累计。
-
-
-##### 10.4.2 文件跟踪是"累积"的
-
-默认压缩与分支摘要都会从被摘要消息的**工具调用**中提取文件操作，并且：
-
-- 压缩会**继承上一次 pi 生成压缩**的文件列表；
-- 分支摘要会继承被摘要条目里**pi 生成的分支摘要**的列表；
-- 因此列表跨多轮压缩不断累计；
-- **扩展生成的摘要（`fromHook: true`）不自动继承**——扩展自己管理 `details`（`compaction.md` 明确说明）。
-
-文件列表的消费方：`details: { readFiles, modifiedFiles }`（`CompactionDetails` / `BranchSummaryDetails`）——界面、扩展、以及"摘要质量"的调试都靠它。
-
-
-##### 10.4.3 序列化：让模型"看访谈记录"，而不是"接着聊"
-
-生成摘要前，消息被 `serializeConversation`（`compaction/utils.ts`）转成一种**第三人称速记文本**：
-
-```text
-[User]: What they said
-[Assistant thinking]: Internal reasoning
-[Assistant]: Response text
-[Assistant tool calls]: read(path="foo.ts"); edit(path="bar.ts", ...)
-[Tool result]: Output from tool
-```
-
-两个设计点：
-
-1. **防止"对话惯性"**：如果直接把历史原样发给模型并要求总结，模型可能把总结任务当作"继续聊天"。加 `[User]:` 这类前缀，明确这是**待处理的材料**；
-2. **工具结果截断到 2000 字符**（超出部分替换为截断标记）——因为 `read`/`bash` 的输出通常是上下文体积的最大来源，摘要请求本身也要控制成本。
-
-另外 `compaction.md` 提到：**摘要请求会禁用 prompt 缓存写入**——这种一次性请求不太可能被复用，写缓存纯属浪费。
-
-
-#### 10.5 溢出恢复的执行顺序
-
-把第 6 章的"重试"与本章的"压缩"拼接起来，官方给出的完整顺序（`compaction.md`）：
-
-```text
-persist final assistant response          # 最终助手响应先落盘
-→ extension/public turn_end               # 对外事件照常
-→ extension/public agent_end
-→ append context_edit omissions for the selected attempt   # 把失败的尝试从投影中剔除
-→ for overflow/length: run session_before_compact and append compaction on success
-→ start the retry as a fresh run          # 以"全新 run"重试
-```
-
-对照代码（第 6.6 节）：`_handlePostAgentRun` 里先试重试（`_prepareRetry` → `_omitRecoveryAttempt` 追加省略编辑），再试压缩（`_checkCompaction(message, true, toolResults)`）。两类恢复共享同一套"先修上下文、再重跑"的骨架。
-
-**失败时的语义**（重要）：
-
-```text
-If recovery compaction fails or is cancelled, Pi keeps the omission edits, appends no
-compaction, and schedules no internal retry.
-```
-
-- 省略编辑**保留**（坏的那次尝试仍不进上下文）；
-- 不写压缩条目、不再自动重试；
-- `agent_before_settle`（第 6.2 节的边界钩子）看到的是**修复后的投影**；
-- 但**原始历史、导出、计费、历史检索仍能看到被省略的尝试**——"修上下文"不等于"抹掉事实"。
-
-
-#### 10.6 分支摘要：切换分支时的"访客报告"
-
-`/tree` 导航到另一条分支时，pi 会**询问用户是否总结**被放弃的路径。选择总结则：
-
-```text
-① 找共同祖先（old 与 new 位置的最深公共节点）
-② 从旧叶子往回收集到共同祖先的条目
-③ 按 token 预算准备（从新到旧纳入）
-④ 调 LLM 生成结构化摘要
-⑤ 在导航点追加 BranchSummaryEntry
-```
-
-官方示意图：
-
-```text
-导航前：
-         ┌─ B ─ C ─ D（旧叶子，将放弃）
-    A ───┤
-         └─ E ─ F（目标）
-
-导航后（带摘要）：
-         ┌─ B ─ C ─ D
-    A ───┤
-         └─ E ─ F ─ [B、C、D 的摘要]（新叶子）
-```
-
-`BranchSummaryEntry` 的字段（`session-format.md`）：
-
-```typescript
-interface BranchSummaryEntry<T = unknown> {
-	type: "branch_summary";
-	id: string; parentId: string | null; timestamp: string;
-	summary: string;
-	fromId: string;        // 从哪个旧叶子离开
-	usage?: Usage;         // 生成摘要的用量（计入会话总计）
-	fromHook?: boolean;    // 是否扩展提供
-	details?: T;           // 默认：{ readFiles, modifiedFiles }
-}
-```
-
-在投影里，它变成一条带包装前缀的 **user 消息**（第 4.4.2 节的 `BRANCH_SUMMARY_PREFIX`）——新分支的模型因此知道"刚才在另一条路上试过什么"。
-
-
-#### 10.7 扩展钩子：把压缩"接管"过来
-
-三个事件（`core/extensions/types.ts`）：
-
-
-##### 10.7.1 `session_before_compact`
-
-每次自动压缩或 `/compact` 前触发，可以取消或提供自定义摘要：
-
-```typescript
-pi.on("session_before_compact", async (event, ctx) => {
-	const { preparation, branchEntries, customInstructions, reason, willRetry, signal } = event;
-
-	// preparation.messagesToSummarize  待摘要消息
-	// preparation.turnPrefixMessages   分裂跨度的前缀（isSplitTurn 时）
-	// preparation.previousSummary      上一次压缩摘要（迭代上下文）
-	// preparation.fileOps              提取出的文件操作
-	// preparation.tokensBefore         压缩前上下文 token 数
-	// preparation.firstKeptEntryId     保留边界
-	// preparation.settings             有效设置（含模型覆盖）
-	// reason - "manual" | "threshold" | "overflow"
-	// willRetry - 溢出恢复是否会重试（决定摘要要不要"接得上"）
-
-	return { cancel: true };                       // 取消
-
-	return {                                       // 自定义摘要
-		compaction: {
-			summary: "Your summary...",
-			firstKeptEntryId: preparation.firstKeptEntryId,
-			tokensBefore: preparation.tokensBefore,
-			// usage: ...,  // 可选：计入会话总计
-			details: { /* 自定义数据 */ },
-		},
-	};
-});
-```
-
-想用**自己的模型**做摘要时，文档给出的标准路径是：`convertToLlm(preparation.messagesToSummarize)` → `serializeConversation(...)` → 自己的模型 → 返回 `compaction` 对象。仓库里有完整示例 `examples/extensions/custom-compaction.ts`。
-
-
-##### 10.7.2 `session_compact_failed`
-
-压缩失败或被取消时触发（给遥测/重试逻辑配对用）：载荷含 `reason`、`errorMessage`、`aborted`、`willRetry`、`fromExtension`。
-
-
-##### 10.7.3 `session_before_tree`
-
-`/tree` 导航前**总是**触发（无论用户选不选摘要）：可以取消导航，或在 `preparation.userWantsSummary` 为真时提供自定义摘要。
-
-三个钩子合起来意味着：**压缩策略是一个开放的扩展点**，而不只是硬编码逻辑。读 `compaction.ts` 时你会看到默认实现与扩展覆盖如何合并（`fromHook` 字段、"preparation" 对象就是给钩子用的数据协议）。
-
-
-#### 10.8 实验 L06：压缩前后对照
-
-**实验性质**：本地运行（faux 驱动）；零模型费用。
-**验证状态**：设计中。
-
-
-##### 目标
-
-用可控的假数据触发一次自动压缩，对照"压缩前后模型上下文"与"磁盘条目"，验证本章结论。
-
-
-##### 步骤
-
-1. **调小阈值**：在测试 harness 的 settings 里覆盖压缩设置（等价于在 `settings.json` 里写）：
-
-```json
-{
-  "compaction": {
-    "enabled": true,
-    "reserveTokens": 200,
-    "keepRecentTokens": 100
-  }
-}
-```
-
-   （字段名以 `CompactionSettings` 与设置的读取实现为准；测试里通常用 `settings: { ... }` 直接注入。）
-
-2. **编脚本**：让 faux 返回若干条长文本响应（每次响应几百字，迅速推高估算 token），随后到达阈值；
-3. **观察会话事件与磁盘分开看**：会话事件主线是 `compaction_start`（reason: `"threshold"`）→ `compaction_end`（result / aborted / willRetry）；扩展钩子另有自己的派发。成功时源码会调用 `appendCompaction()` 写入新 `compaction` 条目，但不会为它发 `entry_appended`。用 `sessionManager.getEntries()` 检查磁盘条目，不要把 `entry_appended` 当成所有写入的日志；
-4. **对照上下文**：
-
-```text
-压缩前：buildSessionContext().messages 的长度与首元素
-压缩后：同一次调用的结果
-期望：首部被替换为“检查点系统消息 + 压缩摘要消息”，随后是 firstKeptEntryId 起的消息
-```
-
-5. **验证"事实不删"**：读 `sessionManager.getEntries()`，确认被摘要的原始条目**仍在文件里**（只是不再投影）；
-6. **变体实验**：把摘要脚本改成"模型抛错"（faux 返回 `{ stopReason: "error" }`），观察 `session_compact_failed` 与"不重试"的行为（对照 10.5 节）。
-
-
-##### 观察与思考
-
-- 压缩的 `tokensBefore` 与你自己估算的值差多少？（体会"估算 + 真实值"的混合）
-- 摘要请求在 faux 的 `callCount` 里占几次？（提示：`generateSummary` 走的是同一条 streamSimple 链路）
-- 若压缩后上下文仍超阈值，下一次检查会发生什么？（重复压缩，起点是上一个保留边界）
-
-
-##### 清理
-
-还原测试文件；删除临时脚本；`git status` 干净。
-
-
-#### 本章源码精读
-
-> **源码精读**：先定位导出与函数签名，再沿调用点核对输入、状态、输出和错误；最后用本篇指定的离线实验验证。
-
-先用 D4 理解系统提示与压缩所需的上下文，再读 D15 的会话侧触发，最后读 D10 的压缩准备与写入。按“输入是什么 → 何时触发 → 写了什么”的顺序读，避免把摘要误认为原始记录被删除。
-
-
-
-##### D4：系统提示与压缩逐段精读
-
-**先懂**：系统提示由多类指令组成，长会话还要为模型腾出空间。先看“这次模型请求的指令从哪来”，再看“历史过长时哪些内容被摘要、哪些被保留”。
-
-```text
-教学伪代码：收集基础与项目指令 → 组成系统提示
-           → 估算上下文空间 → 选择历史切点
-           → 用旧历史生成摘要 → 把摘要用于后续请求
-```
-
-这两个过程相关但不是同一函数；后文分成提示组装和压缩两部分。
-
-> 精读对象：`packages/coding-agent/src/core/system-prompt.ts`（约 200 行）与 `core/compaction/compaction.ts`、`core/compaction/utils.ts` 的关键函数。
-> 对应主线：第 10 章（上下文构造、系统提示与压缩）。
-> 读法：先读第一部分（提示如何分节），再读第二部分（何时压缩、如何切分与摘要）。
-
----
-
-
-###### 第一部分：`system-prompt.ts` 精读
-
-
-##### 0. 文件地图
-
-```text
-常量    SYSTEM_PROMPT_SECTION_NAME   合法 section 名正则
-函数    normalizeBuildSystemPromptOptions  归一化输入（防御性拷贝 + 默认值）
-        renderProjectContext               上下文文件 → <project_instructions> 文本
-        buildRules                         生成"规则"分节（去重 + 条件规则）
-        buildSystemPromptSections          十步组装（本文件主体）
-        buildSystemPromptState             force 覆盖 vs 结构化两态
-        buildSystemPrompt                  渲染成与转录回放一致的文本
-        diffSystemPromptSections           计算分节补丁（增量更新）
-类型    BuildSystemPromptOptions / Normalized... / SystemPromptSections
-```
-
-
-##### 1. 输入类型与与归一化
-
-【源码（节选）】
-
-```typescript
-export interface BuildSystemPromptOptions {
-	/** Custom system prompt (replaces the default prefix). */
-	// 字段分五类：替换类（customPrompt/forceSystemPrompt）、工具相关（selectedTools/toolSnippets/toolGuidelines）、追加类（promptGuidelines/appendSystemPrompt/sections）、环境（cwd）、已加载资源（contextFiles/skills）
-	customPrompt?: string;
-	/** Exact full prompt replacement set by a before_agent_start handler. */
-	forceSystemPrompt?: string;
-	/** Tools to include in prompt. Default: [read, bash, edit, write]. */
-	selectedTools?: string[];
-	/** Optional one-line tool snippets keyed by tool name. */
-	// toolSnippets/toolGuidelines 是"按工具名索引"的字典——调用方负责从工具定义里提取（第 10.1.1 节：提示词是工具定义的投影）
-	toolSnippets?: Record<string, string>;
-	/** Guideline bullets contributed by each tool, keyed by tool name. */
-	toolGuidelines?: Record<string, string[]>;
-	/** Additional guideline bullets appended to the default system prompt rules. */
-	promptGuidelines?: string[];
-	/** Text appended from user configuration before project context, skills, and cwd. */
-	appendSystemPrompt?: string;
-	/** Additional XML-wrapped prompt sections keyed by tag name. */
-	sections?: Record<string, string>;
-	/** Working directory. */
-	cwd: string;
-	/** Pre-loaded context files. */
-	// contextFiles 与 skills 是已加载的（"Pre-loaded"）——本文件不做磁盘发现（那是 resource-loader.ts 的事，第 11 章）
-	contextFiles?: Array<{ path: string; content: string }>;
-	/** Pre-loaded skills. */
-	skills?: Skill[];
-}
-```
-
-【注解】
-
-- 字段分五类：**替换类**（`customPrompt`/`forceSystemPrompt`）、**工具相关**（`selectedTools`/`toolSnippets`/`toolGuidelines`）、**追加类**（`promptGuidelines`/`appendSystemPrompt`/`sections`）、**环境**（`cwd`）、**已加载资源**（`contextFiles`/`skills`）。
-- 【陷阱】`toolSnippets`/`toolGuidelines` 是"按工具名索引"的字典——**调用方负责从工具定义里提取**（第 10.1.1 节：提示词是工具定义的投影）。`read.ts` 的 `readToolSystemPromptContribution` 就是提取源。
-- `contextFiles` 与 `skills` 是**已加载**的（"Pre-loaded"）——本文件不做磁盘发现（那是 `resource-loader.ts` 的事，第 11 章）。**分层清晰：发现归发现，组装归组装。**
-
-【源码（归一化）】
-
-```typescript
-export function normalizeBuildSystemPromptOptions(input: BuildSystemPromptOptions): NormalizedBuildSystemPromptOptions {
-	return {
-		customPrompt: input.customPrompt,
-		forceSystemPrompt: input.forceSystemPrompt,
-		// selectedTools: [...default]——默认工具列表在这里硬编码 ["read","bash","edit","write"]
-		selectedTools: [...(input.selectedTools ?? ["read", "bash", "edit", "write"])],
-		toolSnippets: { ...(input.toolSnippets ?? {}) },
-		// toolGuidelines 的二级拷贝（[...guidelines]）——值数组里的字符串本身不可变，够用
-		toolGuidelines: Object.fromEntries(
-			// 每个数组/对象都做拷贝（展开、map 到新对象、二级数组也拷贝）：这是"交给扩展的可变形状"（类型注释原文："mutable, collection-complete shape exposed to extensions"）——before_agent_start 的处理器可以改这些集合，不能影响调用方传进来的原对象
-			Object.entries(input.toolGuidelines ?? {}).map(([name, guidelines]) => [name, [...guidelines]]),
-		),
-		promptGuidelines: [...(input.promptGuidelines ?? [])],
-		// appendSystemPrompt ?? ""、cwd 直通
-		appendSystemPrompt: input.appendSystemPrompt ?? "",
-		sections: { ...(input.sections ?? {}) },
-		cwd: input.cwd,
-		// contextFiles/skills 的浅拷贝元素（{ ...file }）——内容字段（字符串）共享引用
-		contextFiles: (input.contextFiles ?? []).map((file) => ({ ...file })),
-		skills: (input.skills ?? []).map((skill) => ({ ...skill })),
-	};
-}
-```
-
-【注解】
-
-- **每个数组/对象都做拷贝**（展开、`map` 到新对象、二级数组也拷贝）：这是"交给扩展的可变形状"（类型注释原文："mutable, collection-complete shape exposed to extensions"）——`before_agent_start` 的处理器可以改这些集合，**不能**影响调用方传进来的原对象。
-- 三级拷贝的差异要看清：
-  - `selectedTools: [...default]`——默认工具列表**在这里硬编码** `["read","bash","edit","write"]`（与 `DEFAULT_TOOL_NAMES` 的关系？第 3 章的 sdk 用 `DEFAULT_TOOL_NAMES` 计算工具集；这里是**提示词侧**的默认。两处默认若不同步会怎样？【陷阱】读代码时留意这个"双默认"——正常流程里 `selectedTools` 总是被显式传入（第 10.1 节的装配），默认值只是低层调用的兜底）；
-  - `toolGuidelines` 的**二级拷贝**（`[...guidelines]`）——值数组里的字符串本身不可变，够用；
-  - `contextFiles`/`skills` 的**浅拷贝元素**（`{ ...file }`）——内容字段（字符串）共享引用。
-- `appendSystemPrompt ?? ""`、`cwd` 直通。
-
-
-##### 2. `renderProjectContext` 与 `buildRules`
-
-【源码（上下文文件渲染）】
-
-```typescript
-// content 原样嵌入，不做转义——若文件内容里写了 </project_instructions>，标签会被"提前闭合"
-function renderProjectContext(contextFiles: Array<{ path: string; content: string }>): string {
-	return [
-		"Project-specific instructions and guidelines:",
-		...contextFiles.map(
-			({ path, content }) => `<project_instructions path="${path}">\n${content}\n</project_instructions>`,
-		),
-	].join("\n\n");
-}
-```
-
-【注解】
-
-- 固定开场句 + 每个文件一个 `<project_instructions path="...">` 标签块，块间空行分隔。
-- **path 放在属性里**：模型能区分不同来源文件的指令（多目录 AGENTS.md 累加时很重要，第 11.4.2 节）。
-- 【陷阱】`content` 原样嵌入，不做转义——若文件内容里写了 `</project_instructions>`，标签会被"提前闭合"。这是文本注入的经典面；对**项目文件**的信任等级适用于此（它们本来就能写任意指令，加标签只是组织手段，不是安全边界）。理解这一点能帮你回答"为什么这不是漏洞"——**标签不是防护，是提示结构**。
-
-【源码（规则生成）】
-
-```typescript
-function buildRules(
-	// 规则来源的三段合并：条件规则 → 各工具的 guidelines（按 selectedTools 顺序）→ 调用方 promptGuidelines；最后两条通用规则（简洁、路径清晰）总是追加
-	selectedTools: string[],
-	toolGuidelines: Record<string, string[]>,
-	promptGuidelines: string[],
-): string {
-	const rules: string[] = [];
-	const seen = new Set<string>();
-	// 去重器：addRule 用 Set 保证同一条规则只加一次（对比原文 seen.has(normalized)——注意是 trim 后比较，前后空白的重复也会被去重）
-	// "总是追加"的通用规则也可能被去重（如果某工具 guideline 恰好写了同样一句）——addRule 对它们同样生效
-	const addRule = (rule: string): void => {
-		const normalized = rule.trim();
-		if (!normalized || seen.has(normalized)) return;
-		seen.add(normalized);
-		rules.push(normalized);
-	};
-
-	const hasBash = selectedTools.includes("bash");
-	const hasPowerShell = selectedTools.includes("powershell");
-	// 规则里同时点名 grep/find/ls 三个工具——也就是说只要有其中任何一个，这条条件规则就不再添加
-	const hasGrep = selectedTools.includes("grep");
-	const hasFind = selectedTools.includes("find");
-	const hasLs = selectedTools.includes("ls");
-
-	if ((hasBash || hasPowerShell) && !hasGrep && !hasFind && !hasLs) {
-		if (hasBash && hasPowerShell) {
-			addRule("Use bash or PowerShell for file operations like listing, searching, and finding files");
-		} else if (hasPowerShell) {
-			addRule("Use PowerShell for file operations like listing, searching, and finding files");
-		} else {
-			addRule("Use bash for file operations like ls, rg, find");
-		}
-	}
-
-	for (const name of selectedTools) {
-		for (const rule of toolGuidelines[name] ?? []) addRule(rule);
-	}
-	for (const rule of promptGuidelines) addRule(rule);
-	addRule("Be concise in your responses");
-	addRule("Show file paths clearly when working with files");
-	return rules.map((rule) => `- ${rule}`).join("\n");
-}
-```
-
-【注解】
-
-- **去重器**：`addRule` 用 `Set` 保证同一条规则只加一次（对比原文 `seen.has(normalized)`——注意是 **trim 后**比较，前后空白的重复也会被去重）。空字符串直接跳过。
-- **条件规则**：当有 shell 工具（bash/powershell）但**没有**专用文件工具（grep/find/ls）时，提示"用 shell 做文件操作"——并按具体可用的 shell 分三种措辞（both/PowerShell-only/bash-only）。
-  - 【陷阱】规则里同时点名 `grep`/`find`/`ls` 三个工具——也就是说只要**有其中任何一个**，这条条件规则就不再添加。工具集与提示的耦合在这里具体可见（第 7.3 节的"声明投影"）。这解释了"为什么禁用 grep 后提示词变了"——**是规则组合变了，不是 bug**。
-- **规则来源的三段合并**：条件规则 → 各工具的 guidelines（按 `selectedTools` 顺序）→ 调用方 promptGuidelines；最后两条通用规则（简洁、路径清晰）总是追加。
-- 【陷阱】"总是追加"的通用规则也可能被去重（如果某工具 guideline 恰好写了同样一句）——`addRule` 对它们同样生效。**顺序决定保留哪一种写法**（先到先得）。
-- 输出带 `- ` 前缀、换行连接——markdown 列表。
-
-
-##### 3. `buildSystemPromptSections`：十步组装（主体）
-
-【源码（完整，含上一章引用的十步）】
-
-```typescript
-/** Build the ordered, independently replaceable sections of the structured system prompt. */
-export function buildSystemPromptSections(input: BuildSystemPromptOptions): SystemPromptSections {
-	const options = normalizeBuildSystemPromptOptions(input);
-	const {
-		// preamble 二选一：有 customPrompt 就整体替换 preamble（仍是分节形态）；否则用内置开场白
-		customPrompt, selectedTools, toolSnippets, toolGuidelines, promptGuidelines,
-		appendSystemPrompt, sections: customSections, cwd, contextFiles, skills,
-	} = options;
-
-	for (const name of Object.keys(customSections)) {
-		// 校验自定义 section 名：必须匹配 SYSTEM_PROMPT_SECTION_NAME（/^[a-z][a-z0-9_-]*$/）且不能叫 preamble（保留名）
-		if (!SYSTEM_PROMPT_SECTION_NAME.test(name) || name === "preamble") {
-			throw new Error(`Invalid system prompt section name: ${name}`);
-		}
-	}
-
-	const promptSections: Record<string, string> = {};
-	if (customPrompt) {
-		promptSections.preamble = customPrompt;
-	} else {
-		promptSections.preamble =
-			"You are an expert coding assistant operating inside pi, a coding agent harness. ...";
-		// tools 分节：只列有 snippet 的工具（visibleTools）；没有则 (none)；末尾固定加一句"可能还有自定义工具"——为扩展工具留预期
-		const visibleTools = selectedTools.filter((name) => !!toolSnippets[name]);
-		const tools = visibleTools.length > 0
-			? visibleTools.map((name) => `- ${name}: ${toolSnippets[name]}`).join("\n")
-			: "(none)";
-		promptSections.tools = `${tools}\n\nIn addition to the tools above, you may have access to other custom tools depending on the project.`;
-		// rules 分节：调用第 2 节的 buildRules
-		promptSections.rules = buildRules(selectedTools, toolGuidelines, promptGuidelines);
-		promptSections.docs = `Pi documentation (read only when the user asks about pi itself, its SDK, extensions, themes, skills, or TUI): ...`;
-	}
-
-	// addendum：appendSystemPrompt 非空才加
-	if (appendSystemPrompt) promptSections.addendum = appendSystemPrompt;
-	// project_context：有上下文文件才加（第 2 节渲染器）
-	if (contextFiles.length > 0) promptSections.project_context = renderProjectContext(contextFiles);
-	const skillFileReadTool = (["read", "bash"] as const).find((tool) => selectedTools.includes(tool));
-	if (skillFileReadTool && skills.length > 0) {
-		const skillsPrompt = formatSkillsForPrompt(skills, skillFileReadTool).trim();
-		if (skillsPrompt) promptSections.skills = skillsPrompt;
-	}
-	promptSections.cwd = cwd.replace(/\\/g, "/");
-	for (const [name, content] of Object.entries(customSections)) {
-		if (content) promptSections[name] = content;
-	}
-
-	const sections: SystemPromptSections = { preamble: promptSections.preamble };
-	for (const [name, content] of Object.entries(promptSections)) {
-		if (name !== "preamble") sections[name] = `<${name}>\n${content}\n</${name}>`;
-	}
-	return sections;
-}
-```
-
-【注解（按十步标注）】
-
-1. **归一化**（第 1 节）。
-2. **校验自定义 section 名**：必须匹配 `SYSTEM_PROMPT_SECTION_NAME`（`/^[a-z][a-z0-9_-]*$/`）且**不能叫 `preamble`**（保留名）。【陷阱】校验只针对**调用方传入的 `customSections`**，不看内置名；内置名（tools/rules/docs/...）由代码保证合法。
-3. **preamble 二选一**：有 `customPrompt` 就整体替换 preamble（仍是**分节形态**）；否则用内置开场白。注意"替换 preamble"≠"force 覆盖"（后者在 `buildSystemPromptState` 处理，第 4 节）。
-4. **tools 分节**：只列**有 snippet 的工具**（`visibleTools`）；没有则 `(none)`；末尾固定加一句"可能还有自定义工具"——**为扩展工具留预期**。`.map(...).join("\n")` 每行 `- name: snippet`。
-5. **rules 分节**：调用第 2 节的 `buildRules`。
-6. **docs 分节**：pi 自身文档的定位说明（路径来自 `config.ts` 的 `getReadmePath`/`getDocsPath`/`getExamplesPath`）——**提示模型"去哪里读 pi 文档"**，并给出"按主题找哪个文件"的对照表。这是"让模型回答 pi 自身问题"的关键上下文（第 12 章提过"pi 的自我文档"）。
-7. **addendum**：`appendSystemPrompt` 非空才加。
-8. **project_context**：有上下文文件才加（第 2 节渲染器）。
-9. **skills 分节**：**条件 = 已选工具里有 `read` 或 `bash`**（`skillFileReadTool` 二选一，按 `["read","bash"]` 先后）——因为技能"按需加载"要靠文件读取；没有读取工具时列了也读不到。【陷阱】这个选择逻辑决定了"技能提示里写的是 read 还是 bash 的用法"（`formatSkillsForPrompt(skills, skillFileReadTool)` 的第二个参数）；参数变了，技能说明里的加载命令也变。
-10. **cwd**：反斜杠统一转正斜杠（跨平台一致性——模型看到的路径风格统一）。
-11. **自定义 sections 覆盖**：非空才设置；可以**覆盖内置名**（比如传 `{ rules: "..." }` 就替换掉规则分节）——【陷阱】这是"扩展点"也是"风险点"：自定义内容能顶掉内置分节。`buildSystemPromptSections` 不做保护，靠调用方自律。
-12. **包装标签**：`preamble` 唯一不加标签；其余全部 `<name>\n...\n</name>`——**自定界**（第 10.1.2 节的原因：按名字打补丁 + 模型能对应更新）。
-
-【陷阱】输出对象 `sections` 的**键顺序**：先 `preamble`，然后按 `promptSections` 的插入顺序（preamble/tools/rules/docs/addendum/project_context/skills/cwd/自定义）。顺序影响模型阅读与"分节补丁 diff"的遍历顺序——插入顺序在这里是**有意义的契约**。
-
-
-##### 4. 两态输出：`buildSystemPromptState` 与 `buildSystemPrompt`
-
-【源码】
-
-```typescript
-/**
- * The complete prompt state for `input`. A forced prompt is opaque and lives in `content`
- * with no sections; otherwise `content` is empty and the structured sections carry the prompt.
- */
-export function buildSystemPromptState(input: BuildSystemPromptOptions): {
-	// force 态：content = 完整文本、无 sections（不可补丁，第 10.1.3 节）
-	content: string;
-	sections?: SystemPromptSections;
-} {
-	// forceSystemPrompt !== undefined 用严格判等 undefined（而不是 if (input.forceSystemPrompt)）：空字符串 force 也算"强制覆盖为空提示词"——一个极端但有意义的区别
-	if (input.forceSystemPrompt !== undefined) return { content: input.forceSystemPrompt };
-	return { content: "", sections: buildSystemPromptSections(input) };
-}
-
-/** Build the system prompt text, rendered exactly as the transcript's system message replays it. */
-// buildSystemPrompt：把状态渲染成与转录回放一致的文本（getSystemMessageText 是 pi-ai 里"把 SystemMessage 按回放规则铺开"的函数：content + 各分节按序拼接）
-export function buildSystemPrompt(input: BuildSystemPromptOptions): string {
-	// timestamp: 0 的占位对象——getSystemMessageText 只读内容字段，时间戳无关；给 0 是为了满足类型
-	return getSystemMessageText({ role: "system", ...buildSystemPromptState(input), timestamp: 0 });
-}
-```
-
-【注解】
-
-- **两态互斥**：
-  - force 态：`content` = 完整文本、**无 sections**（不可补丁，第 10.1.3 节）；
-  - 普通态：`content = ""`、全部在 sections。
-- 【陷阱】`forceSystemPrompt !== undefined` 用**严格判等 undefined**（而不是 `if (input.forceSystemPrompt)`）：空字符串 force 也算"强制覆盖为空提示词"——一个极端但有意义的区别。写自己的判断时注意这种"falsy vs undefined"的选择。
-- `buildSystemPrompt`：把状态**渲染成与转录回放一致的文本**（`getSystemMessageText` 是 pi-ai 里"把 SystemMessage 按回放规则铺开"的函数：content + 各分节按序拼接）。"exactly as the transcript replays it" 是契约：**这个函数产出的字符串 = 模型最终看到的系统提示**（当没有 force 时）。
-- 【陷阱】`timestamp: 0` 的占位对象——`getSystemMessageText` 只读内容字段，时间戳无关；给 0 是为了满足类型。渲染函数不该依赖时间戳（否则"同一输入不同输出"）。
-
-
-##### 5. `diffSystemPromptSections`：增量补丁
-
-【源码】
-
-```typescript
-export function diffSystemPromptSections(
-	// 入参 previous 的类型是 Record<string, string | null>——模型当前持有的分节
-	// 遍历 previous 的键：current 里没有 → 进补丁值 null（删除标记）
-	previous: Record<string, string | null>,
-	current: SystemPromptSections,
-// 空补丁返回 undefined（"没变化就别写历史"——与 D1 的 declareToolChanges 的 unchanged 返回同款）
-): Record<string, string | null> | undefined {
-	const patch: Record<string, string | null> = {};
-	for (const [name, text] of Object.entries(current)) {
-		if (previous[name] !== text) patch[name] = text;
-	}
-	for (const name of Object.keys(previous)) {
-		if (current[name] === undefined) patch[name] = null;
-	}
-	return Object.keys(patch).length > 0 ? patch : undefined;
-}
-```
-
-【注解】
-
-- 入参 `previous` 的类型是 `Record<string, string | null>`——**模型当前持有的分节**（从转录回放得来；注释说 "replayed from the transcript, so never null"——那是说"值不会是 null"？类型上的 `| null` 是给"删除标记"的兼容？【陷阱】按签名与实现读：`previous[name] !== text` 的比较里若 previous 值是 null，则任何文本都算"变化"（会进补丁）——正常流程不会出现 null 值（回放保证），类型的 null 是防御/历史兼容。读这段时不要被类型误导）。
-- 两个循环：
-  1. 遍历 current：与 previous 不同 → 进补丁（包括"previous 没有"的情况，`undefined !== text`）；
-  2. 遍历 previous 的键：current 里没有 → 进补丁值 `null`（**删除标记**）。
-- 空补丁返回 `undefined`（"没变化就别写历史"——与 D1 的 `declareToolChanges` 的 `unchanged` 返回同款）。
-- 【陷阱】比较是**字符串全等**——分节内容里任何一个字符变化都会产生整节的替换补丁（没有 diff 到行）。这是"分节粒度"的设计选择：分节应该足够小（所以内置分节按功能切分），内容大的分节（如 project_context）会整块重发。扩展写动态分节（如"当前时间"）时要注意：**每次都变 = 每次整节重发**（`extensions.md` 提醒过这会破坏提示缓存）。
-- 【跳转】消费方：`AgentSession` 的 prompt 准备（`_preparePromptAndToolLoadout`，第 3.6 节）把补丁变成系统消息追加进转录（第 10.2 节）。
-
----
-
-> D4 第一部分到此。第二部分：`compaction.ts` 与 `compaction/utils.ts` 精读（阈值、估算、切点、文件追踪、序列化、摘要调用链）与总结。
-
----
-
-
-###### 第二部分：`compaction` 与 `utils` 精读
-
-
-##### 6. 阈值与估算：什么时候"该压了"
-
-【源码（设置）】
-
-```typescript
-export interface CompactionSettings {
-	enabled: boolean;
-	reserveTokens: number;
-	keepRecentTokens: number;
-}
-
-export const DEFAULT_COMPACTION_SETTINGS: CompactionSettings = {
-	enabled: true,
-	reserveTokens: 16384,
-	keepRecentTokens: 20000,
-};
-
-/**
- * Check if compaction should trigger based on context usage.
- */
-// shouldCompact 把"读设置"与"算差值"结合，但不读模型元数据——contextWindow 由调用方传入（来自 Model.contextWindow，第 5.3 节）
-export function shouldCompact(contextTokens: number, contextWindow: number, settings: CompactionSettings): boolean {
-	if (!settings.enabled) return false;
-	return contextTokens > contextWindow - settings.reserveTokens;
-}
-```
-
-【注解】
-
-- 三个字段的职责：开关、给回复预留的窗口、压缩后仍保留的近期上下文（第 10.2.1 节的不等式）。
-- 【陷阱】判定是**严格大于**（`>`）而不是 `>=`：恰好等于阈值**不**触发。写边界测试时要注意；差异看似无关紧要，但当上游计算是估算时，"等号归谁"可能影响"这一轮压不压"的确定性。改这里要谨慎（会改变触发时机）。
-- `shouldCompact` 把"读设置"与"算差值"结合，但**不读模型元数据**——`contextWindow` 由调用方传入（来自 `Model.contextWindow`，第 5.3 节）。
-
-【源码（用量）】
-
-```typescript
-/**
- * Calculate total context tokens from usage.
- * Uses the native totalTokens field when available, falls back to computing from components.
- */
-export function calculateContextTokens(usage: Usage): number {
-	// 优先 totalTokens；为 0/缺失时用四个分项相加
-	// || 的语义：totalTokens === 0 也会走 fallback（不是"仅 undefined"）——对"真实的 0 用量"来说 fallback 结果也是 0（四分量都 0），所以无害；但如果某供应商只报分项、totalTokens 报了 0 而分项非 0，fallback 就正确生效
-	return usage.totalTokens || usage.input + usage.output + usage.cacheRead + usage.cacheWrite;
-}
-```
-
-【注解】
-
-- 优先 `totalTokens`；为 0/缺失时用四个分项相加。
-- 【陷阱】`||` 的语义：`totalTokens === 0` 也会走 fallback（不是"仅 undefined"）——对"真实的 0 用量"来说 fallback 结果也是 0（四分量都 0），所以无害；但如果某供应商只报分项、`totalTokens` 报了 0 而分项非 0，fallback 就正确生效。这种"用 `||` 处理 0 与缺失"的写法在本仓库常见——读数值逻辑时留意。
-
-【源码（估算器，节选）】
-
-```typescript
-const ESTIMATED_IMAGE_CHARS = 4800;
-
-// estimateTextAndImageContentChars 对字符串内容直接用 .length（UTF-16 代码单元数；中文、emoji 的计数与"字符数"又有差异）——估算层的精度到此为止，够粗用即可
-function estimateTextAndImageContentChars(content: string | Array<{ type: string; text?: string }>): number {
-	if (typeof content === "string") {
-		return content.length;
-	}
-
-	let chars = 0;
-	for (const block of content) {
-		if (block.type === "text" && block.text) {
-			chars += block.text.length;
-		} else if (block.type === "image") {
-			chars += ESTIMATED_IMAGE_CHARS;
-		}
-	}
-	return chars;
-}
-
-/**
- * Estimate token count for a message using chars/4 heuristic.
- * This is conservative (overestimates tokens).
- */
-export function estimateTokens(message: AgentMessage): number {
-	// ...（按角色分别估算；详情见源码）
-}
-```
-
-【注解】
-
-- **图片按固定字符数折算**（4800 字符 ≈ 1200 token）：无法知道真实图片 token（取决于供应商），取一个保守的常量。
-- `chars/4` 是保守启发式（英文约 4 字符/token；中文会低估 token？——【陷阱】注释说 "conservative (overestimates tokens)"，但严格说对 CJK 文本 chars/4 是**低估**（一个汉字可能 1-2 token，而 4 字符换 1 token 的假设不成立）。这条注释反映的是作者对英文语料的经验；对我们中文用户，**估算可能偏乐观**——所以更要留足 `reserveTokens`。这也是一个"文档与直觉的差异"示例：读注释要结合实际语料验证。
-- `estimateTextAndImageContentChars` 对**字符串内容**直接用 `.length`（UTF-16 代码单元数；中文、emoji 的计数与"字符数"又有差异）——估算层的精度到此为止，够粗用即可。
-
-
-##### 7. `findCutPoint`：切点算法逐段
-
-【源码（完整）】
-
-```typescript
-export function findCutPoint(
-	entries: SessionEntry[],
-	startIndex: number,
-	endIndex: number,
-	keepRecentTokens: number,
-): CutPointResult {
-	// 只能在合法消息边界截断，避免孤立的工具结果。
-	const cutPoints = findValidCutPoints(entries, startIndex, endIndex);
-
-	if (cutPoints.length === 0) {
-		return { firstKeptEntryIndex: startIndex, turnStartIndex: -1, isSplitTurn: false };
-	}
-
-	// Walk backwards from newest, accumulating estimated message sizes
-	let accumulatedTokens = 0;
-	let cutIndex = cutPoints[0]; // Default: keep from first message (not header)
-
-	for (let i = endIndex - 1; i >= startIndex; i--) {
-		const entry = entries[i];
-		const messageTokens = sessionEntryToContextMessages(entry).reduce(
-			(sum, message) => sum + estimateTokens(message),
-			0,
-		);
-		if (messageTokens === 0) continue;
-		accumulatedTokens += messageTokens;
-
-		// Check if we've exceeded the budget
-		if (accumulatedTokens >= keepRecentTokens) {
-			// Prefer the closest valid cut point at or after this entry. If trailing
-			// tool results exceed the budget by themselves, keep their preceding
-			// assistant tool call instead of falling back to the first message.
-			cutIndex = cutPoints.find((candidate) => candidate >= i) ?? cutPoints[cutPoints.length - 1];
-			break;
-		}
-	}
-
-	// Scan backwards from cutIndex to include adjacent metadata entries that do not affect context.
-	while (cutIndex > startIndex) {
-		const prevEntry = entries[cutIndex - 1];
-		// Stop at compaction boundaries or context-visible entries.
-		if (prevEntry.type === "compaction" || sessionEntryToContextMessages(prevEntry).length > 0) {
-			break;
-		}
-		cutIndex--;
-	}
-
-	// Determine if this is a split turn
-	const cutEntry = entries[cutIndex];
-	const startsTurn = isTurnStartEntry(cutEntry);
-	const turnStartIndex = startsTurn ? -1 : findTurnStartIndex(entries, cutIndex, startIndex);
-
-	return {
-		firstKeptEntryIndex: cutIndex,
-		turnStartIndex,
-		isSplitTurn: !startsTurn && turnStartIndex !== -1,
-	};
-}
-```
-
-【注解（按块）】
-
-**前置：`findValidCutPoints`**
-
-- 未展开（只给概念）：返回"合法切点的**索引数组**"（升序），合法 = 用户/助手/bashExecution/自定义消息（第 10.3.1 节），且**永不切在工具结果上**。
-- 【陷阱】它接收 `[startIndex, endIndex)` 的**范围**：切点只在"待摘要区间"里找；每轮的起点由上一轮的保留边界决定（`prepareCompaction` 里计算，第 8 节）。
-- 无合法切点 → 返回 `{ firstKeptEntryIndex: startIndex, ... }`：**保持从区间起点开始保留**（即"这次不切/保住全部"，让调用方决定后续）——注意这不是"报错"，而是"保守结果"。
-
-**累加循环：从新往旧**
-
-```typescript
-	let accumulatedTokens = 0;
-	let cutIndex = cutPoints[0]; // Default: keep from first message (not header)
-	for (let i = endIndex - 1; i >= startIndex; i--) {
-		const entry = entries[i];
-		const messageTokens = sessionEntryToContextMessages(entry).reduce(
-			(sum, message) => sum + estimateTokens(message), 0);
-		if (messageTokens === 0) continue;      // ← 不产消息的条目直接跳过（不累加、不切）
-		accumulatedTokens += messageTokens;
-		if (accumulatedTokens >= keepRecentTokens) {
-			cutIndex = cutPoints.find((candidate) => candidate >= i) ?? cutPoints[cutPoints.length - 1];
-			break;
-		}
-	}
-```
-
-- 超预算的**第一次**出现就停止累加（累加到"至少 keepRecentTokens"为止）——保留的会是"从 cutIndex 到末尾"的部分，其规模≈预算或略多。
-- `cutPoints.find((candidate) => candidate >= i)`：在**合法切点**里找"不早于当前位置"的第一个——即找"离 i 最近（在 i 或其后）的合法切点"。
-  - **方向直觉**：i 是"超预算的那条"；我们想在这里附近切；但必须在合法切点；`>= i` 从 i 往新区方向找——【陷阱】为什么不是往旧区方向（`<= i`）找更近的？注释给了理由："尾部工具结果自身超预算时，保留它们前面的助手工具调用"——即宁可切点落在 i **之后**（多保留一条助手调用），也不要落到 i **之前**把工具结果后面留下"孤儿参数"的缺口。用 `>= i` 保证"保留区间包含 i 处的这个触发条目"（比如那条超预算的工具结果）。
-  - 找不到（i 大于所有切点）→ `?? cutPoints[cutPoints.length - 1]`：落到最后一个切点——保底"仍然保留一部分"，而不是回退到第一条消息。
-- `cutIndex = cutPoints[0]` 的初始默认："从第一条可切消息开始保留"（如果整个区间都没到预算）——即"不切"的形态（切点=区间内第一条合法点，之后所有内容都保留）。
-- 【陷阱】`continue` 跳过 `messageTokens === 0` 的条目：那是"不产消息"的条目（设置、元数据、被编辑为空的内容）——它们**不算预算**但也**不成为切点候选**；它们会被下面的"元数据吞并"处理。
-
-**元数据吞并**
-
-```typescript
-	while (cutIndex > startIndex) {
-		const prevEntry = entries[cutIndex - 1];
-		if (prevEntry.type === "compaction" || sessionEntryToContextMessages(prevEntry).length > 0) {
-			break;
-		}
-		cutIndex--;
-	}
-```
-
-- 向前看一条：如果它是**压缩条目**或"产消息"的条目 → 停；否则（不产消息的元数据）`cutIndex--` 把它并入保留区间。
-- 【陷阱】为什么"压缩条目要停"：压缩条目虽产消息（检查点+摘要），但它是边界标记——再往前吞会跨过压缩边界（逻辑上属于更早的折叠段），所以显式排除（类型判断放在"产消息"判断**之前**）。
-- 结果：保留区不会以"一串 setting/label"开头，而是尽量从"有语义的条目"开始。
-
-**切点半判定：split turn**
-
-```typescript
-	const cutEntry = entries[cutIndex];
-	const startsTurn = isTurnStartEntry(cutEntry);
-	const turnStartIndex = startsTurn ? -1 : findTurnStartIndex(entries, cutIndex, startIndex);
-	return {
-		firstKeptEntryIndex: cutIndex,
-		turnStartIndex,
-		isSplitTurn: !startsTurn && turnStartIndex !== -1,
-	};
-```
-
-- `startsTurn`：切点处恰好是"turn 起点"（用户消息/bash/自定义消息这类"跨度的开始"）→ 不需要 split 处理（`turnStartIndex = -1`）。
-- 否则（切在跨度中间，比如一条助手消息上）：`findTurnStartIndex(entries, cutIndex, startIndex)` **向前找到该跨度的起点**（第 10.3.3 节的 `turnStartIndex`）。
-- 【陷阱】`isSplitTurn = !startsTurn && turnStartIndex !== -1`：只有"不是起点 **且** 找得到起点"才算 split；找不到（-1）时为 false（防御性：数据怪时不制造伪 split）。
-- 【跳转】`prepareCompaction` 消费这个结果，把"切点之前开头的部分"变成 `turnPrefixMessages`（第 10.3.3 节的两份摘要合并逻辑就在那里）。
-
-
-##### 8. `utils.ts`：文件追踪与序列化
-
-**文件追踪的操作提取（两种来源）**
-
-【源码（节选）】
-
-```typescript
-export interface FileOperations {
-	read: Set<string>;
-	written: Set<string>;
-	edited: Set<string>;
-}
-
-export function createFileOps(): FileOperations { /* 三个空 Set */ }
-
-export function extractFileOpsFromMessage(message: AgentMessage, fileOps: FileOperations): void {
-	// 两种来源的返回路径不同：toolResult 分支处理完直接 return（不会再去扫 assistant 逻辑，角色本来就不同）；assistant 分支有四层结构守卫（typeof object、非 null、有 type、type 是 toolCall、有 arguments/name）——因为 content 是"未校验解析"的数据（第 4 节 D3 的同类防御）
-	if (message.role === "toolResult") {
-		// Calls made from codemode scripts are recorded on the script's result.
-		// addFileOp
-		for (const call of message.nestedCalls?.calls ?? []) addFileOp(call.name, call.arguments, fileOps);
-		return;
-	}
-	if (message.role !== "assistant") return;
-	if (!("content" in message) || !Array.isArray(message.content)) return;
-
-	for (const block of message.content) {
-		if (typeof block !== "object" || block === null) continue;
-		// 助手消息的 toolCall 块（模型发起的调用，正常路径）
-		if (!("type" in block) || block.type !== "toolCall") continue;
-		if (!("arguments" in block) || !("name" in block)) continue;
-		addFileOp(block.name, block.arguments as Record<string, unknown> | undefined, fileOps);
-	}
-}
-
-function addFileOp(toolName: string, args: Record<string, unknown> | undefined, fileOps: FileOperations): void {
-	// 只认参数里有字符串 path 的调用（其它参数名/形态忽略——比如 bash 的 command 不追踪）
-	const path = typeof args?.path === "string" ? args.path : undefined;
-	if (!path) return;
-	switch (toolName) {
-		case "read": fileOps.read.add(path); break;
-		// 只认 read/write/edit 三个工具名；这是按名字硬编码：自定义工具的 read（比如 MCP 读取类）不会被追踪，名字改写（edit 改名）会失去追踪
-		case "write": fileOps.written.add(path); break;
-		case "edit": fileOps.edited.add(path); break;
-	}
-}
-```
-
-【注解】
-
-- **两类扫描对象**：
-  1. **助手消息的 `toolCall` 块**（模型发起的调用，正常路径）；
-  2. **`toolResult.nestedCalls`**（脚本/嵌套调用产生——第 14.4 节、第 22 章 codemode；这些调用没有自己的助手消息，只记录在外层结果上）。
-- 【陷阱】两种来源的返回路径不同：`toolResult` 分支处理完**直接 return**（不会再去扫 assistant 逻辑，角色本来就不同）；assistant 分支有**四层结构守卫**（typeof object、非 null、有 type、type 是 toolCall、有 arguments/name）——因为 `content` 是"未校验解析"的数据（第 4 节 D3 的同类防御）。**逐字段检查代替类型断言**。
-- `addFileOp`：
-  - 只认参数里有**字符串 `path`** 的调用（其它参数名/形态忽略——比如 `bash` 的 `command` 不追踪）；
-  - 只认 `read`/`write`/`edit` 三个工具名；【陷阱】这是**按名字硬编码**：自定义工具的 `read`（比如 MCP 读取类）不会被追踪，名字改写（`edit` 改名）会失去追踪。这是"内置工具语义"的假设，扩展想参与追踪需要自己维护（或未来加钩子）。
-  - 同一路径多次操作：Set 去重（只关心"是否发生过"）。
-
-**汇总与格式化**
-
-【源码】
-
-```typescript
-// 互斥分类：readOnly = read ∩ ¬modified——被读过又被改过的文件只出现在 modifiedFiles
-// readFiles 的语义是"只读文件"（read-only），不是"所有被读的文件"
-export function computeFileLists(fileOps: FileOperations): { readFiles: string[]; modifiedFiles: string[] } {
-	const modified = new Set([...fileOps.edited, ...fileOps.written]);
-	// 两个列表都排序（sort()）：输出确定性（同一批操作产生同一摘要文本）——便于测试与缓存
-	const readOnly = [...fileOps.read].filter((f) => !modified.has(f)).sort();
-	const modifiedFiles = [...modified].sort();
-	return { readFiles: readOnly, modifiedFiles };
-}
-
-// formatFileOperations：标签块 + 空行分隔；都为空时返回空字符串（调用方据此决定"不加文件列表"）
-export function formatFileOperations(readFiles: string[], modifiedFiles: string[]): string {
-	const sections: string[] = [];
-	if (readFiles.length > 0) {
-		sections.push(`<read-files>\n${readFiles.join("\n")}\n</read-files>`);
-	}
-	if (modifiedFiles.length > 0) {
-		sections.push(`<modified-files>\n${modifiedFiles.join("\n")}\n</modified-files>`);
-	}
-	if (sections.length === 0) return "";
-	return `\n\n${sections.join("\n\n")}`;
-}
-```
-
-【注解】
-
-- **互斥分类**：`readOnly = read ∩ ¬modified`——被读过又被改过的文件只出现在 `modifiedFiles`。【陷阱】为什么？因为摘要的用途是"告诉下一个模型：哪些文件有最新内容、哪些文件只是看过"。改过的文件内容已变，列在"读过的文件"里会误导（模型以为文件里是它读到的旧内容）。这个**信息设计**值得学习。
-- 两个列表都**排序**（`sort()`）：输出确定性（同一批操作产生同一摘要文本）——便于测试与缓存。
-- `formatFileOperations`：标签块 + 空行分隔；**都为空时返回空字符串**（调用方据此决定"不加文件列表"）。注意它返回时**前置两个换行**（`\n\n${...}`）——方便直接拼接在摘要正文后面。
-- 【陷阱】`readFiles` 的语义是"**只读文件**"（read-only），不是"所有被读的文件"。字段命名与实现的差异容易被误读——读任何 `readFiles` 消费方时记住这点。
-
-**序列化**
-
-【源码（完整）】
-
-```typescript
-/** Maximum characters for a tool result in serialized summaries. */
-const TOOL_RESULT_MAX_CHARS = 2000;
-
-/**
- * Truncate text to a maximum character length for summarization.
- * Keeps the beginning and appends a truncation marker.
- */
-function truncateForSummary(text: string, maxChars: number): string {
-	if (text.length <= maxChars) return text;
-	const truncatedChars = text.length - maxChars;
-	return `${text.slice(0, maxChars)}\n\n[... ${truncatedChars} more characters truncated]`;
-}
-
-// 这打乱了内容块的原始交错顺序（模型原本可能"思考→文本→工具→思考→文本"）
-export function serializeConversation(messages: Message[]): string {
-	const parts: string[] = [];
-
-	for (const msg of messages) {
-		// user：contentText(msg.content, "") 把内容块拼成文本（contentText 来自 pi-ai；第二个参数是"没有内容时的默认值"）；空内容跳过
-		if (msg.role === "user") {
-			// 文本块 → 用 contentText（它会拼接所有 text 块）
-			const content = contentText(msg.content, "");
-			if (content) parts.push(`[User]: ${content}`);
-		// assistant：按内容块分类收集（不按原顺序输出！）
-		} else if (msg.role === "assistant") {
-			const thinkingParts: string[] = [];
-			const toolCalls: string[] = [];
-
-			for (const block of msg.content) {
-				if (block.type === "thinking") {
-					thinkingParts.push(block.thinking);
-				} else if (block.type === "toolCall") {
-					const args = block.arguments as Record<string, unknown>;
-					const argsStr = Object.entries(args)
-						.map(([k, v]) => `${k}=${JSON.stringify(v)}`)
-						.join(", ");
-					toolCalls.push(`${block.name}(${argsStr})`);
-				}
-			}
-
-			if (thinkingParts.length > 0) {
-				// 输出顺序固定：[Assistant thinking]: → [Assistant]: → [Assistant tool calls]:（各部分非空才输出）
-				parts.push(`[Assistant thinking]: ${thinkingParts.join("\n")}`);
-			}
-			if (msg.content.some((block) => block.type === "text")) {
-				// [Assistant]: 的条件用 msg.content.some(text) 判断——用"是否存在文本块"而不是"拼出的字符串非空"（空字符串的文本块也会命中）——一个空的 text 块会输出 [Assistant]: （冒号后空）——小瑕疵，影响可以忽略；但读代码时这种"判断依据与被判断内容不完全一致"的地方值得留意
-				parts.push(`[Assistant]: ${contentText(msg.content)}`);
-			}
-			if (toolCalls.length > 0) {
-				parts.push(`[Assistant tool calls]: ${toolCalls.join("; ")}`);
-			}
-		} else if (msg.role === "toolResult") {
-			const content = contentText(msg.content, "");
-			if (content) {
-				parts.push(`[Tool result]: ${truncateForSummary(content, TOOL_RESULT_MAX_CHARS)}`);
-			}
-		}
-	}
-
-	return parts.join("\n\n");
-}
-```
-
-【注解（按角色）】
-
-- **user**：`contentText(msg.content, "")` 把内容块拼成文本（`contentText` 来自 pi-ai；第二个参数是"没有内容时的默认值"）；空内容跳过。**前缀 `[User]:`**。
-- **assistant**：按内容块**分类收集**（不按原顺序输出！）：
-  - thinking 块 → 收集 thinking 文本；
-  - toolCall 块 → 序列化为 `name(k=v, k2="v2")` 形式（参数的**每个值 JSON.stringify**——字符串带引号、对象带结构；键用 `=`）；
-  - 文本块 → 用 `contentText`（它会拼接所有 text 块）。
-  - 输出顺序固定：`[Assistant thinking]:` → `[Assistant]:` → `[Assistant tool calls]:`（各部分非空才输出）。
-  - 【陷阱】**这打乱了内容块的原始交错顺序**（模型原本可能"思考→文本→工具→思考→文本"）。对**摘要**任务来说，"归类概要"比"逐步重放"更有用——这是有意的取舍（也提醒我们：`serializeConversation` 不是"忠实转写"，是"喂给摘要模型的加工文本"）。
-  - `[Assistant]:` 的条件用 `msg.content.some(text)` 判断——用"是否存在文本块"而不是"拼出的字符串非空"（空字符串的文本块也会命中）——【陷阱】一个空的 text 块会输出 `[Assistant]: `（冒号后空）——小瑕疵，影响可以忽略；但读代码时这种"判断依据与被判断内容不完全一致"的地方值得留意。
-- **toolResult**：`contentText` + **截断到 2000 字符** + `[Tool result]:` 前缀。截断**保留开头**并附 `[... N more characters truncated]` 标记。
-- 段落间用 `\n\n` 连接——所有部分汇成一个大字符串。
-- 【陷阱】函数头的注释解释了最关键的意图："This prevents the model from treating it as a conversation to continue."——**前缀格式就是防"对话惯性"的机制**（第 10.4.3 节）。如果你自己写摘要功能，别忘了这一步。
-- 【陷阱】入参是 `Message[]`（已经是 LLM 形态）——调用方要先 `convertToLlm`（`generateSummaryWithUsage` 里就是先转换，见第 10 节）。**序列化不管自定义消息**。
-
-
-##### 9. 摘要提示词与调用链
-
-【源码（哨兵与模板）】
-
-```typescript
-// 系统提示限定摘要任务，禁止把历史对话当成当前用户请求继续回答。
-export const SUMMARIZATION_SYSTEM_PROMPT = `You are a context summarization assistant. Your task is to read a conversation between a user and an AI assistant, then produce a structured summary following the exact format specified.
-
-Do NOT continue the conversation. Do NOT respond to any questions in the conversation. ONLY output the structured summary.`;
-```
-
-```typescript
-const SUMMARIZATION_PROMPT = `The messages above are a conversation to summarize. Create a structured context checkpoint summary that another LLM will use to continue the work.
-// ...（省略其余格式说明）
-`;
-
-const UPDATE_SUMMARIZATION_PROMPT = `The messages above are NEW conversation messages to incorporate into the existing summary provided in <previous-summary> tags.
-// ...（省略其余格式说明）
-`;
-```
-
-【注解】
-
-- **系统提示**：限定角色 + 两条禁令（不要继续对话、不要回答问题）——与序列化格式是双重保险。
-- **两条模板**：初次摘要（`SUMMARIZATION_PROMPT`）与增量更新（`UPDATE_SUMMARIZATION_PROMPT`，把新消息**合并进**已有摘要）。`generateSummaryWithUsage` 按 `previousSummary` 是否存在二选一。
-- 【陷阱】字符串前缀"**The messages above**"——模板假设对话文本放在它**前面**（`<conversation>` 块）。读模板时要把"它在 prompt 里的位置"一起读（第 10 节组装顺序），不然会疑惑"messages above"指什么。
-
-【源码（上下文与选项）】
-
-```typescript
-// buildSummarizationContext：用 systemPrompt 字段（旁路形态）+ 单条 user 消息，然后 normalizeContext 折成"系统消息在最前"的标准转录（第 5.4 节）——这就是"旁路字段只在入口用一次"的实例
-function buildSummarizationContext(promptText: string): TranscriptContext {
-	return normalizeContext({
-		systemPrompt: SUMMARIZATION_SYSTEM_PROMPT,
-		messages: [
-			{
-				role: "user",
-				content: [{ type: "text", text: promptText }],
-				timestamp: Date.now(),
-			},
-		],
-	});
-}
-
-function createSummarizationOptions(
-	model: Model<any>, maxTokens: number, apiKey: string | undefined,
-	headers: Record<string, string> | undefined, env: Record<string, string> | undefined,
-	signal: AbortSignal | undefined, thinkingLevel: ThinkingLevel | undefined,
-	sessionId: string | undefined,
-): SimpleStreamOptions {
-	const options: SimpleStreamOptions = { maxTokens, signal, apiKey, headers, env, sessionId };
-	if (model.reasoning && thinkingLevel && thinkingLevel !== "off") {
-		options.reasoning = thinkingLevel;
-	}
-	return options;
-}
-```
-
-【注解】
-
-- `buildSummarizationContext`：用 **`systemPrompt` 字段**（旁路形态）+ 单条 user 消息，然后 `normalizeContext` **折成"系统消息在最前"的标准转录**（第 5.4 节）——这就是"旁路字段只在入口用一次"的实例。
-- 【陷阱】整个对话被塞进**一条 user 消息**（promptText），而不是作为多轮消息——刻意为之：摘要请求要的是"材料+指令"，不是"对话继续"（与序列化格式同一目的）。
-- `createSummarizationOptions`：把选项打包；思考级别的映射是**条件**的：`model.reasoning && thinkingLevel && !== "off"` 才带 `reasoning`——【陷阱】`"off"` 的判断在这里也与循环层的 `undefined` 表示不同（第 D1/D2 节反复出现的"两套词汇表"）：这个函数接受 `ThinkingLevel | undefined`（**不含 off**？——类型上 `ThinkingLevel` 是 pi-ai 的级别联合，`"off"` 不在其中；但调用方可能传 `"off"` 字符串，所以这里仍防御）。读同一字段在不同函数的类型/命名，是理解这套代码库的关键习惯。
-
-【源码（分享的调用汇点）】
-
-```typescript
-/**
- * Shared choke point for every compaction/branch-summary summarization call. Wraps the
- * single LLM call in {@link retryAssistantCall} so transient stream drops (e.g.
- * `terminated`, socket close) honor the configured retry policy instead of failing
- * the whole compaction on the first attempt. Deterministic errors and aborts return
- * immediately (see {@link retryAssistantCall}).
- */
-export async function completeSummarization(
-	model: Model<any>,
-	context: TranscriptContext,
-	options: SimpleStreamOptions,
-	// (await streamFn(...)).result()：先拿到流，再等结果——两步都在这一个表达式里
-	streamFn?: StreamFn,
-	retry?: RetryPolicy,
-	callbacks?: RetryCallbacks,
-): Promise<AssistantMessage> {
-	// Avoid cache writes for one-off summaries. Reuse caller-supplied routing when available;
-	// callers without a session ID, including branch summaries, receive a fresh routing ID.
-	const requestOptions: SimpleStreamOptions = {
-		...options,
-		// cacheRetention: "none"——一次性摘要不值得写提示缓存（第 10.4.3 节）
-		cacheRetention: "none",
-		// sessionId: options.sessionId ?? uuidv7()——没有会话 id 就给一个新的（独立路由），注释点名"branch summaries"这种情况
-		sessionId: options.sessionId ?? uuidv7(),
-	};
-	// produce 里二选一：注入的 streamFn（测试/faux 路径）或 completeSimple（真实路径）——可注入的又一次体现
-	const produce = async (): Promise<AssistantMessage> =>
-		streamFn
-			? (await streamFn(model, context, requestOptions)).result()
-			: completeSimple(model, context, requestOptions);
-	return retryAssistantCall(produce, retry, requestOptions.signal, callbacks);
-}
-```
-
-【注解】
-
-- "**共享收口点**"（choke point）：压缩与分支摘要都经过它——所以"重试策略、缓存关闭、路由 id"只需在这里维护一份。
-- **两个关键设置**：
-  1. `cacheRetention: "none"`——一次性摘要不值得写提示缓存（第 10.4.3 节）；
-  2. `sessionId: options.sessionId ?? uuidv7()`——**没有会话 id 就给一个新的**（独立路由），注释点名"branch summaries"这种情况。为什么不用同一个？摘要请求与主对话的缓存/亲和互不干扰（也避免主会话的缓存被摘要请求污染）。
-- `produce` 里二选一：注入的 `streamFn`（测试/faux 路径）或 `completeSimple`（真实路径）——**可注入**的又一次体现。
-- `retryAssistantCall(produce, retry, ...)`：把"引导一次的调用"包上重试策略（第 6.6.3 节的"摘要重试共享同一套预算"）；注释说明"瞬态流断开会被重试，确定性错误与取消立即返回"。
-- 【陷阱】`(await streamFn(...)).result()`：先拿到**流**，再等**结果**——两步都在这一个表达式里。读别的 `streamFn` 调用点（D1 第 18 节的 `streamFunction(...)` 后 `response.result()`）是同一模式。
-
-【源码（generateSummaryWithUsage 的组装段，完整）】
-
-```typescript
-/** Generate or update a conversation summary and return its provider usage. */
-export async function generateSummaryWithUsage(...): Promise<{ text: string; usage: Usage }> {
-	const maxTokens = Math.min(
-		Math.floor(0.8 * reserveTokens),
-		model.maxTokens > 0 ? model.maxTokens : Number.POSITIVE_INFINITY,
-	);
-
-	// Use update prompt if we have a previous summary, otherwise initial prompt
-	let basePrompt = previousSummary ? UPDATE_SUMMARIZATION_PROMPT : SUMMARIZATION_PROMPT;
-	if (customInstructions) {
-		basePrompt = `${basePrompt}\n\nAdditional focus: ${customInstructions}`;
-	}
-
-	// Serialize conversation to text so model doesn't try to continue it
-	// Convert to LLM messages first (handles custom types like bashExecution, custom, etc.)
-	// 先 convertToLlm 再 serializeConversation：注释明确说"handles custom types like bashExecution, custom, etc."——自定义角色先翻译成四种标准角色（第 4.4.2 节），再进入序列化器（后者只认 Message[]）
-	const llmMessages = convertToLlm(currentMessages);
-	const conversationText = serializeConversation(llmMessages);
-
-	// Build the prompt with conversation wrapped in tags
-	let promptText = `<conversation>\n${conversationText}\n</conversation>\n\n`;
-	if (previousSummary) {
-		promptText += `<previous-summary>\n${previousSummary}\n</previous-summary>\n\n`;
-	}
-	promptText += basePrompt;
-
-	const completionOptions = createSummarizationOptions(model, maxTokens, apiKey, headers, env, signal, thinkingLevel, sessionId);
-
-	const response = await completeSummarization(model, buildSummarizationContext(promptText), completionOptions, streamFn, retry, callbacks);
-
-	const failure = getSummarizationFailure(response, "Summarization");
-	if (failure) {
-		throw new Error(failure);
-	}
-	if (response.content.some((block) => block.type === "toolCall")) {
-		throw new Error("Summarization attempted to call a tool");
-	}
-
-	const textContent = contentText(response.content);
-
-	return { text: textContent, usage: response.usage };
-}
-```
-
-【注解（六步）】
-
-1. **maxTokens 双上限**：`min(80% 的 reserveTokens, 模型上限)`——摘要本身就占用上下文，所以比 reserve 再保守 20%；模型上限为 0（未知）时用 `Infinity`（只受 reserve 限制）。
-2. **模板选择 + 自定义聚焦**：`Additional focus: ...` 追加在模板后（`/compact [[instructions]]` 的用户指令从这条路径进来）。
-3. **先 `convertToLlm` 再 `serializeConversation`**：注释明确说"handles custom types like bashExecution, custom, etc."——自定义角色先翻译成四种标准角色（第 4.4.2 节），再进入序列化器（后者只认 `Message[]`）。**两个函数的调用顺序是硬性依赖。**
-4. **prompt 组装顺序**（重要，模板里的 "above" 指的就是它）：
-
-```text
-<conversation>
-（序列化文本）
-</conversation>
-
-<previous-summary>
-（旧摘要，若有）
-</previous-summary>
-
-（basePrompt：初次或更新模板 + 自定义聚焦）
-```
-
-5. **调用与失败检查**：
-   - `getSummarizationFailure(response, "Summarization")`：把 `error`/`length` 两种停止原因翻译成人话错误（`stopReason` 是 `"length"` 时的文案："generation hit the token cap and the summary is incomplete"——**截断的摘要视为失败**，宁可不压缩）；
-   - **拒绝工具调用**：`response.content.some(block.type === "toolCall")` → 抛 "Summarization attempted to call a tool"——【陷阱】为什么？摘要请求**没有声明任何工具**（上下文里只有系统提示+一条 user 消息），模型要是"幻觉出"工具调用，说明输出不可信；而且工具调用会打乱"文本摘要"的预期。这是一条**输出形状校验**。
-6. **取文本与用量**：`contentText(response.content)` 拼接文本块；返回 `{ text, usage }`——`usage` 让上层把摘要消耗计入会话统计（第 10.4.1 节的"摘要用量"落点）。
-
-
-##### 10. 总结
-
-
-###### 10.1 压缩的完整函数调用图
-
-```mermaid
-flowchart TD
-  A[shouldCompact 阈值判定] --> B[prepareCompaction 找切点]
-  B --> C[findCutPoint 走查/切点/split]
-  B --> D[extractFileOpsFromMessage 文件追踪]
-  B --> E[turnPrefixMessages 组装]
-  E --> F[generateSummaryWithUsage]
-  C --> F
-  F --> G[convertToLlm 翻译]
-  G --> H[serializeConversation 序列化]
-  H --> I[buildSummarizationContext 包装]
-  I --> J[completeSummarization 共享收口]
-  J --> K[retryAssistantCall 重试]
-  K --> L[getSummarizationFailure 校验]
-  L --> M[compaction 条目 + usage]
-```
-
-
-###### 10.2 五个最值得记的点
-
-1. **压缩 = 表示替换**：原条目不动，投影折叠（D3）+ 检查点（本节）。
-2. **切点只落在合法边界**：用户/助手/bash/自定义消息；工具结果永不单独切。
-3. **"能解析 ≠ 完整"**：截断的场景宁可全部拒绝（D1）——摘要侧同理，"截断的摘要=失败"。
-4. **序列化是加工不是转录**：分类收集、`[User]:` 前缀、工具结果 2000 字符截断。
-5. **摘要请求是受控调用**：无工具、关缓存、独立路由 id、可重试、可注入 streamFn。
-
-
-###### 10.3 阅读检查清单
-
-- [ ] 我能说出 `shouldCompact` 的三个默认值与严格大于的边界吗？
-- [ ] 我能解释 `findCutPoint` 为什么用 `candidate >= i` 吗？（孤儿工具结果的防护）
-- [ ] 我知道 `readFiles` 其实是"只读文件（排除已修改）"吗？
-- [ ] 我能背出摘要 prompt 的三段组装顺序吗？
-- [ ] 我知道 `cacheRetention: "none"` 与独立 `sessionId` 的原因吗？
-- [ ] 我能说出"摘要截断视为失败"的位置与文案吗？
-
----
-
-> D4 完。下一篇（D5）精读 `sdk.ts` 的 `createAgentSession` 与 `agent-session.ts` 的 prompt 主路径（选段）。
-
-
-
-##### D15：压缩的"触发端"精读（`_checkCompaction` + `_runAutoCompaction`）
-
-**先懂**：会话层先判断是否需要压缩，再安排执行。它还要处理扩展是否接管、压缩失败和接下来是否重试。先看“是否触发”，再看“触发后如何收尾”。
-
-```text
-教学伪代码：检查当前上下文与本次结果 → 判断是否达到压缩条件
-           → 通知相关扩展 → 执行压缩或采用扩展结果
-           → 记录成功/失败 → 决定是否继续运行
-```
-
-自动压缩和手动压缩的入口不同；完整判断条件以后面的决策树为准。
-
-> 精读对象：`core/agent-session.ts` 的压缩触发与编排段（`_checkCompaction` 第 2900 行、`_runAutoCompaction` 第 3050 行、`_runDefaultCompaction` 与手动 `compact()` 的共享点）。
-> 对应主线：第 10 章；与 D4/D10 的关系：D4 精读"读侧素材"（阈值/估算/切点/序列化），D10 精读"纯函数写路径"（prepare → compact），**D15 精读"会话侧的触发与编排"**（何时查、查什么、失败怎么记）。
-> 读法：先读 `_checkCompaction` 的**决策树**（这是一份"什么时候压、什么时候不压"的判例集），再读 `_runAutoCompaction` 的**执行事务**（事件、扩展拦截、写盘、重试信号）。
-
----
-
-
-###### 0. 三段职责的分工图
-
-```mermaid
-flowchart TD
-  T1[prompt 前检查<br/>_checkCompaction(lastAssistant, false)] --> C
-  T2[turn 后检查<br/>_handlePostAgentRun → _checkCompaction(message, true, toolResults)] --> C
-  T3[手动 /compact<br/>AgentSession.compact] --> M[手动路径]
-  C[_checkCompaction 决策树] -->|overflow / recoverableLength| A1[_runAutoCompaction 'overflow']
-  C -->|threshold| A2[_runAutoCompaction 'threshold']
-  A1 --> P[prepareCompaction D10]
-  A2 --> P
-  M --> P2[prepareCompaction 同款 + _runDefaultCompaction]
-  P --> X{session_before_compact 扩展钩子}
-  P2 --> X
-  X -->|cancel| F
-  X -->|自定义 compaction| W[appendCompaction]
-  X -->|默认| D[_runDefaultCompaction → compact D10] --> W
-  W --> E[compaction_end / session_compact 事件]
-  F[compaction_end aborted + session_compact_failed]
-```
-
-【陷阱】**同一个 `prepareCompaction`/`compact` 被三条路径复用**（自动-阈值、自动-溢出、手动）——会话侧只决定"何时触发、失败如何记账、要不要续跑"；**纯函数边界（D10）是三条路径的公因子**。
-
----
-
-
-###### 第一部分：`_checkCompaction` 决策树（十二个判定）
-
-
-##### 1. 函数签名与两道前置门
-
-【源码（节选）】
-
-```typescript
-	private async _checkCompaction(
-		// 参数三件套：assistantMessage（要检查的那条助手消息）、skipAbortedCheck（默认 true）、toolResults（溢出恢复时要一起省略的证据）
-		assistantMessage: AssistantMessage,
-		// skipAbortedCheck 的两种调用点语义（第 0 节的 T1/T2）
-		// turn 后检查（1837 行）：true——刚被取消的消息不触发压缩（取消是用户意图，不要顺手压缩）
-		skipAbortedCheck = true,
-		toolResults: AgentMessage[] = [],
-	): Promise<boolean> {
-		// getCompactionSettings(this.model)：按当前模型取设置（可能含 per-model 覆盖——reserveTokens/keepRecentTokens 可因模型而异）
-		const settings = this.settingsManager.getCompactionSettings(this.model);
-		// prompt 前检查（2009 行）：false——"上一次响应被取消后留下的历史"仍可能超限；新输入即将发出，必须检查（否则下一条请求直接撞溢出）
-		// settings.enabled 是第一道门（关掉自动压缩就什么都不查）
-		if (!settings.enabled) return false;
-
-		// Skip if message was aborted (user cancelled) - unless skipAbortedCheck is false
-		if (skipAbortedCheck && assistantMessage.stopReason === "aborted") return false;
-```
-
-【注解】
-
-- **参数三件套**：`assistantMessage`（要检查的那条助手消息）、`skipAbortedCheck`（**默认 true**）、`toolResults`（溢出恢复时要一起省略的证据）。
-- 【陷阱】`skipAbortedCheck` 的**两种调用点语义**（第 0 节的 T1/T2）：
-  - **turn 后检查**（1837 行）：`true`——刚被取消的消息不触发压缩（取消是用户意图，不要顺手压缩）；
-  - **prompt 前检查**（2009 行）：`false`——"上一次响应被取消后留下的历史"仍可能超限；**新输入即将发出，必须检查**（否则下一条请求直接撞溢出）。**同一个布尔在两个场景的默认值相反**——这是读调用点时最容易看漏的地方。
-- `getCompactionSettings(this.model)`：**按当前模型取设置**（可能含 per-model 覆盖——`reserveTokens`/`keepRecentTokens` 可因模型而异）。
-- `settings.enabled` 是**第一道门**（关掉自动压缩就什么都不查）。
-
-
-##### 2. 三道"数据一致性"守卫
-
-【源码（节选）】
-
-```typescript
-		// Skip overflow check if the message came from a different model. ...
-		// _modelForMessage(assistantMessage)：从消息里解析出实际回答的物理模型（虚拟选择下"物理模型提供限制"——注释原文）——与 D3 的 getSessionContextSettings"物理模型优先"同源
-		const messageModel = this._modelForMessage(assistantMessage);
-		// 同模型守卫（sameModel）：把"哪条消息、哪个模型的窗口"绑在一起——注释举的例子极具体：从 opus（小窗口）切到 codex（大窗口）后，旧模型留下的溢出错误不该触发新模型的压缩（新窗口大得多，那个错误过时了）
-		const sameModel = messageModel !== undefined;
-		const contextWindow = (messageModel ?? this.model)?.contextWindow ?? 0;
-
-		// Skip compaction checks if this assistant message is older than the latest
-		// compaction boundary. ...
-		const compactionEntry = getLatestCompactionEntry(this.sessionManager.getBranch());
-		// 压缩边界守卫（assistantIsFromBeforeCompaction）：时间戳比较（消息毫秒 vs 条目 ISO → new Date(...).getTime() 转换——第 4.7.1 节的两种时间戳在此相遇）
-		const assistantIsFromBeforeCompaction =
-			compactionEntry !== null && assistantMessage.timestamp <= new Date(compactionEntry.timestamp).getTime();
-		if (assistantIsFromBeforeCompaction) {
-			return false;
-		}
-```
-
-【注解】
-
-1. **同模型守卫**（`sameModel`）：把"哪条消息、哪个模型的窗口"绑在一起——注释举的例子极具体：从 opus（小窗口）切到 codex（大窗口）后，**旧模型留下的溢出错误不该触发新模型的压缩**（新窗口大得多，那个错误过时了）。
-   - `_modelForMessage(assistantMessage)`：从消息里解析出**实际回答的物理模型**（虚拟选择下"物理模型提供限制"——注释原文）——与 D3 的 `getSessionContextSettings`"物理模型优先"同源。
-2. **压缩边界守卫**（`assistantIsFromBeforeCompaction`）：**时间戳比较**（消息毫秒 vs 条目 ISO → `new Date(...).getTime()` 转换——第 4.7.1 节的两种时间戳在此相遇）。作用：**压缩刚完成时，第一条"旧消息"不该把压缩再触发一遍**（老 usage 反映的是压缩前的更大上下文）。
-   - 【陷阱】用时间戳而不是 id/引用——因为调用方拿到的可能是**同一条消息的不同副本**（状态与投影的对象身份不完全稳定，第 D5 的引用比较教训）；时间戳是"语义相同"的可行代理。
-
-
-##### 3. 投影与分支上的一串布尔判定
-
-【源码（完整）】
-
-```typescript
-		// Automatic cases 1 and 2: context overflow.
-		// A length stop is recoverable when output ended below the model's original desired limit,
-		// independent of the configured context size or any context-clamped provider request limit.
-		// currentProjection（D3 的投影）与 assistantEntryId（消息对象 → 条目 id 的反查，_entryIdsByMessage 那条链）——先建立"这条消息在磁盘与投影中的落点"
-		const currentProjection = this.sessionManager.buildSessionProjection();
-		const assistantEntryId = this._findPersistedMessageEntryId(assistantMessage);
-		// assistantIsProjected：消息仍在模型可见投影里（条目 id 找不到时按可见处理——undefined || 的宽松分支：非持久化消息（测试/内存）不该被排除）
-		const assistantIsProjected =
-			assistantEntryId === undefined ||
-			currentProjection.entries.some(
-				(entry) =>
-					entry.sourceEntry.id === assistantEntryId &&
-					entry.messages.some((message) => message.role === "assistant"),
-			);
-		const branch = this.sessionManager.getBranch();
-		// assistantIndex/entriesAfterAssistant：在原始分支上找位置与后续条目——为下面两个"事后状态"判定提供范围
-		const assistantIndex = assistantEntryId ? branch.findIndex((entry) => entry.id === assistantEntryId) : -1;
-		const entriesAfterAssistant = assistantIndex >= 0 ? branch.slice(assistantIndex + 1) : [];
-		// hasPostAssistantContextEdit：这条消息产生之后发生过任何上下文编辑——若有，usage 与投影可能不一致（usage 是"编辑前"的）→ 相关的溢出判定要降级
-		const hasPostAssistantContextEdit = entriesAfterAssistant.some((entry) => entry.type === "context_edit");
-		// latestAssistantEdit：针对这条消息本身的最后一条编辑——replacement !== null 表示"没被省略"（被替换或原样）
-		const latestAssistantEdit = entriesAfterAssistant
-			.filter(
-				(entry): entry is ContextEditEntry => entry.type === "context_edit" && entry.targetId === assistantEntryId,
-			)
-			.at(-1);
-		// assistantRetainedForExplicitRecovery：显式溢出恢复的保留判定——有后续压缩 → 不保留；被编辑省略（replacement === null）→ 不保留；否则保留
-		const assistantRetainedForExplicitRecovery =
-			assistantEntryId === undefined ||
-			(!entriesAfterAssistant.some((entry) => entry.type === "compaction") &&
-				latestAssistantEdit?.replacement !== null);
-		const assistantUsageMatchesProjection = assistantIsProjected && !hasPostAssistantContextEdit;
-		const explicitOverflow = assistantMessage.stopReason === "error" && isContextOverflow(assistantMessage);
-		const contextOverflow =
-			sameModel &&
-			((explicitOverflow && assistantRetainedForExplicitRecovery) ||
-				(assistantUsageMatchesProjection && isContextOverflow(assistantMessage, contextWindow)));
-		const recoverableLength =
-			sameModel && assistantIsProjected && isRecoverableLength(assistantMessage, messageModel.maxTokens);
-```
-
-【注解（按依赖顺序）】
-
-1. **`currentProjection`**（D3 的投影）与 **`assistantEntryId`**（消息对象 → 条目 id 的反查，`_entryIdsByMessage` 那条链）——先建立"这条消息在磁盘与投影中的落点"。
-2. **`assistantIsProjected`**：消息**仍在模型可见投影里**（条目 id 找不到时**按可见处理**——`undefined ||` 的宽松分支：非持久化消息（测试/内存）不该被排除）。作用：**已被 `context_edit` 省略的消息不该再触发压缩**（它不在上下文里，没有"上下文超限"可言）。
-3. **`assistantIndex`/`entriesAfterAssistant`**：在**原始分支**上找位置与后续条目——为下面两个"事后状态"判定提供范围。
-4. **`hasPostAssistantContextEdit`**：这条消息产生**之后**发生过任何上下文编辑——若有，**usage 与投影可能不一致**（usage 是"编辑前"的）→ 相关的溢出判定要降级。
-5. **`latestAssistantEdit`**：针对**这条消息本身**的最后一条编辑——`replacement !== null` 表示"没被省略"（被替换或原样）。
-6. **`assistantRetainedForExplicitRecovery`**：显式溢出恢复的**保留判定**——`有后续压缩 → 不保留`；`被编辑省略（replacement === null）→ 不保留`；否则保留。用途：**显式报错的溢出**只有在"这条失败消息还会进入下一轮"时才值得压缩重试（否则压缩对象都不在上下文里）。
-7. **`assistantUsageMatchesProjection`**：投影可见 **且** 无事后编辑——usage 数字与当前投影匹配（估计才可信）。
-8. **`explicitOverflow`**：`stopReason === "error"` 且 `isContextOverflow(assistantMessage)`——**供应商明确报的溢出错误**。
-9. **`contextOverflow`** 的**双分支**：
-   - 显式溢出 **且** 消息会被保留（`assistantRetainedForExplicitRecovery`）→ 算溢出；
-   - 或者 usage 与投影匹配 **且** `isContextOverflow(assistantMessage, contextWindow)`（用窗口数字做**推断溢出**——messages 本身没报错，但用量已超窗）。
-   - 两者都要求 `sameModel`。
-10. **`recoverableLength`**：`stopReason === "length"` 且 `isRecoverableLength(assistantMessage, model.maxTokens)`——**"可恢复的截断"**：注释给了定义（"output ended below the model's original desired limit"**独立于**配置的上下文大小与供应商的钳制请求限制——即**截断不是因为我们要求的 maxTokens 小，而是撞了别的壁**）。**这是 D4/D10 里 `"length"` 场景在触发端的入口**。
-
-- 【陷阱】这一串布尔的**共同主题是"防误判"**：模型不对别压、消息被编辑/省略别压、过期 usage 别信、明确截断但可恢复才压。**任何一条读错，压缩就会在错误的时机触发或漏触发**——第 10 章的"反复压缩/不压缩"类故障大多落在这几行。
-
-
-##### 4. 溢出/可恢复截断分支：一击制（compact-and-retry 一次）
-
-【源码（节选）】
-
-```typescript
-		if (contextOverflow || recoverableLength) {
-			// willRetry 的判定 = stopReason !== "stop"
-			// 正常完成（stop）但已超窗 → 只压缩、不重试（注释原文："agent.continue() cannot continue from a completed assistant response"——上下文末尾是完成态助手消息，continue() 的守卫会拒（第 6.1.2 节））
-			const willRetry = assistantMessage.stopReason !== "stop";
-
-			// Case 2: the response completed successfully. Compact, but do not retry because
-			// agent.continue() cannot continue from a completed assistant response.
-			if (!willRetry) {
-				return await this._runAutoCompaction("overflow", false);
-			}
-
-			// _overflowRecoveryAttempted 一击制：整个会话只允许一次溢出恢复
-			if (this._overflowRecoveryAttempted) {
-				const errorMessage = contextOverflow
-					? "Context overflow recovery failed after one compact-and-retry attempt. ..."
-					: "Truncated response recovery failed after one compact-and-retry attempt.";
-				// 第二次溢出 → 双事件（compaction_end 失败版 + session_compact_failed）并返回 false——明确放弃（错误文案给出行动建议："reduce context or switch to a larger-context model"）
-				this._emit({ type: "compaction_end", reason: "overflow", result: undefined, aborted: false, willRetry: false, errorMessage });
-				await this._emitSessionCompactFailed({ reason: "overflow", errorMessage, aborted: false, willRetry: false, fromExtension: false });
-				return false;
-			}
-
-			this._overflowRecoveryAttempted = true;
-			// 先省略、再压缩：_omitRecoveryAttempt(assistantMessage, toolResults)（第 6.6.2 节）——把失败的尝试从投影剔除（连同工具结果）；然后才压缩（prepareCompaction 基于修好的投影）
-			this._omitRecoveryAttempt(assistantMessage, toolResults);
-			const retry = await this._runAutoCompaction("overflow", willRetry);
-			// _failedResponse = assistantMessage：重试成功后供上报/展示（失败响应引用）；retry 返回 true → 调用方的收尾循环会 agent.continue()（第 6.6 节）
-			if (retry) this._failedResponse = assistantMessage;
-			return retry;
-		}
-```
-
-【注解（四步）】
-
-1. **`willRetry` 的判定** = `stopReason !== "stop"`：
-   - **正常完成**（`stop`）但已超窗 → **只压缩、不重试**（注释原文："agent.continue() cannot continue from a completed assistant response"——上下文末尾是完成态助手消息，`continue()` 的守卫会拒（第 6.1.2 节））；
-   - 出错（`error`/`length`）→ 压缩后**重试**（失败消息会被省略，续跑从更前面的合法位置开始）。
-2. **`_overflowRecoveryAttempted` 一击制**：**整个会话只允许一次溢出恢复**（不是"每次溢出一次"——标志位没有按轮重置？【陷阱】读它的重置点：成功响应后清零（message_end 处理里 `stopReason !== "error" && !== "length"` 时 `_overflowRecoveryAttempted = false`——第 3.13 节的读段）。所以是"**连续溢出**只救一次；一旦有正常响应，资格恢复"。）
-   - 第二次溢出 → **双事件**（`compaction_end` 失败版 + `session_compact_failed`）并返回 false——**明确放弃**（错误文案给出行动建议："reduce context or switch to a larger-context model"）。
-3. **先省略、再压缩**：`_omitRecoveryAttempt(assistantMessage, toolResults)`（第 6.6.2 节）——把失败的尝试从投影剔除（连同工具结果）；**然后**才压缩（`prepareCompaction` 基于修好的投影）。
-4. **`_failedResponse = assistantMessage`**：重试成功后供上报/展示（失败响应引用）；`retry` 返回 true → 调用方的收尾循环会 `agent.continue()`（第 6.6 节）。
-
-
-##### 5. 阈值分支：三种 token 口径
-
-【源码（节选）】
-
-```typescript
-		let contextTokens: number;
-		const projection = currentProjection;
-		const hasContextEdits = projection.entries.some((entry) => entry.sourceEntry.type === "context_edit");
-		const directContextTokens = assistantMessage.usage ? calculateContextTokens(assistantMessage.usage) : 0;
-		if (hasContextEdits) {
-			// 有 context_edit → 用投影估算（estimateProjectedContextTokens——D10 同款；编辑改变了实际输入，只有投影估算反映"编辑后"）
-			contextTokens = estimateProjectedContextTokens(projection, branch).tokens;
-		} else if (assistantMessage.stopReason === "error" || directContextTokens === 0) {
-			const messages = this.agent.state.messages;
-			// 出错或零用量 → 用 estimateContextTokens(messages)（纯消息估算），并且
-			const estimate = estimateContextTokens(messages);
-			if (estimate.lastUsageIndex !== null) {
-				// Verify the usage source is post-compaction. ...
-				const usageMsg = messages[estimate.lastUsageIndex];
-				if (compactionEntry && usageMsg.role === "assistant" && (usageMsg as AssistantMessage).timestamp <= new Date(compactionEntry.timestamp).getTime()) {
-					return false;
-				}
-			}
-			contextTokens = estimate.tokens;
-		} else {
-			contextTokens = directContextTokens;
-		}
-		// 最后统一进 shouldCompact(contextTokens, contextWindow, settings)（第 10.2.1 节的不等式）
-		if (shouldCompact(contextTokens, contextWindow, settings)) {
-			return await this._runAutoCompaction("threshold", false);
-		}
-		return false;
-	}
-```
-
-【注解（三级选择）】
-
-1. **有 context_edit** → 用**投影估算**（`estimateProjectedContextTokens`——D10 同款；编辑改变了实际输入，只有投影估算反映"编辑后"）。
-2. **出错或零用量** → 用 `estimateContextTokens(messages)`（纯消息估算），并且：
-   - 若估算找到了"最后一次有效 usage"的来源消息，**校验它不是压缩前的旧消息**（同样的 stale 时间戳检查）——旧 usage 会给出过大的数字（压缩前的上下文），导致**刚压完又压**（注释原文）。**不满足就直接返回 false**（这轮不压——下次有新鲜数据再说）。
-3. **其余** → 直接用 `calculateContextTokens(usage)`（供应商报的真实数字，最可信）。
-
-- 最后统一进 `shouldCompact(contextTokens, contextWindow, settings)`（第 10.2.1 节的不等式）。
-- 【陷阱】三个口径的**选择条件**要背下来：**编辑 → 投影估；错误/零用量 → 消息估（带 stale 校验）；正常 → usage 实数**。
-
----
-
-> D15 第一部分到此。第二部分：`_runAutoCompaction` 的执行事务（abortController、扩展拦截、默认/自定义摘要、写盘与事件、重试信号、失败记账）、触发点总表与总结。
-
----
-
-
-###### 第二部分：`_runAutoCompaction` 的执行事务
-
-
-##### 6. 签名与文档注释（先看契约）
-
-【源码（节选）】
-
-```typescript
-	/**
-	 * Execute threshold or overflow compaction. Manual compaction uses
-	 * `AgentSession.compact()` instead. Both paths call the lower-level `compact()`
-	 * function imported from `./compaction/index.ts` after preparation and extension
-	 * interception.
-	 *
-	 * @param reason Automatic trigger selected by `_checkCompaction()`
-	 * @param willRetry Whether to continue the interrupted turn after overflow compaction
-	 * @returns Whether the post-run loop should call `agent.continue()`
-	 */
-	// 两个 reason："overflow"（溢出恢复）与 "threshold"（常规阈值）；手动路径不走这里（走 AgentSession.compact()）——但两者都经过扩展拦截与同一个默认摘要器（注释原文）
-	private async _runAutoCompaction(reason: "overflow" | "threshold", willRetry: boolean): Promise<boolean> {
-```
-
-【注解】
-
-- **返回值是一个"要不要续跑"的信号**（`@returns Whether the post-run loop should call agent.continue()`）——调用方（`_handlePostAgentRun`）据此决定 `agent.continue()`（第 6.6 节）。**压缩函数不只是"做完事"，还承担"调度建议"**。
-- 两个 reason：`"overflow"`（溢出恢复）与 `"threshold"`（常规阈值）；手动路径不走这里（走 `AgentSession.compact()`）——**但两者都经过扩展拦截与同一个默认摘要器**（注释原文）。
-
-
-##### 7. 准备段：守卫、控制器、起始事件
-
-【源码（节选）】
-
-```typescript
-		const model = this.model;
-		const settings = this.settingsManager.getCompactionSettings(model);
-		// abortController：本次压缩的取消信号（与全局的 _autoCompactionAbortController 同一对象——abortCompaction() 方法据此取消）
-		let abortController: AbortController | undefined;
-		// started："已经发过 compaction_start"——失败路径据此决定是否补发 compaction_end（没开始过就别说结束）
-		// 准备失败不算"开始"（started 仍 false）：prepareCompaction 返回 undefined（幂等守卫/无事可做）→ 直接 false 返回、零事件——"没有可压的东西"不是失败，别报事件
-		let started = false;
-		// fromExtension：最终摘要是否来自扩展（进 appendCompaction 的字段 + session_compact 事件）
-		let fromExtension = false;
-		// cancelledByExtension：钩子取消的标记（最后在 catch 里并入 aborted 判定）
-		let cancelledByExtension = false;
-
-		try {
-			if (!model) return false;
-
-			const pathEntries = this.sessionManager.getBranch();
-			const preparation = prepareCompaction(pathEntries, settings);
-			if (!preparation) return false;
-
-			abortController = new AbortController();
-			this._autoCompactionAbortController = abortController;
-			started = true;
-			this._emit({ type: "compaction_start", reason });
-			// throwIfAborted() 在发事件之后立刻检查——取消优先于一切后续（包括扩展钩子）
-			abortController.signal.throwIfAborted();
-```
-
-【注解（四个状态位各司其职）】
-
-- `abortController`：本次压缩的取消信号（与全局的 `_autoCompactionAbortController` 同一对象——`abortCompaction()` 方法据此取消）。
-- `started`：**"已经发过 `compaction_start`"**——失败路径据此决定是否补发 `compaction_end`（没开始过就别说结束）。
-- `fromExtension`：最终摘要是否来自扩展（进 `appendCompaction` 的字段 + `session_compact` 事件）。
-- `cancelledByExtension`：钩子取消的标记（最后在 catch 里并入 `aborted` 判定）。
-- 【陷阱】**准备失败不算"开始"**（`started` 仍 false）：`prepareCompaction` 返回 undefined（幂等守卫/无事可做）→ 直接 false 返回、**零事件**——"没有可压的东西"不是失败，别报事件。
-- `throwIfAborted()` 在**发事件之后**立刻检查——**取消优先于一切后续**（包括扩展钩子）。
-
-
-##### 8. 扩展拦截：可取消点与自定义摘要
-
-【源码（节选）】
-
-```typescript
-			let extensionCompaction: CompactionResult | undefined;
-
-			// hasHandlers 前置检查：没有扩展处理时连事件对象都不构造（第 D8 第 7 节的快速门）；构造 emit 的载荷本身要读 pathEntries 等——省掉
-			if (this._extensionRunner.hasHandlers("session_before_compact")) {
-				const extensionResult = (await this._extensionRunner.emit({
-					type: "session_before_compact",
-					// 事件载荷六件套：preparation（D10 的施工图——扩展拿得到待摘要消息/保留边界/文件操作/设置）、branchEntries（原始分支——自定义逻辑可能要全量看）、customInstructions（自动路径为 undefined；手动路径才有）、reason、willRetry、signal（扩展的模型调用也要可取消——第 10.7.1 节的示例里显式把 signal 传给了自己的调用）
-					preparation,
-					branchEntries: pathEntries,
-					customInstructions: undefined,
-					reason,
-					willRetry,
-					signal: abortController.signal,
-				})) as SessionBeforeCompactResult | undefined;
-
-				if (extensionResult?.cancel) {
-					cancelledByExtension = true;
-					throw new Error("Compaction cancelled");
-				}
-
-				if (extensionResult?.compaction) {
-					// 自定义摘要（extensionResult.compaction）：直接给出 CompactionResult——跳过默认摘要器（不花 token），但保留边界的 firstKeptEntryId/tokensBefore 由扩展负责正确（契约在 SessionBeforeCompactResult 类型与 compaction.md 的示例里）
-					extensionCompaction = extensionResult.compaction;
-					fromExtension = true;
-				}
-			}
-			abortController.signal.throwIfAborted();
-```
-
-【注解】
-
-- 事件载荷**六件套**：`preparation`（D10 的施工图——扩展拿得到待摘要消息/保留边界/文件操作/设置）、`branchEntries`（原始分支——自定义逻辑可能要全量看）、`customInstructions`（自动路径为 undefined；手动路径才有）、`reason`、`willRetry`、`signal`（**扩展的模型调用也要可取消**——第 10.7.1 节的示例里显式把 signal 传给了自己的调用）。
-- **cancel 用"标记 + throw"**（而不是 return false）：统一的 catch 处理会做"aborted 记账"（事件 + `session_compact_failed`）——**取消与失败共用收尾通道，但结果字段不同**（`aborted: true` vs `errorMessage`）。
-- 自定义摘要（`extensionResult.compaction`）：直接给出 `CompactionResult`——**跳过默认摘要器**（不花 token），但保留边界的 `firstKeptEntryId`/`tokensBefore` **由扩展负责正确**（契约在 `SessionBeforeCompactResult` 类型与 compaction.md 的示例里）。
-- 【陷阱】`hasHandlers` 前置检查：没有扩展处理时**连事件对象都不构造**（第 D8 第 7 节的快速门）；构造 `emit` 的载荷本身要读 `pathEntries` 等——省掉。
-
-
-##### 9. 生成与写盘：默认摘要器与"共享收口"
-
-【源码（节选）】
-
-```typescript
-			if (extensionCompaction) {
-				summary = extensionCompaction.summary;
-				firstKeptEntryId = extensionCompaction.firstKeptEntryId;
-				tokensBefore = extensionCompaction.tokensBefore;
-				usage = extensionCompaction.usage;
-				details = extensionCompaction.details;
-			} else {
-				// Shared default summary generator, also used by manual compaction.
-				const compactResult = await this._runDefaultCompaction(preparation, model, undefined, abortController.signal, reason);
-				summary = compactResult.summary;
-				firstKeptEntryId = compactResult.firstKeptEntryId;
-				tokensBefore = compactResult.tokensBefore;
-				usage = compactResult.usage;
-				details = compactResult.details;
-			}
-			abortController.signal.throwIfAborted();
-
-			// 写盘：appendCompaction（D9 第 11.3 节）——一次性事务的"提交点"
-			// 回找条目：find(e => e.type === "compaction" && e.summary === summary)——按 summary 匹配
-			this.sessionManager.appendCompaction(summary, firstKeptEntryId, tokensBefore, details, fromExtension, usage);
-			// 刷新与估算：getEntries + _refreshFinalizedContext()（把投影刷给 state.messages 等消费方）+ estimateMessagesTokens(projection.messages)（压缩后的估算——进 compaction_end 的 estimatedTokensAfter，事件消费者能看到"省了多少"）
-			const newEntries = this.sessionManager.getEntries();
-			this._refreshFinalizedContext();
-			const estimatedTokensAfter = estimateMessagesTokens(this.sessionManager.buildSessionProjection().messages);
-
-			// Get the saved compaction entry for the extension event
-			const savedCompactionEntry = newEntries.find((e) => e.type === "compaction" && e.summary === summary) as CompactionEntry | undefined;
-
-			if (this._extensionRunner && savedCompactionEntry) {
-				// 两个事件的顺序：先 session_compact（扩展视角——带条目对象）→ 后 compaction_end（UI/通用视角——带 result 摘要）
-				// willRetry → true（溢出恢复：调用方续跑）
-				await this._extensionRunner.emit({ type: "session_compact", compactionEntry: savedCompactionEntry, fromExtension, reason, willRetry });
-			}
-
-			const result: CompactionResult = { summary, firstKeptEntryId, tokensBefore, estimatedTokensAfter, usage, details };
-			this._emit({ type: "compaction_end", reason, result, aborted: false, willRetry });
-
-			if (willRetry) return true;
-			// Auto-compaction can complete while follow-up/steering/custom messages are waiting.
-			// Continue once so queued messages are delivered.
-			// 否则 agent.hasQueuedMessages()——注释原文解释：压缩期间可能有 follow-up/steering/自定义消息在排队，续跑一次把队列交付（第 6.3 节的取数点语义——压缩占住运行，队列攒着）
-			return this.agent.hasQueuedMessages();
-```
-
-【注解（六个动作）】
-
-1. **两条摘要来源归一**成五个局部量（summary/firstKeptEntryId/tokensBefore/usage/details）——**下游代码不关心摘要从哪来**（扩展 or 默认）。
-2. `_runDefaultCompaction(...)`：**共享默认摘要器**（注释点名"also used by manual compaction"）——把 D10 的 `compact()` 包成"会话语境版"（注入 key/headers/retry/streamFn 之类的会话资产——具体参数以函数实现为准）。**找到它就读懂了"手动与自动的唯一差异"**。
-3. **写盘**：`appendCompaction`（D9 第 11.3 节）——一次性事务的"提交点"。
-4. **刷新与估算**：`getEntries` + `_refreshFinalizedContext()`（把投影刷给 `state.messages` 等消费方）+ `estimateMessagesTokens(projection.messages)`（压缩**后**的估算——进 `compaction_end` 的 `estimatedTokensAfter`，事件消费者能看到"省了多少"）。
-5. **回找条目**：`find(e => e.type === "compaction" && e.summary === summary)`——**按 summary 匹配**（【陷阱】没有更稳的关联？`appendCompaction` 返回 id，但这里用 summary 匹配——如果两条摘要文本完全相同会匹配到第一条；实践里摘要几乎不可能同文，但这是一个"可改进点"式的观察。读代码时识别这类"概率上没问题"的写法，是审阅能力的一部分）。
-6. **两个事件的顺序**：先 `session_compact`（**扩展视角**——带条目对象）→ 后 `compaction_end`（**UI/通用视角**——带 result 摘要）。【陷阱】顺序有含义：扩展可以**在界面前**看到/改后处理？不——事件都是通知；但"谁先收到"仍影响扩展的数据可见性（比如扩展在 `session_compact` 里又 append 了条目——会排在 `compaction_end` 之前被观察）。
-7. **返回信号**（两条）：
-   - `willRetry` → true（溢出恢复：调用方续跑）；
-   - 否则 **`agent.hasQueuedMessages()`**——注释原文解释：压缩期间可能有 follow-up/steering/自定义消息在排队，**续跑一次把队列交付**（第 6.3 节的取数点语义——压缩占住运行，队列攒着）。
-   - 【陷阱】这条返回值回答了"**压缩自身为什么可能带来一次额外模型请求**"——不只是恢复，也可能是"把排队消息送出去"。
-
-
-##### 10. 失败记账：`catch` 与 `finally`
-
-【源码（节选）】
-
-```typescript
-		} catch (error) {
-			const message = error instanceof Error ? error.message : "compaction failed";
-			// aborted 的双来源：signal.aborted（用户取消/abortCompaction()）或 cancelledByExtension（钩子取消）——两者语义合并（"不是失败，是被中止"）；取消时 errorMessage 为 undefined（aborted 分支）——事件消费者据此区分"取消"与"失败"
-			const aborted = abortController?.signal.aborted === true || cancelledByExtension;
-			if (started) {
-				const errorMessage = aborted
-					? undefined
-					: reason === "overflow"
-						? `Context overflow recovery failed: ${message}`
-						: `Auto-compaction failed: ${message}`;
-				// 双事件（compaction_end + session_compact_failed）——与成功路径的"两视角"对称
-				this._emit({ type: "compaction_end", reason, result: undefined, aborted, willRetry: false, errorMessage });
-				await this._emitSessionCompactFailed({ reason, errorMessage, aborted, willRetry: false, fromExtension });
-			}
-			return false;
-		} finally {
-			// 清 _autoCompactionAbortController（身份比对：只有还是"我"的控制器才清——防更晚的压缩覆盖时的错清；第 D11/D12 的"代际"守卫在单字段版）
-			if (this._autoCompactionAbortController === abortController) {
-				this._autoCompactionAbortController = undefined;
-			}
-			// _resolveIdleWaitIfIdle()：如果一切空闲，唤醒 waitForIdle 的等待者——压缩也是"工作"，压缩期间"会话不空闲"（isCompacting 状态、get_state 的字段——H.8）
-			this._resolveIdleWaitIfIdle();
-		}
-```
-
-【注解】
-
-- **aborted 的双来源**：`signal.aborted`（用户取消/`abortCompaction()`）**或** `cancelledByExtension`（钩子取消）——两者语义合并（"不是失败，是被中止"）；**取消时 `errorMessage` 为 undefined**（`aborted` 分支）——事件消费者据此区分"取消"与"失败"。
-- **失败文案按 reason 分流**（"Context overflow recovery failed" vs "Auto-compaction failed"）——排障时按文案定位触发路径。
-- 双事件（`compaction_end` + `session_compact_failed`）——与成功路径的"两视角"对称。
-- **finally 两件事**：
-  - 清 `_autoCompactionAbortController`（**身份比对**：只有还是"我"的控制器才清——防更晚的压缩覆盖时的错清；第 D11/D12 的"代际"守卫在单字段版）；
-  - `_resolveIdleWaitIfIdle()`：**如果一切空闲，唤醒 `waitForIdle` 的等待者**——压缩也是"工作"，压缩期间"会话不空闲"（`isCompacting` 状态、`get_state` 的字段——H.8）。**收尾的统一"重新判定空闲"**。
-
-
-##### 11. 三条路径的对照总结
-
-| 维度     | 自动-阈值                                                   | 自动-溢出                                      | 手动`/compact`                         |
-| -------- | ----------------------------------------------------------- | ---------------------------------------------- | ---------------------------------------- |
-| 触发     | `shouldCompact` 判定                                      | 溢出错误/可恢复截断                            | 用户命令                                 |
-| 入口     | `_checkCompaction` → `_runAutoCompaction("threshold")` | 同上（"overflow"）+ 先`_omitRecoveryAttempt` | `AgentSession.compact()`               |
-| 重试     | 否（除非有队列消息）                                        | 是（一击制；`willRetry`）                    | 否                                       |
-| 扩展钩子 | `session_before_compact`（reason/threshold）              | 同（reason/overflow）                          | 同（reason/manual + customInstructions） |
-| 摘要器   | `_runDefaultCompaction`                                   | 同                                             | 同（共享）                               |
-| 写盘     | `appendCompaction`                                        | 同                                             | 同                                       |
-| 事件     | `compaction_start/end` + `session_compact`              | 同                                             | 同                                       |
-
-【陷阱】"共享"是理解这段代码的钥匙：**五件事（钩子、摘要、写盘、事件、空闲唤醒）在三条路径上完全一致**；差异集中在"触发条件、重试信号、自定义指令"。**读会话侧压缩不要重读三遍——读一遍共享段 + 三条触发段即可。**
-
-
-##### 12. 阅读检查清单
-
-- [ ] 我能说出 `skipAbortedCheck` 在 T1/T2 两个调用点的相反语义吗？
-- [ ] 我能解释三道一致性守卫（同模型/压缩边界/投影与编辑）各自防的误判吗？
-- [ ] 我知道 `contextOverflow` 的两个分支与 `recoverableLength` 的定义吗？
-- [ ] 我能复述溢出恢复的"一击制"与标志位重置点吗？
-- [ ] 我能背出阈值分支的三种 token 口径与选择条件吗？
-- [ ] 我知道 `_runAutoCompaction` 返回值两种 `true` 的含义吗？（恢复续跑 vs 队列交付）
-- [ ] 我能说出成功/取消/失败三种收尾的事件组合吗？
-
----
-
-> D15 完。精读篇（D1-D15）覆盖：循环、Agent、会话（投影/本体/压缩触发）、提示与压缩（读/写/触发）、SDK、CLI、工具、扩展（类型/派发/加载）、模型层、协议模式、交互模式。
-
-
-
-##### D10：压缩的"写入路径"精读（`prepareCompaction` + `compact`）
-
-**先懂**：决定压缩之后，还要选择保留哪些最近消息、用哪些旧消息生成摘要，并把新的摘要条目写入会话。先跟踪一段短历史的切分，再读计算细节。
-
-```text
-教学伪代码：读取活动历史 → 选保留区间与摘要区间
-           → 序列化摘要素材并请求模型生成摘要
-           → 合并需要保留的信息 → 写入压缩结果
-```
-
-system 消息与历史摘要素材不完全相同；后文说明哪些条目被过滤、哪些状态要重建。
-
-> 精读对象：`core/compaction/compaction.ts` 的**后半段**——`CompactionPreparation`、`findProjectedCutPoint`、`prepareCompaction`、`compact`（生成摘要并产出结果）。
-> 对应主线：第 10 章；与 D4 的关系：D4 精读"阈值/估算/切点/序列化/摘要调用"（读侧素材），D10 精读"从当前会话到 `CompactionEntry` 的完整写路径"。
-> 读法：先读 `prepareCompaction`（决定"摘要什么、保留什么"），再读 `compact`（决定"怎么摘要、怎么合并"）。
-
----
-
-
-###### 0. 写路径全景
-
-```text
-AgentSession._checkCompaction（触发端：阈值/溢出/手动）
-  → prepareCompaction(pathEntries, settings)          ← 本篇第一部分：算出"预备方案"
-      · buildSessionProjection（D3 的投影）
-      · findProjectedCutPoint（投影版切点算法）
-      · messagesToSummarize / turnPrefixMessages / firstKeptEntryId / fileOps
-  → compact(preparation, ...)                          ← 本篇第二部分：真正生成摘要
-      · generateSummaryWithUsage（历史摘要；D4 第 9 节）
-      · generateTurnPrefixSummary（分裂跨度前缀摘要）
-      · 合并 + 文件列表 + 用量
-      · 返回 CompactionResult
-  → sessionManager.appendCompaction(...)（D9 第 11.3 节：写检查点条目）
-```
-
-【陷阱】三层职责**不要混**：`prepareCompaction` 不调模型（纯计算）；`compact` 调模型但**不写会话**（只返回结果）；写入由 `SessionManager.appendCompaction` 完成（D9）。**"算 → 生成 → 落盘"三段分离**——哪段失败、哪段可重试、哪段是纯函数，一目了然。
-
----
-
-
-###### 第一部分：`prepareCompaction`（预备方案）
-
-
-##### 1. `CompactionPreparation`：一份"施工图"
-
-【源码】
-
-```typescript
-export interface CompactionPreparation {
-	/** UUID of first entry to keep */
-	// firstKeptEntryId：保留边界（D3 折叠算法的输入，也是最终写入 CompactionEntry 的字段）
-	firstKeptEntryId: string;
-	/** Messages that will be summarized and discarded */
-	// messagesToSummarize：要被摘要替代的历史消息（投影后）
-	messagesToSummarize: AgentMessage[];
-	/** Messages that will be turned into turn prefix summary (if splitting) */
-	// turnPrefixMessages：分裂跨度的前缀消息（可能要第二份摘要）
-	turnPrefixMessages: AgentMessage[];
-	/** Whether this is a split turn (cut point in middle of turn) */
-	// isSplitTurn：是否分裂（决定走不走两段摘要路径）
-	isSplitTurn: boolean;
-	// tokensBefore：压缩前的 token 数（用于 CompactionEntry 与报告）
-	tokensBefore: number;
-	/** Summary from previous compaction, for iterative update */
-	// previousSummary：上一次压缩的摘要（作为迭代更新的输入——第 10.3.4 节）
-	previousSummary?: string;
-	/** File operations extracted from messagesToSummarize */
-	fileOps: FileOperations;
-	/** Compaction settions from settings.jsonl	*/
-	settings: CompactionSettings;
-}
-```
-
-【注解（八个字段就是全部决策）】
-
-1. `firstKeptEntryId`：**保留边界**（D3 折叠算法的输入，也是最终写入 `CompactionEntry` 的字段）；
-2. `messagesToSummarize`：要**被摘要替代**的历史消息（投影后）；
-3. `turnPrefixMessages`：分裂跨度的前缀消息（可能要**第二份摘要**）；
-4. `isSplitTurn`：是否分裂（决定走不走两段摘要路径）；
-5. `tokensBefore`：压缩前的 token 数（用于 `CompactionEntry` 与报告）；
-6. `previousSummary`：上一次压缩的摘要（作为**迭代更新的输入**——第 10.3.4 节）；
-7. `fileOps`：从被摘要消息里提取的文件操作（第 D4 第 8 节的追踪器）；
-8. `settings`：生效的设置（`reserveTokens`/`keepRecentTokens`——可能含模型覆盖）。
-
-- 【陷阱】注释里有个拼写错误（"Compaction settions from settings.jsonl"——`settings.json` 拼成 `jsonl`、`settions` 拼成 `sections` 的兄弟？）。**读注释不要被笔误带偏**；以字段名与实现为准。
-
-
-##### 2. `findProjectedCutPoint`：投影版切点（与 D4 的差别）
-
-**先懂**：切点针对模型实际看到的投影历史查找；原始条目中可能有控制信息，不适合直接按条目数切。
-
-```text
-教学伪代码：从投影历史末尾往前估算保留量
-           → 遵守相关消息的边界 → 返回摘要与保留分界
-```
-
-【源码（核心段）】
-
-```typescript
-function findProjectedCutPoint(
-	entries: ProjectedSessionEntry[],
-	startIndex: number,
-	endIndex: number,
-	keepRecentTokens: number,
-): CutPointResult {
-	const cutPoints: number[] = [];
-	for (let i = startIndex; i < endIndex; i++) {
-		const entry = entries[i];
-		if (entry.sourceEntry.type !== "compaction" && entry.messages.some(isCutPointMessage)) cutPoints.push(i);
-	}
-	if (cutPoints.length === 0) {
-		return { firstKeptEntryIndex: startIndex, turnStartIndex: -1, isSplitTurn: false };
-	}
-
-	let accumulatedTokens = 0;
-	let exceededBudget = false;
-	let cutIndex = cutPoints[0];
-	for (let i = endIndex - 1; i >= startIndex; i--) {
-		const messageTokens = entries[i].messages.reduce((sum, message) => sum + estimateTokens(message), 0);
-		if (messageTokens === 0) continue;
-		accumulatedTokens += messageTokens;
-		if (accumulatedTokens >= keepRecentTokens) {
-			exceededBudget = true;
-			cutIndex = cutPoints.find((candidate) => candidate >= i) ?? cutPoints[cutPoints.length - 1];
-			break;
-		}
-	}
-
-	// A recovery attempt and its omission edits are context-invisible after the last
-	// visible input. Advance only for a closed suffix containing an omitted assistant
-	// attempt; ...
-	const suffix = entries.slice(cutIndex + 1, endIndex);
-	const isIntrinsicallyVisible = (entry: ProjectedSessionEntry): boolean =>
-		// 场景：溢出恢复把失败的尝试用 context_edit（replacement=null）抹掉后，投影里那些条目 messages 为空——它们"在上下文里不可见"，但仍占 entries 的位置
-		entry.sourceEntry.type !== "context_edit" && sessionEntryToContextMessages(entry.sourceEntry).length > 0;
-	const isOmitted = (entry: ProjectedSessionEntry): boolean =>
-		isIntrinsicallyVisible(entry) && entry.messages.length === 0;
-	const omittedSuffixIds = new Set(suffix.filter(isOmitted).map((entry) => entry.sourceEntry.id));
-	const hasExternalReplacement = suffix.some(
-		(entry) =>
-			entry.sourceEntry.type === "context_edit" &&
-			entry.sourceEntry.replacement !== null &&
-			!omittedSuffixIds.has(entry.sourceEntry.targetId),
-	);
-	const isRecoveryOmissionSuffix =
-		exceededBudget &&
-		!hasExternalReplacement &&
-		suffix.some(
-			(entry) =>
-				entry.sourceEntry.type === "message" && entry.sourceEntry.message.role === "assistant" && isOmitted(entry),
-		) &&
-		suffix.every(
-			(entry) => entry.sourceEntry.type !== "compaction" && (!isIntrinsicallyVisible(entry) || isOmitted(entry)),
-		);
-	if (isRecoveryOmissionSuffix) cutIndex++;
-
-	while (cutIndex > startIndex) {
-		const previous = entries[cutIndex - 1];
-		if (previous.sourceEntry.type === "compaction" || previous.messages.length > 0) break;
-		cutIndex--;
-	}
-	const startsTurn = isProjectedTurnStart(entries[cutIndex]);
-	const turnStartIndex = startsTurn ? -1 : findProjectedTurnStartIndex(entries, cutIndex, startIndex);
-	return {
-		firstKeptEntryIndex: cutIndex,
-		turnStartIndex,
-		isSplitTurn: !startsTurn && turnStartIndex !== -1,
-	};
-}
-```
-
-【注解（与 D4 的 `findCutPoint` 逐点对照）】
-
-| 维度                    | D4 的`findCutPoint`（原始条目）               | 本函数（投影条目）                                                                                                                               |
-| ----------------------- | ----------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------ |
-| 输入                    | `SessionEntry[]` + 索引起止                   | `ProjectedSessionEntry[]`（每项含 `sourceEntry` 与 `messages`）                                                                            |
-| 切点判定                | `findValidCutPoints`（内部实现）              | 内联：`sourceEntry.type !== "compaction" && messages.some(isCutPointMessage)`（**注意 `isCutPointMessage` 判的是"消息"而不是"条目"**） |
-| 预算累加                | `sessionEntryToContextMessages(entry)` 再估算 | 直接用`entry.messages`（投影已经翻译好——**不再重复翻译**）                                                                             |
-| 恢复省略的特殊处理      | 无                                              | **有**（见下）                                                                                                                             |
-| 元数据吞并 / split 判定 | 同构                                            | 同构（用投影版判定函数）                                                                                                                         |
-
-**核心差异：recursive 省略后缀的处理**（注释与那段五连逻辑）：
-
-- 场景：**溢出恢复**把失败的尝试用 `context_edit`（replacement=null）抹掉后，投影里那些条目 **`messages` 为空**——它们"在上下文里不可见"，但仍占 `entries` 的位置。
-- 问题：切点如果落在"最后一个可见输入"之后（即后缀全是"不可见条目"），会白保留一段"什么都看不见"的尾巴，让下一次压缩早触发/晚触发得莫名其妙。
-- 解法（**只在严格条件下**前进一位）：
-
-```text
-isIntrinsicallyVisible(entry) = 不是 context_edit 且 原始条目能转出消息
-isOmitted(entry)              = 本来可见（源条目有消息）但投影后 messages 为空（被省略）
-
-isRecoveryOmissionSuffix =
-  exceededBudget                                  ← 确实超预算了
-  && !hasExternalReplacement                      ← 后缀里的 context_edit 不是"替换内容"（可能改变语义）
-  && 后缀里至少有一条"被省略的 assistant 消息"        ← 是"恢复省略"而不是别的删除
-  && 后缀里没有 compaction 且每条都"不可见或本来就不可见" ← 后缀是"闭合的不可见段"
-
-满足 → cutIndex++（把切点前移一格，把这段不可见尾巴留在"待摘要"侧）
-```
-
-- 【陷阱】四个条件的**防守对象**不同：`exceededBudget` 防"没超预算也乱切"；`!hasExternalReplacement` 防"把用户主动的编辑（替换文本）当垃圾吞掉"；"含被省略的 assistant"防"误判无关的隐身条目"；"后缀闭合"防"跨过还有可见内容的条目"。**注释原文**（"Advance only for a closed suffix containing an omitted assistant attempt; arbitrary metadata must not move the cut past unsent input."）就是这四条的白话版——这种"复杂判定只前进一位"的保守设计，是"宁可不优化也不能切错"的又一次体现。
-- 【陷阱】`cutPoints` 收集时**排除 compaction 源条目**：不能拿压缩条目当切点（它是边界标记，D3 同款处理）。
-- 【陷阱】`estimateTokens`/`isCutPointMessage` 等判定**只传消息**——如果未来加"条目级"的切点规则（比如"设置条目也可以切"），这些内联条件要改；D4 的版本有独立的 `findValidCutPoints` 函数（更易扩展），版本之间**没有共享**（两套算法各自演化——读时别以为一个改另一个也变）。
-
-
-##### 3. `prepareCompaction`：从路径到施工图
-
-**先懂**：生成摘要前先算好素材、保留段和旧摘要，形成一份后续可用的准备数据。
-
-```text
-教学伪代码：读取活动路径和投影 → 算切点
-           → 分出摘要素材与保留消息 → 返回准备结果
-```
-
-【源码（完整，分段注解）】
-
-```typescript
-export function prepareCompaction(
-	pathEntries: SessionEntry[],
-	settings: CompactionSettings,
-): CompactionPreparation | undefined {
-	// 幂等守卫：路径的最后一条已经是 compaction → 返回 undefined（"刚压过就别再压"——防止连续触发重复压缩；对应第 10.2.3 节的检查时机）
-	if (pathEntries.length > 0 && pathEntries[pathEntries.length - 1].type === "compaction") {
-		return undefined;
-	}
-
-	// 构建投影（D3 的 buildSessionProjection）——一切基于投影而非原始条目（被省略/被编辑的内容不参与摘要；这正是第 10.3.1 节"从投影找切点"的依据）
-	const projection = buildSessionProjection(pathEntries);
-	const projectedEntries = projection.entries;
-	const sourceEntries = projectedEntries.map((entry) => entry.sourceEntry);
-	// The newest compaction is projected first. Older compaction entries can still
-	// occur in its retained raw range, but their projected contribution is empty.
-	// 投影里只有最新压缩贡献消息（D3 的 index > 0 → [] 规则），所以"messages 非空的 compaction"就是最新那次；findIndex 找它
-	const prevCompactionIndex = projectedEntries.findIndex(
-		(entry) => entry.sourceEntry.type === "compaction" && entry.messages.length > 0,
-	);
-
-	// previousSummary 取它的 summary——用于迭代更新（第 10.3.4 节）
-	let previousSummary: string | undefined;
-	let boundaryStart = 0;
-	if (prevCompactionIndex >= 0) {
-		previousSummary = (projectedEntries[prevCompactionIndex].sourceEntry as CompactionEntry).summary;
-		// The canonical projection has already selected the previous compaction's retained tail.
-		// boundaryStart = prevCompactionIndex + 1——注释点明："投影已经选好了上一次压缩的保留尾巴"，所以本轮摘要的起点是它的下一个条目（不是从会话开头！）——这就是"重复压缩从上一个保留边界开始"的实现位置（第 10.3.4 节的另一处表述）
-		boundaryStart = prevCompactionIndex + 1;
-	}
-	// boundaryEnd = 投影长度；tokensBefore 用 estimateProjectedContextTokens(projection, pathEntries)（投影后的估算——第 10.3.4 节的"重算 tokensBefore"）；切点用 findProjectedCutPoint(projectedEntries, boundaryStart, boundaryEnd, keepRecentTokens)
-	const boundaryEnd = projectedEntries.length;
-	const tokensBefore = estimateProjectedContextTokens(projection, pathEntries).tokens;
-	const cutPoint = findProjectedCutPoint(projectedEntries, boundaryStart, boundaryEnd, settings.keepRecentTokens);
-
-	const firstKeptEntry = projectedEntries[cutPoint.firstKeptEntryIndex]?.sourceEntry;
-	if (!firstKeptEntry?.id) return undefined;
-	const firstKeptEntryId = firstKeptEntry.id;
-	const historyEnd = cutPoint.isSplitTurn ? cutPoint.turnStartIndex : cutPoint.firstKeptEntryIndex;
-
-	const messagesToSummarize = projectedEntries
-		.slice(boundaryStart, historyEnd)
-		.flatMap(getMessagesFromProjectedEntryForCompaction);
-	const turnPrefixMessages = cutPoint.isSplitTurn
-		? projectedEntries
-				.slice(cutPoint.turnStartIndex, cutPoint.firstKeptEntryIndex)
-				.flatMap(getMessagesFromProjectedEntryForCompaction)
-		: [];
-
-	if (messagesToSummarize.length === 0 && turnPrefixMessages.length === 0) return undefined;
-
-	// Extract file operations from edited model-visible messages and the previous compaction.
-	const fileOps = extractFileOperations(messagesToSummarize, sourceEntries, prevCompactionIndex);
-
-	if (cutPoint.isSplitTurn) {
-		for (const msg of turnPrefixMessages) extractFileOpsFromMessage(msg, fileOps);
-	}
-
-	return {
-		firstKeptEntryId, messagesToSummarize, turnPrefixMessages,
-		isSplitTurn: cutPoint.isSplitTurn, tokensBefore, previousSummary, fileOps, settings,
-	};
-}
-```
-
-【注解（七步）】
-
-1. **幂等守卫**：路径的最后一条已经是 `compaction` → 返回 undefined（"刚压过就别再压"——防止连续触发重复压缩；对应第 10.2.3 节的检查时机）。
-2. **构建投影**（D3 的 `buildSessionProjection`）——**一切基于投影而非原始条目**（被省略/被编辑的内容不参与摘要；这正是第 10.3.1 节"从投影找切点"的依据）。
-3. **找上一次压缩**：
-   - 投影里**只有最新压缩**贡献消息（D3 的 `index > 0 → []` 规则），所以"messages 非空的 compaction"就是**最新那次**；`findIndex` 找它；
-   - `previousSummary` 取它的 `summary`——**用于迭代更新**（第 10.3.4 节）；
-   - `boundaryStart = prevCompactionIndex + 1`——【陷阱】注释点明："投影已经选好了上一次压缩的保留尾巴"，所以**本轮摘要的起点是它的下一个条目**（不是从会话开头！）——这就是"重复压缩从上一个保留边界开始"的实现位置（第 10.3.4 节的另一处表述）。
-4. **`boundaryEnd`** = 投影长度；`tokensBefore` 用 `estimateProjectedContextTokens(projection, pathEntries)`（**投影后的估算**——第 10.3.4 节的"重算 tokensBefore"）；切点用 `findProjectedCutPoint(projectedEntries, boundaryStart, boundaryEnd, keepRecentTokens)`。
-5. **取保留边界与历史终点**：
-   - `firstKeptEntry` 必须存在且有 id，否则返回 undefined（防御）；
-   - `historyEnd`：分裂时是 **turnStartIndex**（跨度的起点——"历史"只到前缀之前），否则是切点本身。
-6. **切出两段消息**：
-   - `messagesToSummarize = [boundaryStart, historyEnd)`（历史摘要素材）；
-   - `turnPrefixMessages = 分裂时 [turnStartIndex, firstKeptEntryIndex)`（前缀摘要素材）；
-   - 都空 → undefined（**无事可做**，不生成空压缩）。
-7. **文件追踪**：`extractFileOperations(messagesToSummarize, sourceEntries, prevCompactionIndex)`（注意三个参数：被摘要消息、**源条目数组**、上一次压缩的位置——说明这个提取器还会从"源条目"和"旧压缩的文件列表"里累计，第 10.4.2 节的"累积"）；分裂时**再**从 `turnPrefixMessages` 提取一遍（两段都要计入）。
-
-- 【陷阱】`projectedEntries.slice(...).flatMap(getMessagesFromProjectedEntryForCompaction)`：不能直接沿用投影的扁平 `messages`，因为压缩切点定义在**条目索引**上；先切条目区间，才能保持 `firstKeptEntryId` 与摘要边界一致。提取函数还有两条明确过滤规则：源条目是 `compaction` 时返回空数组，避免把旧 checkpoint/summary 再摘要；投影消息中的 `system` 消息也被排除，因为它们表示 prompt 状态，不是对话历史。压缩后，会话投影用最新 compaction checkpoint 加上保留区间内的 system patch 重建模型所需的 system state。`packages/coding-agent/test/compaction.test.ts` 的 `does not treat system messages as conversation history` 验证 system 消息不进入 `messagesToSummarize`；`test/suite/agent-session-compaction.test.ts` 的 `checkpoints the replayed system state and folds summarized and retained system patches into it` 验证 checkpoint 与两侧 patch 的重建结果。所以“投影给模型看的消息”与“交给摘要模型的消息”不是同一集合。
-- 【陷阱】`sourceEntries` 是 `projectedEntries` 的映射——条目数一致，索引可对齐（第 7 步的 `prevCompactionIndex` 同时用于两个数组）。
-
----
-
-> D10 第一部分到此。第二部分：`findProjectedCutPoint` 的姊妹函数（`isProjectedTurnStart`/`findProjectedTurnStartIndex`）、`TURN_PREFIX_SUMMARIZATION_PROMPT`、`compact()` 的完整流程（两段摘要合并、用量合并、文件列表追加、结果形状），以及与"触发端"的衔接、总结。
-
----
-
-
-###### 第二部分：`compact()` 与结果组装
-
-
-##### 4. 两个投影版 turn 判定（切点算法的零件）
-
-【源码】
-
-```typescript
-// isProjectedTurnStart
-function isProjectedTurnStart(entry: ProjectedSessionEntry): boolean {
-	if (entry.sourceEntry.type === "compaction") return false;
-	// 其余条目看投影消息里有没有 isTurnStartMessage（turn 起点消息的定义——用户消息/bash/自定义消息一族，与 D4 的 isTurnStartEntry 对应但作用于消息层）
-	return entry.messages.some(isTurnStartMessage);
-}
-
-// findProjectedTurnStartIndex：从切点往前找最近的 turn 起点；返回 -1 表示"找不到"（isSplitTurn 据此为 false——防御性）
-function findProjectedTurnStartIndex(entries: ProjectedSessionEntry[], entryIndex: number, startIndex: number): number {
-	for (let i = entryIndex; i >= startIndex; i--) {
-		if (isProjectedTurnStart(entries[i])) return i;
-	}
-	return -1;
-}
-```
-
-【注解】
-
-- `isProjectedTurnStart`：
-  - **压缩条目永远不是 turn 起点**（第一行显式排除）——即便它的投影消息（检查点+摘要）里可能含"看起来像"的消息；这是语义规则，不是内容推断。
-  - 其余条目看**投影消息**里有没有 `isTurnStartMessage`（turn 起点消息的定义——用户消息/bash/自定义消息一族，与 D4 的 `isTurnStartEntry` 对应但作用于**消息**层）。
-- `findProjectedTurnStartIndex`：从切点往前**找最近的 turn 起点**；返回 -1 表示"找不到"（`isSplitTurn` 据此为 false——防御性）。
-- 【陷阱】与 D4 的函数关系：**同一个概念的两套实现**（原始条目版 vs 投影版）。D4 的 `findTurnStartIndex(entries, cutIndex, startIndex)`（条目数组）与这里的 `findProjectedTurnStartIndex(entries /*投影*/, ...)` 参数形状不同、包在不同函数里。**读压缩两段代码时，先看函数名里的 `Projected` 前缀**——这是本文件区分两套算法的唯一标记。
-
-
-##### 5. `TURN_PREFIX_SUMMARIZATION_PROMPT`：前缀摘要的专用提示
-
-【源码】
-
-```typescript
-// 前缀摘要只概括切点前的消息；后段消息会原样保留，不能在摘要中重造。
-const TURN_PREFIX_SUMMARIZATION_PROMPT = `The messages above are earlier context from an ongoing conversation. Later messages are stored separately and do not need to be reconstructed.
-
-Create a concise checkpoint of the user's request and the progress shown above. This checkpoint will be placed before the later messages so the conversation can continue with the necessary context.
-
-## Original Request
-[What did the user ask for?]
-
-## Progress So Far
-- [Key decisions and work completed in these messages]
-
-## Context Needed to Continue
-- [Information from these messages needed to understand the later work]
-
-Only summarize information explicitly present above. Do not infer or recreate later messages.`;
-```
-
-【注解】
-
-- **与主摘要模板的三处差别**（对照 D4 第 9 节的两条模板）：
-  1. 开场强调"**后面还有消息，且它们被单独存放**"——防止模型"把后面的补出来"；
-  2. 模板更短（三节：Original Request / Progress So Far / Context Needed）——因为它的目标是"**让后段能被理解**"，不是完整复盘；
-  3. 结尾双重禁令："**只总结上面明确出现的信息；不要推断或重造后面的消息**"。
-- 【陷阱】为什么这么强调"不要重造"？因为前缀摘要会**插在后段消息之前**（合并摘要的前半段）——如果模型凭"对话直觉"补出后段内容，恢复后的上下文会出现**幻觉重复**（摘要里说了一遍、真实消息里又有一遍）。**提示词的每一句都在防一个具体的失效模式**——读压缩/摘要这类提示词模板时，把"这句话要防什么"问出来，才算真的读懂。
-- 【陷阱】它没有 `UPDATE_` 版本（不像主摘要）：前缀摘要不做"迭代更新"（前缀是即时切出来的、一次性的）。
-
-
-##### 6. `compact()`：生成与合并的完整流程
-
-**先懂**：准备阶段选好素材，`compact()` 再生成摘要，并按规则合并旧摘要中的重要信息。
-
-```text
-教学伪代码：取得准备数据 → 生成新摘要
-           → 与旧摘要合并 → 产出压缩结果
-```
-
-【源码（按分支）】
-
-```typescript
-export async function compact(
-	preparation: CompactionPreparation,
-	model: Model<any>,
-	apiKey: string | undefined,
-	headers?: Record<string, string>,
-	customInstructions?: string,
-	signal?: AbortSignal,
-	thinkingLevel?: ThinkingLevel,
-	streamFn?: StreamFn,
-	env?: Record<string, string>,
-	retry?: RetryPolicy,
-	callbacks?: RetryCallbacks,
-	sessionId?: string,
-): Promise<CompactionResult> {
-	const {
-		firstKeptEntryId, messagesToSummarize, turnPrefixMessages, isSplitTurn,
-		tokensBefore, previousSummary, fileOps, settings,
-	} = preparation;
-
-	let summary: string;
-	let summaryUsage: Usage;
-
-	// 前缀摘要总是生成（前置条件 turnPrefixMessages.length > 0）
-	if (isSplitTurn && turnPrefixMessages.length > 0) {
-		// historyText 的默认值是 "No prior history."——不是空串！这个默认值会在"没有更早历史"时显式写进合并摘要（告诉未来的模型"这段是新的"）
-		let historyText = previousSummary ?? "No prior history.";
-		let historyUsage: Usage | undefined;
-		// messagesToSummarize.length > 0 才调历史摘要——空历史跳过模型调用（省一次请求）；此时 historyText 保持"No prior history."或 previousSummary（有旧摘要时用旧的整段——它也属于"历史"）
-		if (messagesToSummarize.length > 0) {
-			const historyResult = await generateSummaryWithUsage(
-				messagesToSummarize, model, settings.reserveTokens, apiKey, headers, signal,
-				customInstructions, previousSummary, thinkingLevel, streamFn, env, retry, callbacks, sessionId,
-			);
-			historyText = historyResult.text;
-			historyUsage = historyResult.usage;
-		}
-		const turnPrefixResult = await generateTurnPrefixSummary(
-			turnPrefixMessages, model, settings.reserveTokens, apiKey, headers, env, signal,
-			thinkingLevel, streamFn, retry, callbacks, sessionId,
-		);
-		// Merge into single summary
-		summary = `${historyText}\n\n---\n\n**Turn Context (split turn):**\n\n${turnPrefixResult.text}`;
-		summaryUsage = historyUsage ? combineUsage(historyUsage, turnPrefixResult.usage) : turnPrefixResult.usage;
-	} else {
-		const result = await generateSummaryWithUsage(
-			messagesToSummarize, model, settings.reserveTokens, apiKey, headers, signal,
-			customInstructions, previousSummary, thinkingLevel, streamFn, env, retry, callbacks, sessionId,
-		);
-		summary = result.text;
-		summaryUsage = result.usage;
-	}
-
-	// Compute file lists and append to summary
-	const { readFiles, modifiedFiles } = computeFileLists(fileOps);
-	summary += formatFileOperations(readFiles, modifiedFiles);
-
-	if (!firstKeptEntryId) {
-		throw new Error("First kept entry has no UUID - session may need migration");
-	}
-
-	return { summary, firstKeptEntryId, tokensBefore, usage: summaryUsage, /* ... */ };
-}
-```
-
-【注解（六个决策点）】
-
-1. **分裂分支的两段逻辑**：
-   - `historyText` 的默认值是 **`"No prior history."`**——不是空串！这个默认值会在"没有更早历史"时**显式写进合并摘要**（告诉未来的模型"这段是新的"）。
-   - `messagesToSummarize.length > 0` 才调历史摘要——**空历史跳过模型调用**（省一次请求）；此时 `historyText` 保持"No prior history."或 `previousSummary`（**有旧摘要时用旧的整段**——它也属于"历史"）。
-   - 前缀摘要**总是生成**（前置条件 `turnPrefixMessages.length > 0`）。
-2. **合并格式固定**：
-
-```text
-{historyText}
-
----
-
-**Turn Context (split turn):**
-
-{turnPrefixResult.text}
-```
-
-- 分隔线 + 粗体标题——**结构标记让未来的模型/人**能看出"这前半段是分裂跨度的前缀摘要"（`**Turn Context (split turn):**` 同时也是给"读摘要的人"的信号）。
-
-3. **用量合并**：`historyUsage ? combineUsage(historyUsage, turnPrefixResult.usage) : turnPrefixResult.usage`——两次模型调用的用量相加（哪个分支没有就取另一个）。`combineUsage` 来自 pi-ai（用量分项相加的正确实现——不要手写，避免漏字段）。
-4. **非分裂分支**：单次 `generateSummaryWithUsage`（**必须成功**——`messagesToSummarize` 一定非空，因为 `prepareCompaction` 的空守卫）。
-5. **文件列表追加**（`computeFileLists` + `formatFileOperations`，D4 第 8 节的两个函数）：
-   - 【陷阱】**追加发生在摘要文本的最后**——说明格式化函数返回的"前置换行"（`\n\n...`）就是为这种直接拼接设计的（D4 里看到的那个细节在这里闭环）。
-   - 【陷阱】即使两个列表都空（`formatFileOperations` 返回 `""`），拼接也无害（`summary += ""`）——不需要分支。
-6. **`firstKeptEntryId` 非空断言**（否则抛"session may need migration"——**指针缺失指向老会话**）：这是"结果完整性"的最后一道闸（类型上 `CompactionPreparation.firstKeptEntryId` 是 string，理论上不该为空——这个 throw 防的是类型系统管不到的历史数据路径）。
-
-【陷阱】`customInstructions`（用户 `/compact 指令`）**只在两处透传给 `generateSummaryWithUsage`**：分裂分支的历史摘要、非分裂分支的单次摘要——**前缀摘要的 `generateTurnPrefixSummary` 调用里没有它**（前缀的性质决定"聚焦指令"不适用）。读参数流动时要逐调用点核对，不要假设"一个参数全程都在"。
-
-【陷阱】`sessionId` 同样只透传主摘要路径（前缀摘要的调用里也传了……看代码：`generateTurnPrefixSummary(..., sessionId)` 有传）。等等——两处确认：历史摘要传了 `sessionId`；前缀摘要的调用末尾也有 `sessionId`。所以差异**只在 `customInstructions`**。（这类"读到一半觉得有差异、再核对发现只差一个参数"的反复，正是逐调用点核对的必要性。）
-
-
-##### 7. 与触发端的衔接（会话侧）
-
-`compact()` 的输入全部来自 `prepareCompaction`，而**触发时机**由会话层决定（第 10.2.3 节的四个检查点）。会话侧的基本流程（以主线第 10 章与第 8.3.2 节为准，具体函数以 `agent-session.ts` 的实现为准）：
-
-```text
-检查点触发（阈值/溢出/手动）
-  → session_before_compact 扩展钩子（可 cancel 或提供自定义 compaction）
-      · 取消 → 不写条目、不重试（区分"失败"与"拒绝"）
-      · 自定义 → 直接得到 CompactionEntry 草稿（fromHook）
-  → prepareCompaction + compact（本 D10）
-  → sessionManager.appendCompaction(summary, firstKeptEntryId, tokensBefore, details?, usage?)
-      · details 默认是 { readFiles, modifiedFiles }——但注意 compact() 已经把列表拼进 summary 文本；
-        details 的来源见会话侧对 fileOps 的消费（以实现为准，别凭文档猜）
-  → compaction 事件（start/end、failed）+ 可能的重试（willRetry）
-```
-
-【陷阱】**不要把 `details` 与"摘要里的文件标签"混为一谈**：两者都源自 `fileOps`，但一个是**给界面/扩展的结构化数据**、一个是**给模型的文本**（第 10.4.2 节的 `CompactionDetails`）。会话侧如何填充 `details`（是否复用 preparation.fileOps、是否加别的字段）**以 `agent-session.ts` 的 `_checkCompaction` 实现为准**——本 D10 只负责 `prepareCompaction`/`compact` 两个纯函数边界的准确性。
-
-
-##### 8. 总结
-
-
-###### 8.1 三阶段职责再强调
-
-| 阶段 | 函数                       | 是否调用模型              | 是否写磁盘   | 纯函数？                               |
-| ---- | -------------------------- | ------------------------- | ------------ | -------------------------------------- |
-| 预备 | `prepareCompaction`      | 否                        | 否           | **是**（给定输入必得同输出）     |
-| 生成 | `compact`                | **是**（1 或 2 次） | 否           | 否（但无副作用：不写会话，仅返回结果） |
-| 落盘 | `appendCompaction`（D9） | 否                        | **是** | 否                                     |
-
-- 【陷阱】"`compact` 不写盘"这个事实让**失败重试**变得简单：失败就重跑（幂等安全，因为还没写）；而 `appendCompaction` 是单次写（重复调用会写两条压缩条目——**所以重试逻辑必须挂在 `compact` 而非它之后**）。**副作用的边界决定重试策略**——这是本 D10 最实用的一个结论。
-
-
-###### 8.2 阅读检查清单
-
-- [ ] 我能说出 `prepareCompaction` 的七步，以及 `boundaryStart` 为什么从"上一次压缩之后"开始吗？
-- [ ] 我能解释恢复省略后缀的四个守卫条件各防什么吗？
-- [ ] 我知道前缀摘要提示词的"三节 + 双重禁令"吗？
-- [ ] 我能背出分裂合并的文本格式吗？（`---` + `**Turn Context (split turn):**`）
-- [ ] 我知道 `combineUsage` 在哪个分支被用吗？为什么不手动相加？
-- [ ] 我能说清"三阶段"哪个可重跑、哪个必须只跑一次吗？
-
----
-
-> D10 完。精读篇（D1-D10）至此覆盖：循环、Agent、会话投影与类本体、提示与压缩（读侧 + 写侧）、SDK、CLI、工具、扩展。
-
-#### 10.9 常见错误
-
-| 现象                                                                           | 原因                          | 处理                                                              |
-| ------------------------------------------------------------------------------ | ----------------------------- | ----------------------------------------------------------------- |
-| "没超窗口也压缩了"                                                             | 估算保守 + reserveTokens 预留 | 调`reserveTokens`/`keepRecentTokens`；不要改判定代码          |
-| 压缩后模型"失忆"                                                               | 摘要信息损失是压缩的固有属性  | 在摘要格式里加"必须保留"的栏目；重要事实落在文件/文档里而非对话里 |
-| 摘要响应被当成对话继续                                                         | 序列化没加`[User]:` 前缀    | 用仓库的`serializeConversation`，别自己拼                       |
-| 工具结果孤零零出现                                                             | 切点切在工具结果上            | 只允许在合法切点切（用户/助手/bash/自定义消息）                   |
-| `session_before_compact` 里直接用 `preparation.messagesToSummarize` 发模型 | 忘了转文本                    | 先`convertToLlm` + `serializeConversation`                    |
-| 溢出恢复失败后系统还在循环                                                     | 期望"自动重试"                | 按 10.5 节：失败时不排重试；队列消息仍按 steer/follow-up 规则处理 |
-| 扩展摘要的文件列表没有累计                                                     | 扩展摘要不自动继承列表        | 在自定义`details` 里自行管理                                    |
-
-
-#### 10.10 验收题
-
-1. 写出触发自动压缩的不等式与三个默认值（enabled/reserve/keepRecent）。
-2. 系统提示分节模型解决了什么问题？`forceSystemPrompt` 与 `customPrompt` 的差别？
-3. `findCutPoint` 为什么"从新往旧"累计？遇到"尾部工具结果自身超预算"时它做了什么特殊处理？
-4. 压缩中的 split turn 是什么？为什么要生成两份摘要？
-5. 给定一段历史（含一次读文件、一次改文件、一个关键决策），写出压缩摘要里"必须保留"的信息，并指出它们分别落在模板的哪一节。
-6. 溢出恢复的完整顺序是什么？压缩失败时保留了什么、不保留什么？
-
-
-##### 参考答案（要点）
-
-1. `contextTokens > contextWindow - reserveTokens`；默认 `enabled: true`、`reserveTokens: 16384`、`keepRecentTokens: 20000`。
-2. 分节让系统提示可以"按名字增量打补丁 + 可回放"；`customPrompt` 替换默认 preamble 但仍分节；`forceSystemPrompt` 整体覆盖且不分节（不可补丁）。
-3. 最新上下文最重要，从新往旧累计保证保留"最近的 keepRecentTokens"；尾部工具结果自身超预算时，倾向保留其前面的助手工具调用（合法切点），而不是退回第一条。
-4. 单个用户消息跨度超过保留预算时，切点落在跨度中间；前半段生成"跨度前缀摘要"，加上更早的"历史摘要"，两者合并。
-5. 读过的文件 → `<read-files>`；改过的文件 → `<modified-files>`；关键决策 → `## Key Decisions`（含理由）；用户约束 → `## Constraints & Preferences`；下一步 → `## Next Steps`；继续所需数据 → `## Critical Context`。目标 → `## Goal`。
-6. 顺序：落盘最终响应 → `turn_end` → `agent_end` → 追加省略编辑 → `session_before_compact`（溢出/长度场景）→ 成功则写压缩条目 → 以全新 run 重试。失败/取消时：保留省略编辑；不写压缩条目；不安排内部重试；`agent_before_settle` 看到修复后的投影；原始历史与导出不受影响。
-
-
-#### 10.11 源码依据
-
-- `packages/coding-agent/src/core/system-prompt.ts`（`buildSystemPromptSections`、`buildSystemPromptState`、`buildSystemPrompt`、`diffSystemPromptSections`、`normalizeBuildSystemPromptOptions`）；
-- `packages/coding-agent/src/core/compaction/compaction.ts`（`CompactionSettings`、`DEFAULT_COMPACTION_SETTINGS`、`shouldCompact`、`estimateTokens`、`calculateContextTokens`、`findCutPoint`、`prepareCompaction`、`compact`）、`compaction/branch-summarization.ts`、`compaction/utils.ts`；
-- `packages/coding-agent/docs/compaction.md`、`docs/settings.md`、`docs/sessions.md`；
-- `packages/coding-agent/src/core/extensions/types.ts`（`session_before_compact`、`session_compact_failed`、`session_before_tree` 事件）。
-
-
----
-
-## 动手任务 A：观察提示来源。
-
-先用一个纯函数测试 `shouldCompact(850, 1000, { enabled: true, reserveTokens: 200, keepRecentTokens: 100 }) === true`，再把 `enabled` 改成 `false` 验证返回值。然后读 `buildSystemPromptSections` 的输入结构，写一张“工具、项目上下文、技能 → 对应 section”的来源表。项目上下文示例固定为临时 `AGENTS.md` 文本“请只读当前目录”，不要改变仓库根的真实指令文件。解释为什么字符长度不能直接当 token 数。
-
-## 动手任务 B：压缩前后对照。
-
-先做一个完全可控的“压缩记录改变投影”测试，写入今日准备指定的测试文件。它不调用模型，所以结果不会受 token 估算波动影响：
-
-```typescript
-import { expect, it } from "vitest";
-import { SessionManager } from "../../src/core/session-manager.ts";
-import { userMsg } from "../utilities.ts";
-import { shouldCompact } from "../../src/core/compaction/compaction.ts";
-
-it("keeps history while replacing old context with a summary", () => {
-  const s = SessionManager.inMemory();
-  s.appendMessage(userMsg("early A"));
-  s.appendMessage(userMsg("early B"));
-  const kept = s.appendMessage(userMsg("recent C"));
-  const before = s.buildSessionContext().messages;
-  expect(shouldCompact(850, 1000, {
-    enabled: true, reserveTokens: 200, keepRecentTokens: 100,
-  })).toBe(true);
-  s.appendCompaction("summary of A and B", kept, 850);
-  const after = s.buildSessionContext().messages;
-  expect(s.getEntries()).toHaveLength(4);
-  expect(before).toHaveLength(3);
-  expect(JSON.stringify(after)).toContain("summary of A and B");
-  expect(JSON.stringify(after)).toContain("recent C");
-});
-```
-
-随后单独验证自动路径：用 `createHarness({ models: [{ id: "faux-1", contextWindow: 2600, maxTokens: 100 }], settings: { compaction: { enabled: true, reserveTokens: 400, keepRecentTokens: 1750 } } })` 建一个新会话；用三次 prompt 和长 faux 响应跨过阈值，并预留一次 faux 响应用于摘要。记录 `compaction_start/end`、faux 请求次数、原始条目与压缩后投影。若自动触发条件不稳定，保留上面确定性的投影测试作为本任务的动手证据，并用 `shouldCompact` 与真实 usage 找出未触发原因，不把“没有触发”写成“压缩无效”。
-
-## 实验记录
-
-1. 压缩前记下系统提示 sections、当前模型窗口、估算 token 数与实际 usage；把“触发阈值”和“要保留的近期内容”分别标在时间轴上。
-2. 调用 `findCutPoint` 对照每个候选切点，特别检查工具调用和对应结果是否成组留下。若切点落在错误位置，写出模型下一轮会缺失什么。
-3. 压缩成功后同时观察事件和 session entries。记录摘要使用了多少次 faux 请求、压缩条目指向哪个 `firstKeptEntryId`、旧条目为何仍在原始树里。
-4. 失败变体中对比事件、条目数、模型上下文，说明“压缩失败”是否会把旧历史破坏；用具体断言替代主观观察。
-
-若未触发压缩，先记录真实 `usage` 与估算 token、模型窗口和预留量，不要无限追加文本碰运气。若 faux 响应队列耗尽，按事件序列数清普通回答、工具后的续跑和摘要各消耗几次请求。实验结束只清理自己的测试文件。
-
-## 验收标准
-
-能指出摘要替代的是哪段模型输入，以及哪段原始历史仍可恢复；能解释切点为什么不能落在工具调用和结果之间。
+练习：把配置改为 `{}`，两个表达式都得到 200。再想一想，源码中 `calculateContextTokens` 的 `||` 为什么可以接受（提示：分项之和也是 0）。
+
+## 下一篇
+
+下一步要解决的问题：压缩阈值等设置从哪里来，项目指令文件（如 AGENTS.md）如何被发现，以及为什么项目文件需要人工信任。
+
+## 术语小结
+
+| 术语 | 一句话定义 | 首次出现的小节 |
+| ---- | ---------- | -------------- |
+| 上下文窗口（context window） | 模型一次请求能接收的 token 上限 | 核心概念 1 |
+| token | 模型计量文本的基本单位 | 核心概念 1 |
+| 预留（reserveTokens） | 为模型回答留出的窗口空间 | 核心概念 1 |
+| 系统提示分节（section） | 有名字、可单独替换的系统提示段 | 核心概念 2 |
+| 补丁（patch） | 只包含变化分节的系统消息，`null` 表示删除 | 核心概念 2 |
+| 压缩阈值（threshold） | 判断是否自动压缩的不等式 | 核心概念 3 |
+| 切点（cut point） | 保留区与摘要区的分界消息 | 核心概念 4 |
+| 合法切点 | 允许作为切点的消息类型，工具结果除外 | 核心概念 4 |
+| 分裂跨度（split turn） | 切点落在一轮用户请求中间的情况 | 核心概念 4 |
+| 摘要请求（summary request） | 压缩时发给模型的一次专用调用 | 核心概念 4 |
+| 压缩条目（compaction entry） | 会话文件中记录摘要与保留边界的一行 | 核心概念 5 |
+| 投影（projection） | 模型实际看到的历史，由条目计算得出 | 核心概念 5 |
+| 溢出恢复（overflow recovery） | 溢出或截断后压缩并重试一次 | 核心概念 6 |
+| 省略编辑（context_edit） | 把失败尝试从投影中去掉的条目 | 核心概念 6 |

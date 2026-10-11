@@ -1,1286 +1,726 @@
 # 03. 消息、事件、状态与持久化条目
 
-今天只用本篇和源码，亲手把一次工具调用拆成消息、事件、内存状态、会话条目四种对象。无需其他任务的产物或真实模型账号，预计 2–3 小时。
+> 预计时间：2 小时
+> 先修：TypeScript 的判别联合与类型收窄（用一个字段区分多种对象）；一次请求从 CLI 到模型调用的路径
 
-## 今日准备
+## 本篇你会学到
 
-确认 Node.js >= 22.19.0 和 `node_modules`；缺失依赖时在仓库根目录执行 `npm install --ignore-scripts`。在 `packages/coding-agent/test/suite/` 新建 `task-03-learning.test.ts`，用下面的测试步骤收集证据。运行命令（工作目录 `packages/coding-agent`）：
+- 区分四种数据：模型消息、Agent 消息、事件、会话条目。说出每一种由谁产生、给谁用、是否写入磁盘。
+- 读懂 `convertToLlm`：它把内部消息翻译成模型能接受的消息，并解释为什么需要它。
+- 读懂 `AgentState` 的字段，知道哪些可以赋值，哪些只读。
 
-```powershell
-node ../../node_modules/vitest/dist/cli.js --run test/suite/task-03-learning.test.ts
-```
+## 先用一个例子理解
 
-`createHarness()` 自带 faux 假模型、内存会话和 `events` 数组；每个测试用 `try/finally` 调用 `h.cleanup()`。
+用户在 pi 里输入：“读取 README 并总结”。这一次操作会产生很多数据：
 
-## 学习内容
+1. 用户的一句话。
+2. 模型说“我要调用 `read`”。
+3. `read` 工具返回文件内容。
+4. 模型生成总结，文字一个字一个字到达。
+5. 界面显示进度，磁盘上保存历史。
 
-同一个回答会有四种表示。**消息**是对话内容，如用户文字、助手文字、工具结果；**事件**是过程通知，如 `message_update`、`tool_execution_start`，给订阅者实时观察；**状态**是当前 Agent 的模型、工具和消息等内存快照；**会话条目**是可恢复的历史记录。把 `text_delta` 当成完整助手消息，就会过早保存或重复显示；把会话条目当成模型输入，就会误读分支和压缩。`AgentMessage` 允许应用级内容，送到模型前还要经过转换。消息中的 `content` 也并非总是字符串，可能是文本、图片、思考或工具调用块。
+如果 pi 只有一种数据结构，就会出现问题。例如，把文字增量当成完整回答保存，重启后会得到半句话；把界面进度当成历史保存，恢复会话时会重复显示；把保存的历史直接发给模型，又可能带入模型不该看到的内容。
 
-## 核心源码
+所以 pi 把这些数据分成四类：
 
-`packages/ai/src/types.ts`找 `Message`、`AssistantMessageEvent`；`packages/agent/src/types.ts`找 `AgentEvent`、`AgentState`；`packages/coding-agent/src/core/messages.ts`找 `convertToLlm`；`packages/coding-agent/src/core/session-manager.ts`找 `SessionEntry`；`packages/coding-agent/src/core/agent-session.ts`找 `AgentSessionEvent`。按“类型定义 → 谁创建 → 谁消费”的顺序读每一个。
+| 数据 | 一句话 | 例子 |
+| --- | --- | --- |
+| 模型消息（Message） | 模型能理解的对话内容 | 用户的话、模型的回答、工具结果 |
+| Agent 消息（AgentMessage） | pi 内部的对话内容，可以比模型消息多几种角色 | 模型消息加上 bash 执行记录、压缩摘要 |
+| 事件（AgentEvent / AgentSessionEvent） | 过程通知，告诉订阅者“正在发生什么” | `message_update`、`tool_execution_start` |
+| 会话条目（SessionEntry） | 写入磁盘的历史记录，每行一条 | `message` 条目、`compaction` 条目 |
 
-## TypeScript 语法小课：判别联合与类型收窄
+另外还有一个“当前值”：`AgentState`，记录进程里现在的模型、工具、消息数组等。它不是历史，进程退出后就消失。
 
-消息与事件都用 `type` 字段区分形状，这叫判别联合。判断 `event.type` 后，TypeScript 才知道该分支有哪些字段；不能把任何事件都当成完整消息。
+下面用一次真实运行来看这四类数据。运行内容是：用户输入“读取 README”，模型调用 `read` 工具，工具返回文件内容，模型回答“README 已读取”。这次运行由 faux 假模型（脚本化的测试模型，不调用真实服务）完成，不需要密钥。
 
-```typescript
-type Event =
-  | { type: "text_delta"; delta: string } // 增量只有片段
-  | { type: "message_end"; text: string }; // 结束事件带完整文本
-function describe(event: Event): string {
-  if (event.type === "text_delta") return event.delta; // 此处自动收窄到第一种形状
-  return event.text; // 剩余分支只能是 message_end
-}
-console.assert(describe({ type: "text_delta", delta: "A" }) === "A");
-```
+## 核心概念
 
-练习：试着在第一个分支读取 `event.text`，观察类型检查为何拒绝；再在 `packages/agent/src/types.ts` 找真实 `AgentEvent` 的判别字段。
+### 概念 1：模型消息（Message）
 
-
-## 完整学习资料
-
-先按下列正文完成学习，再执行本篇的动手任务。正文中原书的实验与验收题先作为案例阅读，实际动手统一放到文末；只运行本篇“今日准备”和动手任务明确指定的离线命令。章节编号保留知识主题的原编号；源码精读、示例、边界条件、常见错误和参考答案均直接收录在本文件中。开头的预计用时仅指核心主线，完整源码精读需另留时间。
-
-### 本篇共同基础
-
-以下运行图和术语均在本文件内。学习正文保留原手册的知识主题编号，但那些编号不构成本任务的阅读前置；实际操作按本篇的动手任务与验收标准执行。学习正文基于原手册注明的 `200387122ca450d6387f033949423114a270b96c` 源码基线，当前工作区若有差异，以当前源码为准。
-
-### 15 分钟主线：pi 怎样完成一件事
-
-假设用户输入“读取 demo.txt，并总结三点”。模型自己不能读取你电脑里的文件。pi 把用户问题和可用工具告诉模型；模型提出 `read` 调用；pi 在本地执行；模型拿到文件内容后才生成总结。这就是全书反复使用的同一个例子。
-
-**先看不带 TypeScript 细节的主流程（教学伪代码）：**
-
-```text
-收到用户输入，把它加入当前会话
-重复：
-    用当前上下文向模型发起请求
-    收集模型的回答并把过程通知界面
-    如果回答要求执行工具：
-        校验参数，在本地执行工具，记录结果
-        继续循环，让模型看到工具结果
-    否则，检查是否还有排队输入或明确的继续决定
-    如果都没有：结束本次运行
-```
-
-第一行确定这次任务和已有历史。模型请求只负责生成回答或提出工具调用。工具校验与执行由 pi 负责，结果回到对话后才可能有下一轮模型请求。界面接收运行事件，历史保存完成的消息；它们都与“模型请求”有关，但不是同一种数据。真实实现还处理工具并发、错误、取消、重试和压缩，后面分别讲。
-
-**先分清四对容易混淆的词：**
-
-| 两个词                | 直观区别                                           | 在“读文件并总结”中的例子                   |
-| --------------------- | -------------------------------------------------- | -------------------------------------------- |
-| 模型请求 / 用户输入   | 用户只说一次话，pi 可以多次询问模型                | 先请模型选择工具，读完文件后再请模型总结     |
-| 事件 / 消息           | 事件告诉界面过程；消息承载一次完整的对话内容       | “正在输出第几个字”是事件；完成的总结是消息 |
-| 工具调用 / 工具结果   | 调用提出想做什么；结果记录本地执行所得             | `read("demo.txt")` 是调用；文件文字是结果  |
-| 会话历史 / 模型上下文 | 历史保留记录；上下文是这一次请求实际送给模型的内容 | 分支 C 仍在文件里，沿分支 D 继续时不必送 C   |
-
-
-```text
-一次用户输入
-  → 第一次模型请求：请调用 read("demo.txt")
-  → 本地工具执行：读出文件文本
-  → 第二次模型请求：根据工具结果总结三点
-  → 没有后续工作：结束
-```
-
-### 附录 A：术语表
-
-> 用法：每个术语给出"一句话解释 + 首次出现的章节"。读代码遇到不认识的词，先查这里；查不到再搜源码（用英文名搜）。
-
-
-#### A.1 核心概念
-
-| 中文                  | 英文                    | 一句话                                                                                                             | 章节      |
-| --------------------- | ----------------------- | ------------------------------------------------------------------------------------------------------------------ | --------- |
-| 智能体外壳 / 运行框架 | agent harness           | 组织模型、工具、状态、界面的框架，本身不"聪明"                                                                     | 0.1       |
-| 智能体                | agent                   | "模型 + 工具 + 循环"组成的执行体                                                                                   | 0.1       |
-| 轮次                  | turn                    | 一次助手响应 + 它引发的工具执行                                                                                    | 3.3.3     |
-| 低层运行              | Agent run               | 一次`Agent.prompt()` 或 `Agent.continue()` 调用建立的生命周期；以 `agent_end` 和已等待的 listener 收尾为边界 | 3.3.3、D2 |
-| 会话 prompt 编排      | session prompt workflow | `AgentSession.prompt()` 在 `started` 后进入 `_runAgentPrompt()`；可串起 retry、压缩恢复和多个低层 Agent run  | 8、D27    |
-| 用户请求              | user request            | 用户提交一次输入；与模型请求不等价                                                                                 | 3.3.3     |
-| 模型请求              | model request           | 真正发给供应商 API 的一次请求                                                                                      | 3.3.3     |
-| 转录                  | transcript              | 发给模型看/被记录的消息序列                                                                                        | 4.1       |
-| 投影                  | projection              | 从会话树/文档到"模型实际看到的内容"的计算过程                                                                      | 9.4       |
-| 活动分支              | active branch           | 从根到当前叶子的一条路径                                                                                           | 9.1       |
-| 叶子                  | leaf                    | 会话树中的"当前位置"                                                                                               | 4.7.3     |
-| 条目                  | entry                   | 会话文件里的一行（JSONL）                                                                                          | 4.7       |
-| 会话                  | session                 | 一次对话的全部记录与状态                                                                                           | 8.1       |
-| 压缩                  | compaction              | 用摘要替换旧上下文表示的机制                                                                                       | 10        |
-| 上下文窗口            | context window          | 模型一次能接受的最大 token 量                                                                                      | 5.3       |
-| 思考级别              | thinking level          | off/minimal/low/medium/high/xhigh/max                                                                              | 5.3       |
-| 停止原因              | stop reason             | pending/stop/length/toolUse/error/aborted/deferred                                                                 | 4.3.3     |
-| 用量                  | usage                   | token 与成本统计                                                                                                   | 4.3.5     |
-
-
-#### A.2 消息与事件
-
-| 中文           | 英文                | 一句话                                             | 章节        |
-| -------------- | ------------------- | -------------------------------------------------- | ----------- |
-| Agent 消息     | AgentMessage        | 内部消息（模型消息 + 应用自定义角色）              | 4.4         |
-| 模型消息       | Message             | 供应商能理解的四角色联合                           | 4.3         |
-| 内容块         | content block       | 消息内容的最小单元（text/image/thinking/toolCall） | 4.2         |
-| 判别联合       | discriminated union | 用共同字面量字段区分成员的类型联合                 | 1.3.4       |
-| 类型收窄       | narrowing           | 判断判别字段后类型自动缩小                         | 1.3.4       |
-| 事件           | event               | 运行时广播（过程），不是消息（结果）               | 3.3.2       |
-| 队列更新       | queue update        | 排队消息变化的会话事件                             | 4.5.2       |
-| 边界（结算前） | agent_before_settle | 最后一个可行动钩子                                 | 6.2、13.3.5 |
-| 已结算         | agent_settled       | "不会再自动继续"的最终信号                         | 4.5.2、16.3 |
-| 延迟句柄       | deferred handle     | 异步应答的取回凭据                                 | 4.3.3       |
-
-
-#### A.3 工具与模型
-
-| 中文                | 英文                            | 一句话                                    | 章节  |
-| ------------------- | ------------------------------- | ----------------------------------------- | ----- |
-| 工具                | tool                            | 模型可调用的本地操作                      | 7.1   |
-| 工具定义            | ToolDefinition                  | 扩展/应用注册工具的"富"形态               | 7.1.2 |
-| 参数校验            | argument validation             | 用 typebox schema 在运行时校验调用参数    | 7.4   |
-| 前置钩子            | beforeToolCall                  | 执行前可拦截（block）的钩子               | 7.6   |
-| 后置钩子            | afterToolCall                   | 结果字段级改写的钩子                      | 7.6   |
-| 顺序 / 并行执行     | sequential / parallel execution | 工具批次的两种调度                        | 7.5   |
-| 终止提示            | terminate                       | "整批都同意时不因本批继续"的调度提示      | 7.5.4 |
-| 模型                | model                           | 模型静态元数据（api/provider/限制/价格）  | 5.2.2 |
-| 协议方言            | api                             | 供应商接口族标识（如 anthropic-messages） | 5.2.1 |
-| 供应商              | provider                        | 认证 + 模型目录 + 请求实现                | 5.2.3 |
-| 简单流式 / 完整流式 | streamSimple / stream           | 供应商无关档位 vs 协议特有选项            | 5.4   |
-| 兼容开关            | compat                          | OpenAI 兼容生态的行为微调                 | 5.5.4 |
-| 假供应商            | faux provider                   | 脚本化、离线的测试模型                    | 5.7   |
-
-
-#### A.4 会话与持久化
-
-| 中文       | 英文             | 一句话                             | 章节   |
-| ---------- | ---------------- | ---------------------------------- | ------ |
-| 会话管理器 | SessionManager   | 会话文件的对象化句柄               | 9.3    |
-| 分支会话   | branched session | 只包含"根到叶子"路径的新文件       | 9.5.2  |
-| 分支摘要   | branch summary   | 放弃某分支时生成的摘要条目         | 10.6   |
-| 上下文编辑 | context edit     | 只改"投影"、不改原始条目的追加编辑 | 9.4.4  |
-| 保留边界   | firstKeptEntryId | 压缩后从哪条开始保留               | 10.3.2 |
-| 保留预算   | keepRecentTokens | 压缩后至少保留的近期上下文         | 10.3   |
-| 预留       | reserveTokens    | 为模型回复预留的窗口               | 10.2.1 |
-| 检测点替换 | checkpoint       | 压缩条目携带的提示词/工具检查点    | 9.4.3  |
-
-
-#### A.5 扩展与集成
-
-| 中文       | 英文            | 一句话                             | 章节       |
-| ---------- | --------------- | ---------------------------------- | ---------- |
-| 上下文文件 | context files   | AGENTS.md 等纯文本指令             | 11.4.2     |
-| 项目信任   | project trust   | 允许加载项目可执行资源前的人工决定 | 11.5       |
-| 提示词模板 | prompt template | Markdown 变成`/命令`             | 12.3.2     |
-| 技能       | skill           | 目录 + SKILL.md 的按需说明书       | 12.3.3     |
-| 扩展       | extension       | 可执行 TypeScript 模块（进程权限） | 12.3.4、13 |
-| Pi 包      | Pi package      | 分发多资源的 npm/git 单元          | 12.3.6     |
-| 钳制       | clamp           | 按模型能力压低思考级别             | 5.3        |
-| 重绑       | rebind          | 会话替换后重新挂订阅/扩展绑定      | 8.6        |
-
-
-#### A.6 协议与架构（选修）
-
-| 中文     | 英文                   | 一句话                                          | 章节   |
-| -------- | ---------------------- | ----------------------------------------------- | ------ |
-| MCP      | Model Context Protocol | 外部工具/资源接入协议                           | 22     |
-| 暴露方式 | exposure               | codemode/deferred/direct 三种工具到达模型的方式 | 22.3   |
-| 工具搜索 | tool_search            | deferred 工具的"发现后再直调"机制               | 22.3   |
-| 沙箱     | codemode sandbox       | QuickJS VM + worker 的脚本执行环境              | 22.9   |
-| 面片     | facet                  | Chord 插件可独立打包到不同环境的分片            | 23.2   |
-| 服务     | service                | Chord 的类型化稳定 token（singleton/keyed）     | 23.2   |
-| 复制状态 | replicated state       | 原子发布、完整不可变值消费的状态                | 23.2   |
-| 增量跟踪 | delta tracking         | 记录/合并 JSON 操作的机制                       | 23.2   |
-| 持久执行 | durable execution      | 意图先提交、崩溃可续的执行模型                  | 23.1   |
-| 检查点   | checkpoint             | 任务每一步的持久落点                            | 23.3.1 |
-| 附着     | attachment             | 一条表现层连接绑定到一个会话                    | 24.2   |
-| 信封     | envelope               | 协议中包裹 payload 的定向记录                   | 24.3   |
-| span     | span                   | 一次操作的时间记录（遥测）                      | 25.2   |
-| lift     | lift                   | 处理组相对对照组的提升（评估）                  | 25.5   |
-| 阻断配对 | blocked pair           | 两臂未各得恰好一个分数，禁止计入头条            | 25.6   |
-
-
-#### A.7 容易混淆的成对术语
-
-| 对                                              | 区分                                                                                   |
-| ----------------------------------------------- | -------------------------------------------------------------------------------------- |
-| message vs event                                | 结果 vs 过程（3.3.2）                                                                  |
-| turn vs run                                     | 一个轮次 vs 整次运行（3.3.3）                                                          |
-| `agent_end` vs `agent_settled`              | 低层 run 结束 vs 自动工作清零（4.5.2）                                                 |
-| 声明 vs 可执行                                  | 系统消息里的工具声明 vs 运行时工具集（7.3）                                            |
-| details vs content                              | 给界面/程序 vs 给模型（14.2）                                                          |
-| 完成顺序 vs 记录顺序                            | 并发完成 vs 声明序记录（7.5.3）                                                        |
-| 停止原因`length` vs `stop`                  | 被截断 vs 正常说完（4.3.3）                                                            |
-| `AgentSession.prompt()` vs `Agent.prompt()` | 应用层输入分流/会话编排 vs 低层 Agent run 入口（8、D2、D27）                           |
-| `handled` vs `queued` vs `started`        | 输入被消费、不创建该输入自己的 run / 放入当前运行队列 / 进入会话 run 编排（8、16.5.3） |
-| 提示词模板 vs 技能                              | 一段话 vs 一套流程+文件（12.3.3）                                                      |
-| 扩展 vs Pi 包                                   | 可执行单元 vs 分发单元（12.3.6）                                                       |
-| compaction 摘要 vs branch summary               | 压缩历史 vs 放弃分支（10.6）                                                           |
-| durable cheat sheet：`replay: safe/never`     | 崩溃后重跑 vs 报 interrupted（23.4）                                                   |
-| JSONL RPC vs client/server                      | 进程内 stdio 协议 vs 跨进程服务路由（24.1）                                            |
-| 单测 vs 评估                                    | 确定性 vs 配对统计（25.1、25.6）                                                       |
-
-
-#### A.8 输入与运行的层级
-
-不要按“用户按了一次回车”推断低层 run 或模型请求的数量。实际层级是：
-
-| 层级       | 代表符号                                           | 次数关系                                                                                      |
-| ---------- | -------------------------------------------------- | --------------------------------------------------------------------------------------------- |
-| 输入调用   | `AgentSession.prompt(text)`                      | 一次调用只表达一次输入尝试；结果可能是`handled`、`queued` 或 `started`                  |
-| 会话编排   | `_runAgentPrompt(messages)`                      | 只在开始处理输入时进入；在里面管理重试、压缩恢复、边界 continuation 与取消                    |
-| Agent run  | `Agent.prompt(messages)` 或 `Agent.continue()` | 一次会话编排可包含多个 run；每个低层 run 都发出自己的`agent_start` / `agent_end` 生命周期 |
-| Agent turn | `turn_start` 到 `turn_end`                     | 一个 run 可包含多个 turn；每个 turn 通常包含一次助手响应及其引发的工具执行                    |
-| 模型请求   | `streamSimple` / provider stream                 | 通常发生在助手响应阶段；自动重试会再次请求模型，压缩摘要等内部工作也可能有独立请求            |
-
-两个边界例子：
-
-- 扩展命令被消费时，`prompt()` 返回 `handled`，没有为该输入启动 `_runAgentPrompt()`；
-- `prompt()` 在 Agent 已运行时以 `steer`/`followUp` 方式排队，返回 `queued`。这条输入会影响现有流程，但它本身不是新的 `Agent.prompt()` 调用。
-
-因此，统计“模型请求次数”不能数 prompt、turn 或 `agent_end`：应按 provider 请求事件/日志，或明确的测试探针计数。章节 21 的自测题也按这个区分评分。
-
-
-#### A.9 索引方式说明
-
-- 想找"某行为在哪个文件" → 用 source-map；
-- 想找"某命令怎么跑" → 用 commands；
-- 想找"某现象怎么排" → 用 troubleshooting；
-- 想找"哪些练习要做" → 用 exercises-and-answers。
-
----
-
-### 第 4 章：消息、事件、状态与持久化条目
-
-
-**先懂这一章**：把“发生过什么”和“现在正在发生什么”分开。消息承载对话内容；事件通知过程；状态记录运行中的当前值；会话条目用于以后恢复。它们可能描述同一件事，但用途和保存时间不同。
-
-```text
-教学伪代码：收到模型的文本增量 → 发出更新事件供界面显示
-           → 模型完成一条回答 → 形成完整消息
-           → 会话层决定把需要保留的内容写入历史
-```
-
-这只是文本回答的例子；工具调用、系统消息和特殊条目在后面分别说明。先认清数据的去向，再读类型定义。
-
-第 3 章按时间顺序追“一次请求发生了什么”；本章改按数据类型追“产生的东西分别给谁用”。读完后，第 5 章的供应商事件转换和第 6 章的循环事件就有了共同词汇。
-
-> 学完本章你能回答：
->
-> 1. "消息""事件""状态""持久化条目"这四种对象分别是什么？谁产生、给谁用、活多久、存哪里？
-> 2. 为什么流式增量（`text_delta`）不是完整消息，而 `message_end` 才标记消息定稿？
-> 3. `AgentMessage` 比模型消息多了什么？谁负责"翻译"？
-> 4. 磁盘上的会话文件里都有哪些条目类型？为什么它是一棵树而不是一条线？
-
-**预计学习时间**：1-1.5 天。
-**本章验证状态**：静态核对通过（对照 `message-types.md`、`session-format.md` 与源码类型定义）；实验为"填表"，不需要运行模型。
-
----
-
-
-#### 4.1 四种对象：一张总图
-
-第 3 章里这四种对象反复出现，现在把它们一次讲清。先看总图：
-
-```mermaid
-flowchart TD
-  subgraph 运行中的 pi 进程
-    E[事件 AgentEvent / AgentSessionEvent<br/>过程广播，发给订阅者]
-    S[状态 AgentState<br/>当前值：消息数组、工具、运行标志]
-    M[消息 AgentMessage → Message<br/>给模型看的对话内容]
-  end
-  subgraph 磁盘
-    P[持久化条目 SessionEntry<br/>JSONL 每一行，组成树]
-  end
-  E -->|message_end| S
-  E -->|message_end| P
-  S -->|convertToLlm| M
-  M -->|请求| LLM[模型供应商]
-  P -->|恢复/分支| S
-```
-
-用一句口诀记住职责：
-
-- **消息**：对模型说的事实；
-- **事件**：对界面说的"正在发生什么"；
-- **状态**：进程里的"现在"；
-- **条目**：磁盘上的"曾经"。
-
-
-##### 4.1.1 四种对象的对照表
-
-| 对象 | 类型名                                | 生产者                                             | 消费者                                   | 生命周期             | 是否落盘               |
-| ---- | ------------------------------------- | -------------------------------------------------- | ---------------------------------------- | -------------------- | ---------------------- |
-| 消息 | `AgentMessage` → `Message`       | 会话层（用户输入）、模型层（助手）、工具层（结果） | 模型（经转换）、界面（经事件）、会话文件 | 随会话               | 是（`message` 条目） |
-| 事件 | `AgentEvent`、`AgentSessionEvent` | Agent 循环、会话层                                 | 界面、扩展、SDK 宿主                     | 瞬间；发完即弃       | 否（但会触发写入）     |
-| 状态 | `AgentState`                        | Agent 内部归约                                     | 界面读取、SDK 读取、循环自身             | 运行期内存           | 否（部分派生自消息）   |
-| 条目 | `SessionEntry` 家族                 | `SessionManager`                                 | 恢复、分支、导出、界面渲染               | 永久（直到删除会话） | 是（JSONL 文件）       |
-
-一个事件可以同时影响状态与磁盘（`message_end`），这就是"同一事实的三种视角"：过程（事件）、内存（状态）、持久化（条目）。
-
-**暂停预测：** `read("demo.txt")` 已经返回文件内容，界面刚收到 `message_end(toolResult)`。如果现在关闭进程，下次恢复对话时需要重放这个事件，还是读取会话条目？先只按“四种对象”的职责判断。
-
-**对照答案：** 事件已经发完，不能靠它恢复。`AgentState` 中的消息数组是本次进程的当前值；正常启用持久化的会话把完成的工具结果写成消息条目，恢复时再从活动分支构造上下文。一个 `message_end` 可以触发状态更新与保存，但事件本身不是会话文件中的一行。具体的活动分支选择与投影规则留到第 9 章。
-
-
-#### 4.2 内容块：消息的最小积木
-
-一条消息的内容（content）是一个**内容块数组**，常见的四种。它们定义在 `packages/ai/src/types.ts`：
-
-
-##### 4.2.1 `TextContent`：文本
-
-```typescript
-export interface TextContent {
-	type: "text"; // 判别字段：读到 text 就能把联合类型收窄到文本块
-	text: string;
-	textSignature?: string; // 供应商不透明票据；多轮对话时保留并原样回传
-}
-```
-
-- `type: "text"` 是判别字段；
-- `textSignature` 是**供应商专用元数据**，pi 把它当"不透明字符串"原样带回去，绝不解读内容。新手请把带 `Signature` 的字段一律视为"必须保留、不可修改的票据"——很多供应商要求多轮对话时把这些票据回传，否则报错。
-
-
-##### 4.2.2 `ImageContent`：图片
-
-```typescript
-export interface ImageContent {
-	type: "image";
-	data: string;     // base64 编码的图片数据
-	mimeType: string; // e.g., "image/jpeg", "image/png"
-}
-```
-
-图片以 base64 内联在消息里。这解释了第 3 章里 `normalizePromptImages` 的存在：大图会显著增加上下文体积，所以发送前要压缩/缩放（第 10 章）。
-
-
-##### 4.2.3 `ThinkingContent`：思考过程
-
-```typescript
-export interface ThinkingContent {
-	type: "thinking";
-	thinking: string;
-	thinkingSignature?: string; // Provider-specific opaque or serialized reasoning replay data
-	/** When true, the thinking content was redacted by safety filters. The opaque
-	 *  encrypted payload is stored in `thinkingSignature` so it can be passed back
-	 *  to the API for multi-turn continuity. */
-	redacted?: boolean;
-}
-```
-
-- 只有支持"思考"的模型会产生；
-- `redacted: true`：出于安全/合规，思考正文被抹掉，但加密票据还在——**照原样回传**即可；
-- 思考块**会进入下一轮请求**（这是某些模型的要求），但界面可以折叠显示。
-
-
-##### 4.2.4 `ToolCall`：工具调用
-
-```typescript
-export interface ToolCall {
-	type: "toolCall";
-	id: string;                       // 工具结果用 toolCallId 与本次调用配对
-	name: string;                     // 工具名，如 "read"
-	arguments: JsonObject;            // 适配器已将 JSON 文本拼好并解析；执行前仍需按工具 schema 校验
-	thoughtSignature?: string;        // Google 专用：复用思考上下文的不透明签名
-	namespace?: string;               // OpenAI Responses 命名空间工具
-}
-```
-
-三个关键点：
-
-1. **`id` 是"调用"与"结果"之间的唯一桥梁**。模型可能一次提出多个调用（A、B），工具结果的 `toolCallId` 必须对应返回，否则对话历史不自洽；
-2. `arguments` 在 pi 内部已经是**解析好的对象**（供应商原始流里它是 JSON 文本，适配器负责增量解析与拼装）；
-3. `arguments` 的类型是 `JsonObject`，具体字段要靠工具自己的 schema 校验——这正是第 3 章 `validateToolArguments` 存在的原因。
-
-
-#### 4.3 模型消息：`Message` 家族
-
-`packages/ai/src/types.ts` 里：
+**模型消息**是 `packages/ai/src/types.ts` 中定义的 `Message`。它是供应商（如 Anthropic、OpenAI）能理解的对话格式。
 
 ```typescript
 export type Message = SystemMessage | UserMessage | AssistantMessage | ToolResultMessage;
 ```
 
-四种角色的分工，一张表理清：
+它有四个角色，用 `role` 字段区分。`role` 就是判别字段：TypeScript 看到 `role` 的值，就知道这是哪一种消息，并允许读取该种消息专有的字段。
 
-| 角色           | 谁产生                      | 模型看到后的意义      |
-| -------------- | --------------------------- | --------------------- |
-| `system`     | pi（提示词与工具声明）      | 规则、身份、可用工具  |
-| `user`       | 用户输入 / 转换后的内部消息 | "人类在说话"          |
-| `assistant`  | 模型                        | "我之前说过/做过什么" |
-| `toolResult` | 工具执行结果                | "工具的答案"          |
+| 角色 | 类型 | 谁产生 | 作用 |
+| --- | --- | --- | --- |
+| `system` | `SystemMessage` | pi | 提示词和工具声明 |
+| `user` | `UserMessage` | 用户输入，或被转换后的内部消息 | “人在说话” |
+| `assistant` | `AssistantMessage` | 模型 | “我之前说过或做过什么” |
+| `toolResult` | `ToolResultMessage` | 工具执行 | “工具的答案” |
 
+下面是一条真实的 `assistant` 消息。它来自与“动手实验”相同场景的一次本地运行（faux 假模型返回的 `read` 工具调用）。ID 和时间戳每次运行都不同，只看结构即可。每个字段的含义见表后：
 
-##### 4.3.1 `SystemMessage`：不只是"系统提示词"
-
-```typescript
-export interface SystemMessage {
-	role: "system";
-	/** Instruction text. On the leading message this is the base prompt; later, additional instructions. */
-	content: string | TextContent[];
-	/**
-	 * Named, ordered prompt sections rendered verbatim after `content`. The leading message
-	 * declares them; later messages replace sections by name, and `null` removes one.
-	 */
-	sections?: Record<string, string | null>;
-	/** Complete definitions of tools that become available at this point. */
-	toolsAdded?: Tool[];
-	/** Tools that stop being available at this point. */
-	toolsRemoved?: ToolReference[];
-	timestamp: number; // Unix timestamp in milliseconds
+```json
+{
+  "role": "assistant",
+  "content": [
+    { "type": "toolCall", "id": "tool:1791639398350:su6ofp05vem", "name": "read", "arguments": { "path": "README.md" } }
+  ],
+  "api": "faux:1791639398323:y48o0wsn36",
+  "provider": "faux",
+  "model": "faux-1",
+  "usage": {
+    "input": 1424,
+    "output": 7,
+    "cacheRead": 0,
+    "cacheWrite": 0,
+    "totalTokens": 1431,
+    "cost": { "input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0, "total": 0 }
+  },
+  "stopReason": "toolUse",
+  "timestamp": 1791639398350,
+  "thinkingLevel": "off"
 }
 ```
 
-这是本仓库最有特色的类型之一。要点：
+| 字段 | 含义 | 本例的值 |
+| --- | --- | --- |
+| `role` | 角色，判别字段 | `"assistant"` |
+| `content` | 内容块数组，顺序即模型产生的顺序 | 一个 `toolCall` 块 |
+| `api`、`provider`、`model` | 用哪种协议、哪家供应商、哪个模型回答 | faux 假模型，不是真实服务 |
+| `usage` | 本次调用的 token 数和费用；`input` 是输入 token，`output` 是输出 token | 输入 1424，输出 7 |
+| `stopReason` | 模型为什么停下；`toolUse` 表示它要等工具结果 | `"toolUse"` |
+| `timestamp` | Unix 毫秒数（不是 ISO 字符串） | 1791639398350 |
+| `thinkingLevel` | 本次请求用的思考级别（可选字段） | `"off"` |
 
-- **提示词不是一整块，而是分节的**（`sections`：preamble、tools、cwd、skills……）。后续系统消息可以**按名字替换某一节**（值为 `null` 表示删除该节）。这带来两个好处：
-  - 中途启用新技能/改变工具时，不用重发整个提示词，只发一个"补丁"；
-  - 会话回放时，把历次系统消息依次叠加，就能精确重建"此刻的提示词"——这叫**可重放性**（replayability）。
-- **工具声明也在系统消息里**（`toolsAdded` / `toolsRemoved`）。第 3 章 `declareToolChanges()` 生成的就是这种消息；
-- 仓库文档（`docs/message-types.md`）还描述了 `replace: true` 的语义：丢弃此前状态、建立全新基线。请在你的本地类型定义里用编辑器确认该字段是否存在（版本间可能有差异）——**"以本地代码为准"是读本仓库的好习惯**。
+这条消息里有三个要点：
 
+- `content` 是**内容块数组**。块有四种：`text`、`image`、`thinking`、`toolCall`。数组顺序就是模型产生内容的顺序。
+- `toolCall.id` 是“调用”和“结果”之间的唯一连接。工具结果里的 `toolCallId` 必须等于它。
+- `stopReason` 说明模型为什么停下。它有七个值：`pending`、`stop`、`length`、`toolUse`、`error`、`aborted`、`deferred`。流式过程中是 `pending`，结束后是终态值。
 
-##### 4.3.2 `UserMessage`
+对应的工具结果是（同一次运行）：
 
-```typescript
-export interface UserMessage {
-	role: "user";
-	content: string | (TextContent | ImageContent)[];
-	timestamp: number; // Unix timestamp in milliseconds
+```json
+{
+  "role": "toolResult",
+  "toolCallId": "tool:1791639398350:su6ofp05vem",
+  "toolName": "read",
+  "content": [{ "type": "text", "text": "# Demo\nA short paragraph.\n" }],
+  "isError": false,
+  "timestamp": 1791639398369
 }
 ```
 
-`content` 允许直接是字符串（简写）或内容块数组（需要图片时）。注意 `role: "user"` 不总代表"人类打的字"——第 4.4 节你会看到，bash 执行记录、扩展注入的上下文、压缩摘要都会被**转换成** `user` 消息发给模型（因为多数供应商只接受这四种角色，没有"系统注入"通道）。
+| 字段 | 含义 | 本例的值 |
+| --- | --- | --- |
+| `role` | 角色 | `"toolResult"` |
+| `toolCallId` | 对应哪一个 `toolCall.id` | 与上面的 `id` 相同 |
+| `toolName` | 工具名，便于显示 | `"read"` |
+| `content` | 发给模型看的结果 | 文件全文，一个文本块 |
+| `isError` | 工具是否失败 | `false` |
+| `timestamp` | Unix 毫秒数 | 比调用晚 19 毫秒 |
 
+本例没有 `details`、`usage`、`nestedCalls`，因为 `read` 工具没有返回这些字段。
 
-##### 4.3.3 `AssistantMessage`：信息最丰富的消息
+`ToolResultMessage` 有两个容易混淆的字段：
 
-```typescript
-export interface AssistantMessage {
-	role: "assistant";
-	content: (TextContent | ThinkingContent | ToolCall)[];
-	api: Api;
-	provider: ProviderId;
-	model: string;
-	responseModel?: string;   // 供应商实际答复的模型（与请求的不同时记录）
-	responseId?: string;      // 供应商侧的响应标识
-	providerThinkingLevel?: string;
-	thinkingLevel?: ModelThinkingLevel;  // 本次请求的 pi 思考级别
-	diagnostics?: AssistantMessageDiagnostic[];
-	usage: Usage;
-	stopReason: StopReason;
-	deferred?: DeferredHandle;
-	errorMessage?: string;
-	rawStopReason?: string;
-	endTurn?: boolean;        // 供应商是否明确表示"我说完了"（仅调试用，不参与控制流）
-	timestamp: number;
-}
-```
+- `content`：发给模型看的结果。
+- `details`：给界面或程序看的结构化数据。它会保存，但不会发给模型。
 
-逐组理解：
+还有 `nestedCalls`：工具内部调用了其他工具时的记录。它保存在会话里，也不发给模型。
 
-- **身份组**（`api/provider/model/responseModel/responseId`）：这条消息是谁答的。会话恢复、成本统计、多模型切换都靠它；
-- **内容组**（`content`）：文本、思考、工具调用的混合数组。**顺序有语义**：模型先思考、再说话、再调工具，数组顺序就是发生顺序；
-- **用量组**（`usage`）：token 与成本（见 4.3.5）；
-- **状态组**（`stopReason/errorMessage/rawStopReason`）：为什么结束。这是 Agent 循环的核心判据（第 6 章）；
-- **调试组**（`diagnostics`）：经过脱敏的诊断信息。
+`SystemMessage` 不只是“系统提示词”。它的 `sections` 字段是有名字的提示词分节，`toolsAdded` 和 `toolsRemoved` 记录工具的增减。后面的系统消息可以替换某一节，值为 `null` 表示删除。这里要注意：`packages/ai/src/types.ts` 的 `SystemMessage` 没有 `replace` 字段。如果看到某份文档提到 `replace: true`，以源码为准。
 
-`StopReason` 的七个值（`packages/ai/src/types.ts`）：
+### 概念 2：Agent 消息（AgentMessage）
 
-```typescript
-export type StopReason = "pending" | "stop" | "length" | "toolUse" | "error" | "aborted" | "deferred";
-```
+模型消息不能覆盖 pi 内部需要的所有对话内容。例如，用户用 `!` 执行的 shell 命令，也需要出现在对话历史中，但模型不认识 `bashExecution` 这种角色。
 
-| 值           | 含义                       | 循环的反应                               |
-| ------------ | -------------------------- | ---------------------------------------- |
-| `pending`  | 流式过程中的临时值         | 不会持久化（`message_end` 时已是终态） |
-| `stop`     | 正常说完了                 | 看有无工具调用/队列决定是否继续          |
-| `length`   | 达到输出上限被截断         | 工具调用全部拒绝执行（第 3.14 节）       |
-| `toolUse`  | 模型要求调用工具           | 执行工具 → 继续下一轮                   |
-| `error`    | 请求失败                   | 结束 run（可能触发自动重试，第 6 章）    |
-| `aborted`  | 被取消                     | 结束 run                                 |
-| `deferred` | 延迟应答（供应商异步任务） | 通过`DeferredHandle` 后续取回          |
-
-> 新手最容易漏掉的一点：`stopReason` 为 `"toolUse"` 时，**消息里必然带有 toolCall 内容块**；但反过来，有 toolCall 时 `stopReason` 理论上可能是 `length`（截断场景）。所以循环的判据要"看内容 + 看原因"双重检查（第 3.8 节 ⑥ 的代码正是这么写的）。
-
-
-##### 4.3.4 `ToolResultMessage`
-
-```typescript
-export interface ToolResultMessage<TDetails = any> {
-	role: "toolResult";
-	toolCallId: string;                    // 对应哪个 ToolCall
-	toolName: string;
-	content: (TextContent | ImageContent)[]; // 给模型看的结果
-	details?: TDetails;                    // 给界面/程序看的结构化细节（不发给模型）
-	usage?: Usage;                         // 工具内部做了"嵌套模型调用"时的用量
-	isError: boolean;
-	timestamp: number;
-}
-```
-
-两个重要区分：
-
-- `content` 是**面向模型**的，"模型看到什么"由它决定；
-- `details` 是**面向界面/代码**的，可以带文件行号、语法高亮信息、原始 JSON 等。它**不会**发给模型（省 token），但会落盘，界面渲染和扩展逻辑可以依赖它。
-
-（另有一个 `structuredContent` 字段存在于工具执行结果 `AgentToolResult` 上，供程序化调用者使用；但它不进 `ToolResultMessage`，所以不具备"跨会话稳定"的保证。第 7 章展开。）
-
-
-##### 4.3.5 `Usage`：token 与成本
-
-```typescript
-export interface Usage {
-	input: number;
-	output: number;
-	cacheRead: number;
-	cacheWrite: number;
-	cacheWrite1h?: number;   // cacheWrite 中 1 小时保留的部分（仅 Anthropic 上报）
-	reasoning?: number;      // 思考 token：已包含在 output 里，不要重复相加
-	totalTokens: number;
-	cost: { input: number; output: number; cacheRead: number; cacheWrite: number; total: number };
-}
-```
-
-要点：`reasoning` 是 `output` 的子集；缓存命中（cacheRead）通常比常规输入便宜得多——这解释了 pi 为什么要做"缓存预热"（`cache-warmer.ts`，第 15 章会看到它的调用点）。
-
-
-#### 4.4 `AgentMessage`：比模型消息更宽的内部类型
-
-
-##### 4.4.1 基础定义与声明合并
-
-`packages/agent/src/types.ts`：
+所以 `packages/agent/src/types.ts` 定义了更宽的类型：
 
 ```typescript
 export interface CustomAgentMessages {
-	// Empty by default - apps extend via declaration merging
+  // Empty by default - apps extend via declaration merging
 }
 
 export type AgentMessage = Message | CustomAgentMessages[keyof CustomAgentMessages];
 ```
 
-`CustomAgentMessages` 默认是空的。应用可以用 TypeScript 的**声明合并**（declaration merging）扩展它：
-
-```typescript
-// 文档注释里的示例（packages/agent/src/types.ts）
-declare module "@earendil-works/pi-agent-core" {
-	interface CustomAgentMessages {
-		artifact: ArtifactMessage;
-		notification: NotificationMessage;
-	}
-}
-```
-
-`coding-agent` 包正是这么做的。`packages/coding-agent/src/core/messages.ts` 里：
+`CustomAgentMessages` 默认是空接口。应用可以用 TypeScript 的**声明合并**（declaration merging，同名接口会自动合并新成员）往里加角色。`packages/coding-agent/src/core/messages.ts` 就是这样做的：
 
 ```typescript
 declare module "@earendil-works/pi-agent-core" {
-	interface CustomAgentMessages {
-		bashExecution: BashExecutionMessage;
-		custom: CustomMessage;
-		branchSummary: BranchSummaryMessage;
-		compactionSummary: CompactionSummaryMessage;
-	}
+  interface CustomAgentMessages {
+    bashExecution: BashExecutionMessage;
+    custom: CustomMessage;
+    branchSummary: BranchSummaryMessage;
+    compactionSummary: CompactionSummaryMessage;
+  }
 }
 ```
 
-所以在 coding-agent 里，`AgentMessage` 等价于八种角色的联合：
+合并后，coding-agent 里的 `AgentMessage` 包含八种角色：四种模型消息，加上四种应用角色。
 
-```typescript
-type AgentMessage =
-  | SystemMessage | UserMessage | AssistantMessage | ToolResultMessage   // 模型能懂的四种
-  | BashExecutionMessage | CustomMessage | BranchSummaryMessage | CompactionSummaryMessage; // 应用扩展的四种
+| 角色 | 何时产生 | 发给模型时怎么办 |
+| --- | --- | --- |
+| `bashExecution` | 用户用 `!` 执行命令 | 转成 `user` 文本；`excludeFromContext` 为真时丢弃（`!!` 前缀） |
+| `custom` | 扩展调用 `sendMessage()` 注入内容 | 转成 `user` 消息 |
+| `branchSummary` | 切换分支时，对放弃的路径做摘要 | 转成 `user` 文本，外面包一层摘要标签 |
+| `compactionSummary` | 上下文压缩后 | 转成 `user` 文本，外面包一层摘要标签 |
+
+这些角色在 pi 内部有用，但模型不认识。它们需要在发送前被翻译，这一步由 `convertToLlm` 完成（见概念 6）。
+
+下面是一条完整的 `bashExecution` 记录，它对应用户输入 `!ls` 的结果。它的类型是 `packages/coding-agent/src/core/messages.ts` 中的 `BashExecutionMessage`：
+
+```json
+{
+  "role": "bashExecution",
+  "command": "ls",
+  "output": "README.md",
+  "exitCode": 0,
+  "cancelled": false,
+  "truncated": false,
+  "timestamp": 3
+}
 ```
 
-四个扩展角色的用途：
+| 字段 | 含义 | 说明 |
+| --- | --- | --- |
+| `role` | 角色，`bashExecution` 是 pi 自定义的角色 | 模型不认识它，必须经过 `convertToLlm` |
+| `command` | 用户输入的命令 | 原样保存 |
+| `output` | 命令的标准输出和错误输出 | 可能很长 |
+| `exitCode` | 退出码，`0` 表示成功；类型允许 `undefined` | 非 0 时翻译后的文本会提示退出码 |
+| `cancelled` | 用户是否中途取消 | 为真时翻译后的文本会提示“已取消” |
+| `truncated`、`fullOutputPath?` | 输出是否被截断，以及完整输出保存在哪个文件 | 只有截断时才有路径 |
+| `excludeFromContext?` | 为真时不发给模型（`!!` 前缀） | 本例没有此字段，所以会发给模型 |
+| `timestamp` | Unix 毫秒数 | 与其它 AgentMessage 相同的格式 |
 
-| 角色                  | 何时产生                       | 是否进模型上下文                        |
-| --------------------- | ------------------------------ | --------------------------------------- |
-| `bashExecution`     | 用户用`!` 直接执行命令       | 默认转成 user 文本（`!!` 前缀则排除） |
-| `custom`            | 扩展调用`sendMessage()` 注入 | 转成 user 消息                          |
-| `branchSummary`     | 切换分支时对被放弃路径做摘要   | 转成 user 消息（带包装标签）            |
-| `compactionSummary` | 上下文压缩后                   | 转成 user 消息（带包装标签）            |
+### 概念 3：事件（AgentEvent 与 AgentSessionEvent）
 
+**事件**是过程通知。它说的是“刚才发生了一件事”，而不是“这是完整的对话内容”。事件只在发出的那一刻有效，发完就丢弃，不保存。
 
-##### 4.4.2 `convertToLlm`：桥梁的完整实现
+`packages/agent/src/types.ts` 的 `AgentEvent` 是一个判别联合，共有 10 个成员：
 
-模型只认识四种角色，扩展消息必须被"翻译"。翻译函数在 `core/messages.ts`（节选 + 注释）：
+| `type` | 附带的数据 | 何时发出 | 典型用途 |
+| --- | --- | --- | --- |
+| `agent_start` | 无 | 一次运行开始 | 界面进入“忙碌” |
+| `agent_end` | `messages` | 一次运行的循环结束 | 界面显示完成 |
+| `turn_start` | 无 | 一个轮次开始 | 界面显示新一轮 |
+| `turn_end` | `message`、`toolResults` | 一个轮次结束 | 收尾渲染 |
+| `message_start` | `message` | 一条消息开始 | 创建消息气泡 |
+| `message_update` | `message`、`assistantMessageEvent` | 助手消息的每个增量 | 显示流式文字 |
+| `message_end` | `message` | 一条消息定稿 | 写入状态和磁盘 |
+| `tool_execution_start` | `toolCallId`、`toolName`、`args` | 工具开始执行 | 显示“正在执行” |
+| `tool_execution_update` | 同上，另加 `partialResult` | 工具上报进度 | 显示局部输出 |
+| `tool_execution_end` | 同上，另加 `result`、`isError` | 工具结束 | 渲染结果 |
+
+注释里写明：`message_update` 只对助手消息发出。
+
+#### 每个事件什么时候发出
+
+下面按一次“读取 README”运行中的先后顺序列出。括号里是本次运行中是否出现该事件。
+
+- **`agent_start`**（出现）：一次运行开始时最先发出。进入 `prompt()` 后、第一条消息之前。发出后 `isStreaming` 为 `true`。
+- **`turn_start`**（出现，两次）：一轮开始。一轮 = 一次助手回答，加上它调用的工具和结果。本次运行有两轮：第一轮是 `read` 调用，第二轮是最终回答。
+- **`message_start`**（出现）：任何一条消息开始时发出，包括 `system`、`user`、`assistant`、`toolResult`。发出后 `streamingMessage` 指向这条消息。
+- **`message_update`**（出现，多次）：助手消息每收到一个增量时发出。`assistantMessageEvent` 说明是哪种增量。本次出现的类型是 `toolcall_start`、`toolcall_delta`（两次）、`toolcall_end`、`text_start`、`text_delta`、`text_end`。`start` 类型没有出现，因为“开始”由 `message_start` 表示。
+- **`message_end`**（出现）：一条消息定稿时发出。`processEvents` 把它 `push` 到 `messages`，`AgentSession` 把它写成一条 `message` 条目。
+- **`tool_execution_start`**（出现）：工具真正开始执行前发出，位于助手 `toolCall` 的 `message_end` 之后。发出后 `pendingToolCalls` 含该 id。
+- **`tool_execution_update`**（未出现）：工具运行中上报进度时发出，携带 `partialResult`。本次 `read` 工具很快结束，没有上报进度。
+- **`tool_execution_end`**（出现）：工具返回后发出。发出后该 id 从 `pendingToolCalls` 移除。
+- **`turn_end`**（出现，两次）：一轮的最后一条消息 `message_end` 之后发出。它携带 `message`（该轮的助手消息）和 `toolResults`（该轮的工具结果）。
+- **`agent_end`**（出现）：整个 Agent 循环结束后发出，位于最后一个 `turn_end` 之后。`isStreaming` 此时仍为 `true`，要等监听器全部结束。
+- **`agent_settled`**（出现，只属于 `AgentSessionEvent`）：会话层的工作全部结束后发出，由 `_emitAgentSettled()` 发出。此时 `isStreaming` 已是 `false`。
+
+完整的 `tool_execution_end` 事件对象（同一次运行）：
+
+```json
+{
+  "type": "tool_execution_end",
+  "toolCallId": "tool:1791639398350:su6ofp05vem",
+  "toolName": "read",
+  "result": { "content": [{ "type": "text", "text": "# Demo\nA short paragraph.\n" }] },
+  "isError": false
+}
+```
+
+| 字段 | 含义 |
+| --- | --- |
+| `type` | 事件名，是判别字段 |
+| `toolCallId` | 对应哪一次工具调用，与 `tool_execution_start` 相同 |
+| `toolName` | 工具名 |
+| `result` | 工具的 `AgentToolResult`；本次只有 `content` 字段 |
+| `isError` | 工具是否失败 |
+
+`message_update` 的结构由类型定义决定：`{ type, message, assistantMessageEvent }`，其中 `message` 是到目前为止的部分助手消息，`assistantMessageEvent` 是增量。字段名来自 `packages/ai/src/types.ts` 的 `AssistantMessageEvent` 定义；本篇没有打印这类对象的实际内容。
+
+`agent_end` 事件本次运行中带有三个字段：`type`、`messages`、`willRetry`。`messages` 的长度为 5，与转录一致。`willRetry` 只在会话层出现，来自 `AgentSession` 的 `_handleAgentEvent` 对 `agent_end` 的改写。
+
+`message_update` 里的 `assistantMessageEvent` 是另一个判别联合，定义在 `packages/ai/src/types.ts`。它的成员有：`start`、`text_start`、`text_delta`、`text_end`、`thinking_start`、`thinking_delta`、`thinking_end`、`toolcall_start`、`toolcall_delta`、`toolcall_end`、`done`、`error`。它是 `message_update` 的载荷，不是 `AgentEvent` 的第 11 个成员。
+
+下面的代码演示收窄写法（先判断 `type`，再取字段），用于取出文字增量：
+
+```typescript
+const deltaText = h.events
+  .flatMap((e) =>
+    e.type === "message_update" && e.assistantMessageEvent.type === "text_delta"
+      ? [e.assistantMessageEvent.delta]
+      : [],
+  )
+  .join("");
+```
+
+只有判断了 `e.type === "message_update"`，TypeScript 才知道 `e` 上有 `assistantMessageEvent`。判断了 `type === "text_delta"`，才知道有 `delta`。
+
+#### AgentSessionEvent：会话层的事件
+
+`packages/coding-agent/src/core/agent-session.ts` 的 `AgentSession` 对外发出 `AgentSessionEvent`。它复用了 `AgentEvent` 的大部分成员，但做了三类改动：
+
+- `agent_end` 被替换。会话版多了必填字段 `willRetry`，表示会不会因为自动重试再开始一次运行。
+- 新增会话级事件：`agent_settled`、`queue_update`、`compaction_start`、`compaction_end`、`entry_appended`、`session_info_changed`、`thinking_level_changed`、`auto_retry_start`、`auto_retry_end`、`summarization_retry_*`、`bash_execution_update`。
+- 工具执行事件可以带可选字段 `parentToolCallId`，表示这次工具调用属于哪个外层调用。
+
+两个容易混淆的事件：
+
+- `agent_end` 是“这一次 Agent 运行的循环结束”。一次 `session.prompt()` 可能因为自动重试产生多次 `agent_end`。
+- `agent_settled` 是“会话层的全部工作结束”。它在 `_runAgentPrompt()` 的收尾阶段，由 `_emitAgentSettled()` 发出。一次 `prompt()` 只发一次。
+
+probe 运行的事件顺序里，最后两个事件就是 `agent_end` 然后 `agent_settled`。
+
+### 概念 4：会话条目（SessionEntry）
+
+**会话条目**是写入磁盘的历史记录。会话文件是 JSONL 格式：每行一个 JSON 对象，每个对象就是一个条目。
+
+`packages/coding-agent/src/core/session-manager.ts` 定义了条目的公共字段：
+
+```typescript
+export interface SessionEntryBase {
+  type: string;
+  id: string;
+  parentId: string | null;
+  timestamp: string;
+}
+```
+
+- `id` 是这条记录自己的编号。
+- `parentId` 指向上一条记录。根条目的 `parentId` 为 `null`。
+- `timestamp` 是 ISO 字符串，例如 `"2026-10-10T12:00:00.000Z"`。
+
+因为每条记录都指向父节点，所以整个文件组成一棵树，而不是一条直线。当用户从历史中间继续对话时，新记录就挂在较早的节点下面，形成分支。
+
+`SessionEntry` 是一个判别联合，`type` 是判别字段。它的成员是：
+
+| `type` | 类型名 | 主要字段 | 是否进入模型上下文 |
+| --- | --- | --- | --- |
+| `message` | `SessionMessageEntry` | `message: AgentMessage` | 是 |
+| `thinking_level_change` | `ThinkingLevelChangeEntry` | `thinkingLevel` | 否，但影响后续解释 |
+| `model_change` | `ModelChangeEntry` | `provider`、`modelId` | 否，但影响后续解释 |
+| `usage` | `UsageEntry` | `kind`、`provider`、`model`、`usage`、`note?` | 否 |
+| `compaction` | `CompactionEntry` | `summary`、`firstKeptEntryId`、`tokensBefore`、`systemMessage?` 等 | 是，替代较早的消息 |
+| `branch_summary` | `BranchSummaryEntry` | `fromId`、`summary`、`details?` 等 | 是 |
+| `custom` | `CustomEntry` | `customType`、`data?` | 否（源码注释明确说明） |
+| `custom_message` | `CustomMessageEntry` | `customType`、`content`、`display`、`details?` | 是 |
+| `context_edit` | `ContextEditEntry` | `targetId`、`replacement`（`null` 表示省略） | 间接，改变投影结果 |
+| `label` | `LabelEntry` | `targetId`、`label` | 否 |
+| `session_info` | `SessionInfoEntry` | `name?` | 否 |
+
+文件第一行不是 `SessionEntry`，而是 `SessionHeader`（`type: "session"`，含 `id`、`timestamp`、`cwd`，以及 `version`）。`FileEntry` 是 `SessionHeader | SessionEntry`。
+
+`packages/coding-agent/src/core/session-manager.ts` 中的 `CURRENT_SESSION_VERSION` 当前为 `3`。一份会话文件的形状大致如下（示意：字段已省略，ID 为假设值）：
+
+```json
+{"type":"session","version":3,"id":"s-001","timestamp":"2026-10-10T12:00:00.000Z","cwd":"/work/demo"}
+{"type":"message","id":"a1b2c3d4","parentId":null,"timestamp":"2026-10-10T12:00:01.000Z","message":{"role":"system","content":"...","timestamp":1791547201000}}
+{"type":"message","id":"e5f6a7b8","parentId":"a1b2c3d4","timestamp":"2026-10-10T12:00:02.000Z","message":{"role":"user","content":"读取 README","timestamp":1791547202000}}
+```
+
+第二行和第三行的 `message` 字段就是 `AgentMessage`，外层的 `id`、`parentId`、`timestamp` 是条目自己的。注意两个 `timestamp` 的格式不同。
+
+下面是同一次运行中，助手 `toolCall` 消息写成的完整条目（一行 JSONL，这里为了可读性换行显示）。它的 `parentId` 指向上一条的用户消息条目：
+
+```json
+{
+  "type": "message",
+  "id": "11297909",
+  "parentId": "590d64de",
+  "timestamp": "2026-10-10T13:36:38.359Z",
+  "message": {
+    "role": "assistant",
+    "content": [
+      { "type": "toolCall", "id": "tool:1791639398350:su6ofp05vem", "name": "read", "arguments": { "path": "README.md" } }
+    ],
+    "api": "faux:1791639398323:y48o0wsn36",
+    "provider": "faux",
+    "model": "faux-1",
+    "usage": { "input": 1424, "output": 7, "cacheRead": 0, "cacheWrite": 0, "totalTokens": 1431, "cost": { "input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0, "total": 0 } },
+    "stopReason": "toolUse",
+    "timestamp": 1791639398350,
+    "thinkingLevel": "off"
+  }
+}
+```
+
+| 字段 | 含义 | 来源 |
+| --- | --- | --- |
+| `type` | 条目类型，`"message"` 表示 `SessionMessageEntry` | 固定值 |
+| `id` | 这条条目自己的编号（本次运行中是 8 位十六进制字符串） | `SessionManager.appendMessage` 中的 `generateId` |
+| `parentId` | 上一条条目的 `id`；第一条条目为 `null` | `appendMessage` 使用当前叶子 `leafId` |
+| `timestamp` | 写入时的 ISO 字符串 | `appendMessage` 中的 `new Date().toISOString()` |
+| `message` | 完整的 `AgentMessage`，与内存中的消息相同 | 来自 `message_end` 的同一个对象 |
+
+同一次运行的第一条条目是 `system` 消息，它的 `parentId` 为 `null`。它的内容很长（`sections` 中有提示词和工具说明），本篇不全部展示。`message` 的内部 `timestamp` 是 `1791639398350`，即 `13:36:38.350`；外层 `timestamp` 是 `13:36:38.359`。两者只差 9 毫秒：条目的时间戳在 `appendMessage` 被调用时取得，消息自己的时间戳更早。
+
+#### 事件与条目：为什么恢复只看条目
+
+假设 `read` 工具刚返回，界面已经收到 `tool_execution_end`，然后进程被关掉。下次打开会话时，事件已经发完，没有任何东西能重放它们。恢复依赖的是磁盘上的 `message` 条目。`message_end` 到达时，`AgentSession._handleAgentEvent` 调用 `SessionManager.appendMessage`，工具结果在那一刻就已经写成一行。
+
+所以事件适合显示进度，不适合作为恢复的唯一数据源。
+
+#### 两种时间戳
+
+这是新手最容易弄错的地方：
+
+- 条目的 `timestamp`：ISO 字符串，例如 `"2026-10-10T12:00:00.000Z"`。
+- 消息内部的 `timestamp`：Unix 毫秒数，例如 `1733234400000`。
+
+`packages/coding-agent/src/core/messages.ts` 里的 `createBranchSummaryMessage` 用 `new Date(timestamp).getTime()` 把 ISO 字符串转成毫秒，就是这个转换。
+
+### 四种数据的对照
+
+同一次运行中的数据，可以用四列表看清楚。下表中“未发生”表示当前步骤中该类数据还没有产生。
+
+| 步骤 | 模型消息（发给模型的内容） | 事件（发给订阅者） | AgentState（内存当前值） | 会话条目（写入磁盘） |
+| --- | --- | --- | --- | --- |
+| 用户输入“读取 README” | `user` 消息 | `message_start`、`message_end`（user） | `messages` 追加 user | `message` 条目 |
+| 模型开始说话 | 未定稿，不算历史 | `message_start`、`message_update`（`toolcall_start` 等） | `streamingMessage` 为部分消息 | 无记录 |
+| 模型提出调用 `read` | `assistant` 消息，内含 `toolCall` | `message_end`（assistant） | `messages` 追加 assistant，`streamingMessage` 清空 | `message` 条目 |
+| 工具执行 | 未发生 | `tool_execution_start`、`tool_execution_end` | `pendingToolCalls` 含该 id，结束后移除 | 无记录 |
+| 工具返回 | `toolResult` 消息（`content`） | `message_start`、`message_end`（toolResult） | `messages` 追加 toolResult | `message` 条目 |
+| 模型给出总结 | `assistant` 消息（text） | `message_update`（`text_delta` 等），然后 `message_end` | 同上 | `message` 条目 |
+| 运行结束 | 未发生 | `agent_end`，然后 `agent_settled` | `isStreaming` 变为 `false` | 无额外条目 |
+
+这张表的关键是“同一个事实，四个视角”：
+
+- 模型只看“模型消息”列，并且只看经过 `convertToLlm` 翻译后的结果。
+- 界面只看“事件”列。它可以显示增量，但增量不是历史。
+- 进程内的 `AgentState` 保存当前值，它是进程退出后就消失的内存。
+- 磁盘只保存“会话条目”列中的完整记录。
+
+用一句话判断：一个数据是否进入下一次模型请求，取决于它是否在模型消息里，而不是它出现在界面上，也不是它写在磁盘上。
+
+可以用四句口诀记住职责：
+
+- **消息**：对模型说的事实；
+- **事件**：对界面说的“正在发生什么”；
+- **状态**：进程里的“现在”；
+- **条目**：磁盘上的“曾经”。
+
+#### 同一轮对话的逐步对照
+
+下面用同一次运行，把每一步的四种数据并排列出。“Message”是模型能看到的形状，“AgentMessage”是内部形状（本例两者相同，因为没有应用角色），“事件”是按顺序发出的事件，“条目”是写入磁盘的 `id`。
+
+| 步骤 | Message（模型消息） | AgentMessage（内部消息） | 事件序列（按发出顺序） | SessionEntry（磁盘条目） |
+| --- | --- | --- | --- | --- |
+| 1. 用户输入“读取 README” | `user`，文本 | 同一对象，`role: "user"` | `message_start`、`message_end`（user） | `7efe3bd3` 是 system；`590d64de` 是 user，`parentId` 指向 system |
+| 2. 模型提出调用 `read` | `assistant`，内容块为 `toolCall` | 同一对象 | `message_start`、`message_update`（`toolcall_start`、`toolcall_delta` 两次、`toolcall_end`）、`message_end`（assistant） | `11297909`，`parentId` 为 `590d64de` |
+| 3. 工具执行 | 没有 | 没有 | `tool_execution_start`、`tool_execution_end` | 没有条目，不落盘 |
+| 4. 工具返回 | `toolResult`，`content` 为文件全文 | 同一对象 | `message_start`、`message_end`（toolResult） | `af902263`，`parentId` 为 `11297909` |
+| 5. 模型给出总结 | `assistant`，文本块 | 同一对象 | `turn_end`（第一轮），`turn_start`，`message_start`、`message_update`（`text_start`、`text_delta`、`text_end`）、`message_end`（assistant） | `904091e4`，`parentId` 为 `af902263` |
+| 6. 运行收尾 | 没有 | 没有 | `turn_end`（第二轮）、`agent_end`、`agent_settled` | 没有新条目 |
+
+这张表说明三件事：
+
+- 同一个对象从第 2 步起就同时是 `AgentMessage` 和 `Message`。它被写入磁盘时，内容不做转换，只加上 `id`、`parentId`、`timestamp` 外壳。
+- 第 3 步没有任何持久化数据。工具正在执行的状态只在内存的 `pendingToolCalls` 中，进程退出后就没有了。
+- 条目的 `parentId` 串起了一条链：`7efe3bd3`、`590d64de`、`11297909`、`af902263`、`904091e4`。这条链就是 `getBranch()` 返回的活动分支。
+
+### 概念 5：什么时候事件会变成消息
+
+`Agent` 类（`packages/agent/src/agent.ts`）负责把事件转成状态。它的私有方法 `processEvents` 处理每个事件：
+
+- `message_start`、`message_update`：把 `streamingMessage` 设为当前部分消息。它们不写入 `messages`。
+- `message_end`：清空 `streamingMessage`，并把完成的消息 `push` 到 `messages`。
+- `tool_execution_start`、`tool_execution_end`：加入或移除 `pendingToolCalls`。
+- `turn_end`：如果助手消息带有 `errorMessage`，记录到 `state.errorMessage`。
+
+所以，“流式期间的消息”只在 `streamingMessage` 里，直到 `message_end` 才进入 `messages`。这条规则在概念 6 和 AgentState 字段中还会用到。
+
+### 概念 6：convertToLlm（翻译桥）
+
+`convertToLlm` 是 `AgentMessage[]` 到 `Message[]` 的转换函数。它是数据从“内部”走向“模型”的桥。
+
+输入是 `AgentMessage[]`，输出是 `Message[]`。`packages/agent/src/types.ts` 的 `AgentLoopConfig.convertToLlm` 注释写明了契约：每次调用模型前都会执行；不能抛出异常，必须返回安全的值。
+
+coding-agent 的实现在 `packages/coding-agent/src/core/messages.ts`，节选如下：
 
 ```typescript
 export function convertToLlm(messages: AgentMessage[]): Message[] {
-	return messages
-		.map((m): Message | undefined => {
-			switch (m.role) {
-				case "bashExecution":
-					if (m.excludeFromContext) return undefined;   // !! 前缀：只显示给用户看
-					return { role: "user", content: [{ type: "text", text: bashExecutionToText(m) }], timestamp: m.timestamp };
-				case "custom": {
-					const content = typeof m.content === "string" ? [{ type: "text" as const, text: m.content }] : m.content;
-					return { role: "user", content, timestamp: m.timestamp };
-				}
-				case "branchSummary":
-					return { role: "user", content: [{ type: "text", text: BRANCH_SUMMARY_PREFIX + m.summary + BRANCH_SUMMARY_SUFFIX }], timestamp: m.timestamp };
-				case "compactionSummary":
-					return { role: "user", content: [{ type: "text", text: COMPACTION_SUMMARY_PREFIX + m.summary + COMPACTION_SUMMARY_SUFFIX }], timestamp: m.timestamp };
-				case "system": case "user": case "assistant": case "toolResult":
-					return m;   // 已经是模型消息，原样通过
-				default: {
-					const _exhaustiveCheck: never = m;   // 穷尽检查：将来新增角色时这里会编译报错
-					return undefined;
-				}
-			}
-		})
-		.filter((m) => m !== undefined);
+  return messages
+    .map((m): Message | undefined => {
+      switch (m.role) {
+        case "bashExecution":
+          if (m.excludeFromContext) return undefined; // !! 前缀：只给用户看
+          return { role: "user", content: [{ type: "text", text: bashExecutionToText(m) }], timestamp: m.timestamp };
+        case "custom": { /* 字符串内容转成文本块，否则原样 */ }
+        case "branchSummary":
+          return { role: "user", content: [{ type: "text", text: BRANCH_SUMMARY_PREFIX + m.summary + BRANCH_SUMMARY_SUFFIX }], timestamp: m.timestamp };
+        case "compactionSummary":
+          return { role: "user", content: [{ type: "text", text: COMPACTION_SUMMARY_PREFIX + m.summary + COMPACTION_SUMMARY_SUFFIX }], timestamp: m.timestamp };
+        case "system":
+        case "user":
+        case "assistant":
+        case "toolResult":
+          return m; // 已经是模型消息，原样通过
+        default: {
+          const _exhaustiveCheck: never = m; // 新增角色却没处理时，这里编译报错
+          return undefined;
+        }
+      }
+    })
+    .filter((m) => m !== undefined);
 }
 ```
 
-值得学的三个细节：
+这段代码有三个值得学的地方：
 
-1. **包装标签**（前缀/后缀）。摘要类消息不是裸文本，而是：
+1. **包装标签**。摘要不是裸文本，而是用固定的前缀和后缀包起来。模型因此能分辨“这是历史的压缩”，而不是“用户刚说了一段话”。
+2. **穷尽检查**。`default` 分支里的 `never` 类型，让 TypeScript 在编译期发现遗漏的角色。
+3. **过滤**。`excludeFromContext` 为真的 bash 记录返回 `undefined`，最后 `filter` 去掉。
 
-```text
-The conversation history before this point was compacted into the following summary:
+#### 一个完整的翻译例子
 
-<summary>
-……摘要内容……
-</summary>
+下面的输入是一段假设的转录，包含 7 条 `AgentMessage`。把它交给 coding-agent 的 `convertToLlm`，得到的输出只含模型能理解的角色。下面的结果来自一次本地运行（临时测试，已删除）。
+
+输入（`AgentMessage[]`，字段做了保留，便于对照）：
+
+```json
+[
+  { "role": "system", "content": "You are a helper.", "timestamp": 1 },
+  { "role": "user", "content": "读取 README", "timestamp": 2 },
+  { "role": "bashExecution", "command": "ls", "output": "README.md", "exitCode": 0, "cancelled": false, "truncated": false, "timestamp": 3 },
+  { "role": "bashExecution", "command": "echo secret", "output": "secret", "exitCode": 0, "cancelled": false, "truncated": false, "timestamp": 4, "excludeFromContext": true },
+  { "role": "custom", "customType": "note", "content": "extension text", "display": true, "timestamp": 5 },
+  { "role": "branchSummary", "summary": "tried plan A", "fromId": null, "timestamp": 6 },
+  { "role": "compactionSummary", "summary": "older turns", "tokensBefore": 1000, "timestamp": 7 }
+]
 ```
 
-   这样模型能分辨"这是历史信息的压缩"，而不是"用户新说了一段话"。
+输出（`Message[]`，6 条）：
 
-2. **穷尽检查**（`const _exhaustiveCheck: never = m`）。这是判别联合的经典用法：如果某天新增了消息角色而忘了处理，这一行会在**编译期**报错。你在本仓库会经常看到 `never` 出现在 switch 的 default 分支——那不是装饰，是防漏网工具。
-3. **过滤型转换**：`bashExecution` 带 `excludeFromContext` 时直接丢弃；map + filter 的组合在类型上是干净的。
+```json
+[
+  { "role": "system", "content": "You are a helper.", "timestamp": 1 },
+  { "role": "user", "content": "读取 README", "timestamp": 2 },
+  { "role": "user", "content": [{ "type": "text", "text": "Ran `ls`\n```\nREADME.md\n```" }], "timestamp": 3 },
+  { "role": "user", "content": [{ "type": "text", "text": "extension text" }], "timestamp": 5 },
+  { "role": "user", "content": [{ "type": "text", "text": "The following is a summary of a branch that this conversation came back from:\n\n<summary>\ntried plan A</summary>" }], "timestamp": 6 },
+  { "role": "user", "content": [{ "type": "text", "text": "The conversation history before this point was compacted into the following summary:\n\n<summary>\nolder turns\n</summary>" }], "timestamp": 7 }
+]
+```
 
+逐条对照：
 
-##### 4.4.3 转换发生在哪里
+| 输入序号 | 输入 | 输出 | 为什么 |
+| --- | --- | --- | --- |
+| 1 | `system` | 原样通过 | 已是模型消息（`case "system"`） |
+| 2 | `user` | 原样通过 | 已是模型消息 |
+| 3 | `bashExecution`，没有 `excludeFromContext` | `user`，文本为 ``Ran `ls` `` 加输出 | 调用 `bashExecutionToText` 生成文本 |
+| 4 | `bashExecution`，`excludeFromContext: true` | 没有输出 | 返回 `undefined`，最后被 `filter` 去掉（`!!` 前缀） |
+| 5 | `custom`，内容是字符串 | `user`，内容变成一个文本块 | 字符串被包成 `{ type: "text", text }` |
+| 6 | `branchSummary` | `user`，文本前后加标签 | `BRANCH_SUMMARY_PREFIX` 与 `BRANCH_SUMMARY_SUFFIX` 包住摘要 |
+| 7 | `compactionSummary` | `user`，文本前后加标签 | `COMPACTION_SUMMARY_PREFIX` 与 `COMPACTION_SUMMARY_SUFFIX` 包住摘要 |
 
-回顾第 3 章 3.9 节的 `streamAssistantResponse`：
+两个细节：
+
+- 第 4 条被丢掉，所以输出比输入少一条。`convertToLlm` 用 `map` 处理每条消息，被丢弃的消息返回 `undefined`，再用 `filter` 去掉。
+- 第 6 条的后缀 `</summary>` 前面没有换行，而第 7 条的后缀前面有换行。这是 `messages.ts` 中两个常量的写法不同，不是翻译逻辑的差别。
+
+#### 谁负责注入 convertToLlm
+
+`convertToLlm` 是 `Agent` 的配置项，不是写死在循环里的。
+
+- `packages/agent/src/agent.ts` 有一个默认实现 `defaultConvertToLlm`。它只保留四种模型角色（`system`、`user`、`assistant`、`toolResult`），其它角色直接丢弃。
+- `packages/coding-agent/src/core/sdk.ts` 注入完整版本。它先调用 `convertToLlm`，再包一层 `convertToLlmWithBlockImages`：如果设置了屏蔽图片，就再过滤一次图片块。
+
+两者的区别很重要。默认实现丢弃 `bashExecution`、`custom` 等角色；coding-agent 的版本会把它们转成 `user` 文本，因为这些内容对用户和模型都有用。
+
+`convertToLlm` 还被压缩流程复用。生成摘要本身也要调用模型，所以同一份历史也要经过翻译（`messages.ts` 的注释说明了这一点；压缩流程本身不在本篇展开）。
+
+### 概念 7：AgentState（状态）
+
+`AgentState` 是“进程里现在的值”。它在 `packages/agent/src/types.ts` 中定义。
 
 ```typescript
-const llmMessages = await config.convertToLlm(messages);
+export interface AgentState {
+  readonly systemPrompt: string;
+  model: Model<any>;
+  thinkingLevel: ThinkingLevel;
+  set tools(tools: AgentTool<any>[]);
+  get tools(): AgentTool<any>[];
+  set messages(messages: AgentMessage[]);
+  get messages(): AgentMessage[];
+  readonly isStreaming: boolean;
+  readonly streamingMessage?: AgentMessage;
+  readonly pendingToolCalls: ReadonlySet<string>;
+  readonly errorMessage?: string;
+}
 ```
 
-`convertToLlm` 是 `Agent` 的**构造参数**：`agent-core` 自带一个"只保留四种标准角色"的默认实现（`agent.ts` 的 `defaultConvertToLlm`）；`coding-agent` 在 `sdk.ts` 里注入完整版本（还包了一层图片屏蔽）。**下层提供默认，上层注入具体**——又一次看到第 0 章的架构原则。
+字段表：
 
-另外一个用途：`convertToLlm` 也被"生成摘要"的压缩流程复用——因为摘要请求本身也是一次模型调用，需要把同一份历史翻译过去（第 10 章）。
+| 字段 | 类型 | 读写 | 含义 | 何时变化 |
+| --- | --- | --- | --- | --- |
+| `systemPrompt` | `string` | 只读 | 当前系统提示词 | 由 `messages` 中的系统消息重放得出（`getCurrentSystemPrompt`） |
+| `model` | `Model<any>` | 可写 | 下一轮使用的模型 | 切换模型时 |
+| `thinkingLevel` | `ThinkingLevel` | 可写 | 下一轮的思考级别 | 切换思考级别时。该类型含 `off`，共 7 个值 |
+| `tools` | `AgentTool<any>[]` | 可读写 | 可执行的工具 | 赋值时复制顶层数组 |
+| `messages` | `AgentMessage[]` | 可读写 | 对话转录 | 赋值时复制顶层数组；消息结束时追加 |
+| `isStreaming` | `boolean` | 只读 | 是否在处理中 | 直到 `agent_end` 的监听器全部结束才变为 `false` |
+| `streamingMessage` | `AgentMessage?` | 只读 | 正在形成的部分消息 | `message_start`/`message_update` 设置，`message_end` 清空 |
+| `pendingToolCalls` | `ReadonlySet<string>` | 只读 | 正在执行的工具调用 id | `tool_execution_start` 加入，`tool_execution_end` 移除 |
+| `errorMessage` | `string?` | 只读 | 最近一次失败或取消的错误文本 | `turn_end` 时从助手消息提取 |
 
+几个要点：
 
-#### 4.5 事件：`AgentEvent` 与 `AgentSessionEvent`
+- **`systemPrompt` 是只读的**。想改提示词，要追加一条系统消息（`content` 或 `sections`），不能直接赋值。源码注释里写明了这一点。
+- **数组赋值会复制**。给 `tools` 或 `messages` 赋值时，状态保存的是新数组的副本。这样外部代码之后修改自己的数组，不会悄悄改变状态。
+- **`isStreaming` 比“模型还在输出”更晚结束**。它要等 `agent_end` 的 `await` 监听器全部完成。
 
+#### 一次运行中 AgentState 的变化
 
-##### 4.5.1 `AgentEvent` 十种事件
-
-完整定义在 `packages/agent/src/types.ts`（第 3 章 1.3.4 给过原文）。按生命周期的全景表：
-
-| 事件                      | 载荷                               | 发出时机                   | 典型消费者                          |
-| ------------------------- | ---------------------------------- | -------------------------- | ----------------------------------- |
-| `agent_start`           | 无                                 | run 开始                   | 界面：进入"忙碌"状态                |
-| `agent_end`             | `messages`                       | run 结束（最后一个事件）   | 界面：显示完成/错误；会话层判断重试 |
-| `turn_start`            | 无                                 | 每个 turn 开始             | 界面：显示"新一轮"                  |
-| `turn_end`              | `message, toolResults`           | 每个 turn 结束             | 界面：收尾渲染；会话层记录失败信息  |
-| `message_start`         | `message`                        | 用户/助手/工具结果消息开始 | 界面：创建消息气泡                  |
-| `message_update`        | `message, assistantMessageEvent` | 助手消息的每个增量         | 界面：流式文字/思考/工具调用预览    |
-| `message_end`           | `message`                        | 消息最终定型               | 状态归约、持久化、界面定稿          |
-| `tool_execution_start`  | `toolCallId, toolName, args`     | 工具开始                   | 界面：显示"正在执行"                |
-| `tool_execution_update` | `..., partialResult`             | 工具上报进度               | 界面：局部结果（如命令输出滚动）    |
-| `tool_execution_end`    | `..., result, isError`           | 工具结束                   | 界面：渲染结果/错误                 |
-
-当前基线里的 `AgentEvent` 联合**正好有 10 个成员**，与上表十行一一对应。读 TypeScript 联合类型时，一个 `|` 分支代表一种可取的对象形状；像 `message_update` 的 `assistantMessageEvent` 字段虽然又有自己的联合类型，但它是**事件载荷里的嵌套事件**，不是额外的 `AgentEvent` 成员。
-
-可以自己打开 `packages/agent/src/types.ts` 数一遍 `AgentEvent` 的 `|` 分支来练习。自动重试和 `agent_settled` 等会话级通知属于后面的 `AgentSessionEvent`，不会因为它们和 Agent 运行有关就自动成为 core 的 `AgentEvent`。
-
-
-##### 4.5.2 `AgentSessionEvent`：复用并改写 core 事件
-
-`coding-agent` 的 `AgentSession` 对外事件**基于** `AgentEvent`，但不是它的严格超集（`agent-session.ts` 的 `AgentSessionEvent`）：
-
-```typescript
-export type AgentSessionEvent =
-| WithParentToolCallId<Exclude<AgentEvent, { type: "agent_end" }>>   // 复用其它事件；工具事件可多 parentToolCallId
-	| { type: "agent_end"; messages: AgentMessage[]; willRetry: boolean } // 关键差异：多了 willRetry
-	| { type: "agent_settled" }
-	| { type: "queue_update"; steering: readonly string[]; followUp: readonly string[] }
-	| { type: "compaction_start"; reason: "manual" | "threshold" | "overflow" }
-	| { type: "entry_appended"; entry: SessionEntry }
-	| { type: "session_info_changed"; name: string | undefined }
-	| { type: "thinking_level_changed"; level: ThinkingLevel }
-	| { type: "compaction_end"; reason; result; aborted; willRetry; errorMessage? }
-	| { type: "auto_retry_start"; attempt; maxAttempts; delayMs; errorMessage }
-	| { type: "auto_retry_end"; success; attempt; finalError? }
-	| { type: "summarization_retry_scheduled"; /* ... */ }
-	| { type: "summarization_retry_attempt_start"; /* source: branchSummary | compaction */ }
-	| { type: "summarization_retry_finished" }
-	| { type: "bash_execution_update"; id?: string; delta: string };
-```
-
-几个对读代码很重要的差异：
-
-- **`agent_end` 被替换了，不只是加字段**：先用 `Exclude<AgentEvent, { type: "agent_end" }>` 从 core 联合中移除旧的 `agent_end` 形状，再加入带必需 `willRetry` 的会话版。即使 `willRetry` 为 `false`，这个字段也必须存在；所以一个只有 `type` 和 `messages` 的 core `agent_end` 不能直接当成 `AgentSessionEvent` 使用。
-- **其它事件大多复用**：条件类型 `WithParentToolCallId<E>` 只在三种 `tool_execution_*` 事件上加可选的 `parentToolCallId`；其它 core 事件形状保持不变。它标识嵌套工具调用属于哪个外层调用（如 codemode，第 22 章）。
-- **`agent_settled`**：整个会话层面的工作（含重试/压缩/边界）全部结束——第 3 章 `_runAgentPrompt` 的 finally 里发的就是它。注意它和 `agent_end` 不是一个东西：一次 `session.prompt()` 期间可能有**多次** `agent_end`（自动重试场景），但只有**一次** `agent_settled`；
-- **`entry_appended`**：部分辅助条目写入路径会显式发出，例如扩展追加的自定义条目、提交的 boundary 条目和 context edit。它不是通用的“文件有新行”事件：普通 `message_end` 持久化和压缩条目写入都不会因此自动发出它；
-- **`queue_update`**：排队消息变化（界面显示"还有 2 条消息在排队"）；
-
-
-#### 4.6 状态：`AgentState` 字段全表
-
-`packages/agent/src/types.ts` 的 `AgentState`（结合 `Agent` 实现）：
-
-| 字段                 | 类型                          | 含义                               | 备注                                                                   |
-| -------------------- | ----------------------------- | ---------------------------------- | ---------------------------------------------------------------------- |
-| `systemPrompt`     | `string`（只读）            | 当前系统提示（从系统消息重放而来） | 想改提示词要**追加系统消息**，不能直接赋值                       |
-| `model`            | `Model<any>`                | 下一轮使用的模型                   | 中途切换模型的入口                                                     |
-| `thinkingLevel`    | `ThinkingLevel`             | 下一轮的思考级别                   | `off/minimal/low/medium/high/xhigh/max`（按模型能力钳制）            |
-| `tools`            | `AgentTool[]`（get/set）    | 可执行的工具                       | 赋值会**复制顶层数组**；与转录中声明不同时，下一轮自动补系统消息 |
-| `messages`         | `AgentMessage[]`（get/set） | 对话转录                           | 赋值同样复制顶层数组                                                   |
-| `isStreaming`      | `boolean`                   | 是否在处理中                       | **到 `agent_end` 的监听器全部结束才变 false**                  |
-| `streamingMessage` | `AgentMessage \| undefined`  | 当前正在形成的部分消息             | `message_start/update` 设置、`message_end` 清空                    |
-| `pendingToolCalls` | `ReadonlySet<string>`       | 正在执行中的工具调用 id            | 界面显示"还有工具在跑"                                                 |
-| `errorMessage`     | `string \| undefined`        | 最近一次失败/取消的错误文本        | `turn_end` 时从助手消息提取                                          |
-
-两个可访问性细节（`Agent` 实现里的 `createMutableAgentState`）：
-
-- `systemPrompt` 是**推导值**（getter），由 `getCurrentSystemPrompt(messages)` 从系统消息重放而来；
-- `tools`/`messages` 的 setter 会 `slice()` 复制数组，避免调用者后续改动外部数组导致状态漂移。
-
-`AgentSession.state` 就是 `this.agent.state` 的直接返回（`agent-session.ts` 第 1396 行）——会话层没有另建一套状态。**"状态"只有一个数据源**，这是排障时的关键：界面显示异常，先看 `session.state`，再看事件有没有漏。
-
-
-##### 4.6.1 运行态 vs 存储态：同一事实的两种样子
-
-以第一次模型响应为例：
-
-| 时刻                                                             | 状态（内存）                                                            | 磁盘                                           |
-| ---------------------------------------------------------------- | ----------------------------------------------------------------------- | ---------------------------------------------- |
-| 流式进行中                                                       | `streamingMessage` = 最新部分消息；`messages` 还没有这条未完成消息  | 无记录（`pending` 不落盘）                   |
-| `message_end` 到达                                             | `streamingMessage` 清空；终态消息追加到 `messages`                  | listener 尚在处理；还未走到 session 持久化分支 |
-| `AgentSession` listener 完成 message-end hooks/public dispatch | `messages` 保持终态消息；hook 若替换内容，会原地改同一个 message 对象 | 追加该最终 message 的`message` 条目          |
-| 检查磁盘文件                                                     | ——                                                                    | 只有一条终态消息                               |
-
-注意有两个不同的数组/字段：`streamAssistantResponse` 持有并更新模型请求 context 里的 partial message；公开的 `AgentState` 则通过 `streamingMessage` 暴露当前快照。`Agent.processEvents(message_start/update)` 只更新 `streamingMessage`，不会把尚未完成的消息放入 `state.messages`；等 `message_end` 才清掉它并把 final message 追加到 `state.messages`。随后会话层 hook 可能原地替换这条已追加消息的字段，最终 `SessionManager` 再持久化它。
-
-因此在流式期间观察 `state.messages.length`，通常不会因当前 assistant message 正在输出而先加一；应观察 `state.streamingMessage`。第 3 章 3.12.1 画出了 partial message 从模型流到 Agent state 和 session entry 的完整路径。
-
-
-##### 4.6.2 `message_end` 时的原地替换：同一个对象要保持一致
-
-`Agent.processEvents` 处理 `message_end` 时，先把事件中的 message 追加进 `agent.state.messages`，然后才按顺序 `await` listeners。`AgentSession` 是其中一个 listener：它运行扩展的 message-end hook。hook 可以返回替代消息；session 会通过 `_replaceMessageInPlace(target, replacement)` 清掉目标对象的字段，再把替代字段复制回**同一个对象**。
+下面的图按时间顺序画出“读取 README”这次运行中状态的变化。箭头左边是事件，右边是这一步之后状态里发生的改动。
 
 ```text
-streamAssistantResponse 生成 finalMessage
-  → Agent.processEvents(message_end)
-      → agent.state.messages.push(finalMessage)
-      → AgentSession listener 收到同一个 finalMessage 引用
-          → message-end 扩展返回替代内容
-          → _replaceMessageInPlace(finalMessage, replacement)
-          → 公开 session listeners 收到已替换内容
-          → SessionManager.appendMessage(finalMessage)
+用户输入“读取 README”
+  |  message_start / message_end (system, user)
+  |     -> streamingMessage 先设为 system，再清空
+  |     -> messages: [system, user]
+  v
+助手流式输出 toolCall
+  |  message_start            -> streamingMessage = 部分 assistant
+  |  message_update x 4       -> streamingMessage 每次被替换
+  |  message_end              -> streamingMessage = undefined
+  |                           -> messages: [system, user, assistant]
+  v
+工具执行 read
+  |  tool_execution_start     -> pendingToolCalls = {id}
+  |  tool_execution_end       -> pendingToolCalls = {}
+  v
+工具结果
+  |  message_start / message_end (toolResult)
+  |                           -> messages: [system, user, assistant, toolResult]
+  |  turn_end                 -> 第一轮结束（本次没有错误，所以不写 errorMessage）
+  v
+第二轮：助手流式输出文字
+  |  message_start / message_update x 3 / message_end
+  |                           -> messages: [system, user, assistant, toolResult, assistant]
+  |  turn_end, agent_end      -> isStreaming 仍为 true（监听器尚未结束）
+  v
+agent_settled                 -> isStreaming = false
 ```
 
-为什么要保留对象身份？因为 `agent.state.messages`、同一 run 后续产生的事件和最终写入会话的消息都可能引用它。若只让 `event.message` 指向新对象，Agent 状态数组仍留着旧对象，最终就可能出现“界面看见 A、状态持有 B、磁盘写入 C”的分叉。源码注释明确说原地修改用于同步 Agent state、后续 turn/agent events、listeners 与最终持久化。
+用表格看同一过程。每一行是一个事件发出后、会话监听器看到的状态（`messages` 是长度，`streaming` 是 `streamingMessage` 的角色）：
+
+| 事件（发出后） | messages 长度 | streaming | pending | isStreaming |
+| --- | --- | --- | --- | --- |
+| `agent_start` | 0 | - | 0 | true |
+| `message_start`（system） | 0 | system | 0 | true |
+| `message_end`（system） | 1 | - | 0 | true |
+| `message_end`（user） | 2 | - | 0 | true |
+| `message_start`（assistant） | 2 | assistant | 0 | true |
+| `message_update` 共 4 次（toolcall_*） | 2 | assistant | 0 | true |
+| `message_end`（assistant toolCall） | 3 | - | 0 | true |
+| `tool_execution_start` | 3 | - | 1 | true |
+| `tool_execution_end` | 3 | - | 0 | true |
+| `message_start`（toolResult） | 3 | toolResult | 0 | true |
+| `message_end`（toolResult） | 4 | - | 0 | true |
+| `turn_end`（第一轮） | 4 | - | 0 | true |
+| `message_update` 共 3 次（text_*） | 4 | assistant | 0 | true |
+| `message_end`（assistant 文字） | 5 | - | 0 | true |
+| `agent_end` | 5 | - | 0 | true |
+| `agent_settled` | 5 | - | 0 | false |
+
+几点读法：
+
+- `messages` 只在 `message_end` 时增加。流式期间它的长度不变，部分消息只在 `streamingMessage` 中。
+- `pendingToolCalls` 在工具执行的两个事件之间非空，之后回到空集合。
+- `isStreaming` 在 `agent_end` 监听器运行时仍是 `true`，到 `agent_settled` 才是 `false`。
+
+#### 只有一个状态来源
+
+`AgentSession` 不另外保存一份状态。`packages/coding-agent/src/core/agent-session.ts` 中的 `get state(): AgentState` 直接返回 `this.agent.state`。`model`、`thinkingLevel`、`tools` 等访问器也都读 `this.agent.state`。
+
+排查界面显示问题时，先看 `session.state`；如果状态正确，再看事件是否漏发。
+
+#### 为什么 message_end 要保持同一个对象
+
+`message_end` 之后，扩展可能替换这条消息的内容。如果只让事件里的 `message` 指向新对象，那么：
+
+- `agent.state.messages` 仍然指向旧对象；
+- 界面收到的是新对象；
+- 磁盘保存的可能是第三个版本。
+
+这会导致“界面看到 A，状态里是 B，磁盘里是 C”。为了避免这种分叉，`AgentSession` 用 `_replaceMessageInPlace` 把替换内容复制到同一个对象上。源码如下（`packages/coding-agent/src/core/agent-session.ts`）：
 
 ```typescript
 private _replaceMessageInPlace(target: AgentMessage, replacement: AgentMessage): void {
-  if (target === replacement) return;
+  if (target === replacement) {
+    return;
+  }
   const targetRecord = target as unknown as Record<string, unknown>;
-  for (const key of Object.keys(targetRecord)) delete targetRecord[key];
+  for (const key of Object.keys(targetRecord)) {
+    delete targetRecord[key];
+  }
   Object.assign(targetRecord, replacement);
 }
 ```
 
-逐行读：
+这是原地修改，不是新增会话条目。它只影响“首次写入磁盘之前”的那条消息。
 
-- `target === replacement`：同一个对象无需处理；
-- `Record<string, unknown>`：临时把对象看作可按键读写的记录。`unknown` 要求调用方别假定任意值都有特定字段；
-- 先删旧键：避免替代对象没有的可选字段仍残留在 target 上；
-- `Object.assign` 写回新键值：对象身份没换，内容变成 replacement。
+## 源码导览（按阅读顺序）
 
-这是一次**运行期对象同步**，发生在这条消息首次写入 transcript 之前。它和下面的 `context_edit` 不同：context edit 不回头改 JSONL 里的原消息，而是追加一条记录，在构造模型投影时应用。
+| 顺序 | 文件路径 | 符号 | 读的时候关注什么 |
+| --- | --- | --- | --- |
+| 1 | `packages/ai/src/types.ts` | `Message`、`SystemMessage`、`UserMessage`、`AssistantMessage`、`ToolResultMessage`、`StopReason`、`AssistantMessageEvent` | 每个角色的字段；`toolCallId` 与 `id` 的对应；`details` 与 `content` 的区别 |
+| 2 | `packages/agent/src/types.ts` | `CustomAgentMessages`、`AgentMessage`、`AgentEvent`、`AgentState` | `CustomAgentMessages` 默认为空；`AgentEvent` 的 10 个成员；`AgentState` 的只读字段 |
+| 3 | `packages/agent/src/agent.ts` | `defaultConvertToLlm`、`Agent`、`processEvents` | 默认翻译只保留四种角色；`message_end` 时 `push` 到 `messages` |
+| 4 | `packages/coding-agent/src/core/messages.ts` | `BashExecutionMessage`、`CustomMessage`、`BranchSummaryMessage`、`CompactionSummaryMessage`、`convertToLlm` | `declare module` 如何扩展角色；每个角色转换成什么 |
+| 5 | `packages/coding-agent/src/core/sdk.ts` | `convertToLlmWithBlockImages` | coding-agent 如何注入翻译函数 |
+| 6 | `packages/coding-agent/src/core/agent-session.ts` | `AgentSessionEvent`、`_handleAgentEvent`、`_replaceMessageInPlace`、`get state`、`_runAgentPrompt`、`_emitAgentSettled` | 会话层如何改写 `agent_end`；`message_end` 时何时写入磁盘 |
+| 7 | `packages/coding-agent/src/core/session-manager.ts` | `SessionEntryBase`、`SessionEntry`、`SessionMessageEntry`、`ContextEditEntry`、`SessionManager.appendMessage`、`buildSessionContext`、`getBranch` | 条目的公共字段；哪些条目进入上下文；`getBranch` 返回的是哪条路径 |
 
+读的顺序是“类型定义 → 谁创建 → 谁消费”。先看 `types.ts` 里有哪些字段，再找 `processEvents` 或 `_handleAgentEvent` 谁写入它。
 
-#### 4.7 持久化条目：会话文件的解剖
+## 走读一次完整过程
 
-下面直接给出会话文件的字段和读法。
+以“读取 README 并总结”为例，每一步写清楚发生了什么、对应哪个函数、状态有什么变化。
 
+1. **用户输入进入会话。** `AgentSession.prompt(text)`（`packages/coding-agent/src/core/agent-session.ts`）接收输入。会话层的处理由 `_runAgentPrompt()` 负责。此时还没有模型请求。
+2. **系统消息与用户消息加入转录。** 第一次运行时，转录里先有一条 `system` 消息（提示词和工具声明），再有一条 `user` 消息。`Agent.processEvents` 对每条消息依次收到 `message_start` 和 `message_end`，`message_end` 时把它 `push` 到 `state.messages`。
+3. **模型流式输出工具调用。** 模型产生 `toolcall_start`、`toolcall_delta`、`toolcall_end` 等增量。每个增量作为 `message_update` 发出，`streamingMessage` 保存部分消息，`messages` 不变。
+4. **助手消息定稿。** 收到 `message_end`（助手消息，`stopReason` 为 `toolUse`）。`processEvents` 清空 `streamingMessage`，把它追加到 `messages`。随后 `_handleAgentEvent` 在 `message_end` 分支中调用 `SessionManager.appendMessage`，写入一条 `message` 条目。
+5. **工具执行。** 发出 `tool_execution_start`，`pendingToolCalls` 加入 `toolCallId`。工具运行结束后发出 `tool_execution_end`，该 id 从 `pendingToolCalls` 移除。这两个事件不会写入磁盘。
+6. **工具结果成为消息。** 发出 `message_start`、`message_end`，角色为 `toolResult`。`messages` 追加一条工具结果，磁盘也追加一条 `message` 条目。
+7. **第二次模型请求。** 下一轮开始前，`convertToLlm` 把 `messages` 翻译成 `Message[]`。这次请求的转录包含系统消息、user、assistant（toolCall）和 toolResult，模型据此生成总结。
+8. **总结流式输出并定稿。** `message_update`（`text_start`、`text_delta`、`text_end`），然后 `message_end`。定稿消息追加到 `messages` 并写入磁盘。
+9. **结束。** 依次发出 `turn_end`、`agent_end`，然后 `_emitAgentSettled()` 发出 `agent_settled`。`isStreaming` 在 `agent_end` 监听器结束后变为 `false`。
 
-##### 4.7.1 文件与公共字段
+probe 运行的结果与这个顺序一致（见下面的动手实验）。
 
-```text
-~/.pi/agent/sessions/--<路径编码>--/<时间戳>_<会话ID>.jsonl
-```
+## 动手实验
 
-每行是一个 JSON 对象。除第一行（`SessionHeader`）外，所有条目都有公共字段：
+### 实验 1：观察同一次运行的四种视角
 
-```typescript
-interface SessionEntryBase {
-	type: string;
-	id: string;              // 通常是 8 位十六进制；必要时回退为完整 UUID
-	parentId: string | null; // 父条目 ID；根条目为 null
-	timestamp: string;       // ISO 8601 字符串（与消息内的毫秒时间戳不同！）
-}
-```
+- **目的**：看到同一次工具调用在四种数据中各出现在哪里。
+- **前提**：已安装依赖（仓库根目录执行过 `npm install --ignore-scripts`）。
+- **环境**：使用 faux 假模型，不需要密钥。
 
-**两种时间戳**是新手重灾区：
-
-- 条目外层 `timestamp`：ISO 字符串（如 `"2024-12-03T14:00:00.000Z"`）；
-- 消息内层 `timestamp`：Unix 毫秒数（如 `1733234400000`）。
-
-读会话文件时别把两者混用。
-
-
-##### 4.7.2 条目类型总表
-
-| `type`                  | 作用                                            | 进模型上下文？     |
-| ------------------------- | ----------------------------------------------- | ------------------ |
-| `session`               | 文件头：版本、id、cwd、可选 parentSession       | 否                 |
-| `message`               | 一条`AgentMessage`（含系统消息补丁）          | 是                 |
-| `model_change`          | 中途切换模型                                    | 否（影响后续解释） |
-| `thinking_level_change` | 中途切换思考级别                                | 否                 |
-| `usage`                 | 非消息类用量（如缓存预热）                      | 否                 |
-| `compaction`            | 压缩摘要 + 系统提示检查点 +`firstKeptEntryId` | 是（替换旧消息）   |
-| `context_edit`          | 对早前条目的"仅上下文生效"编辑                  | 间接（改写投影）   |
-| `branch_summary`        | 分支切换时对被放弃路径的摘要                    | 是                 |
-| `custom`                | 扩展私有状态（不参与上下文）                    | 否                 |
-| `custom_message`        | 扩展注入的消息（参与上下文）                    | 是                 |
-| `label`                 | 书签/标记（`targetId` 指向被标记条目）        | 否                 |
-| `session_info`          | 会话元数据（显示名）                            | 否                 |
-
-
-##### 4.7.3 为什么是"树"而不是"线"
-
-看 `session-format.md` 的示意图：
-
-```text
-[user msg] ─── [assistant] ─── [user msg] ─── [assistant] ─┬─ [user msg] ← current leaf
-                                                            │
-                                                            └─ [branch_summary] ─── [user msg] ← alternate branch
-```
-
-- 每个条目用 `parentId` 指向父节点；**"当前叶子"（leaf）标识你现在所处的分支**；
-- 从 B 处分叉：老路径保留，新路径也是同一文件的一部分；
-- `buildContextEntries()` 从叶向根回溯，产出"活动分支"的条目列表——这就是下一次请求的历史来源（细节第 9 章）。
-
-
-##### 4.7.4 系统消息的持久化形态（活例子）
-
-会话文件里的第一条系统消息长这样（`session-format.md` 示例）：
-
-```json
-{"type":"message","id":"a0b1c2d3","parentId":null,"timestamp":"2024-12-03T14:00:00.000Z",
- "message":{"role":"system","content":"","sections":{"preamble":"You are an expert coding assistant...","tools":"<tools>\n- read: ...\n</tools>","cwd":"/project"},
- "toolsAdded":[{"name":"read","description":"...","parameters":{}}],"timestamp":1733234400000}}
-```
-
-后面某次技能启用时又追加：
-
-```json
-{"type":"message","id":"d4e5f6g7","parentId":"c3d4e5f6","timestamp":"...","message":{"role":"system","content":"","sections":{"skills":"<skills>...</skills>"},"toolsRemoved":[{"name":"write"}],"timestamp":1733234640000}}
-```
-
-对照 4.3.1：**"提示词分节补丁 + 工具增删"不是概念演示，而是磁盘上的真实格式**。恢复会话时按顺序重放，就得到当前的提示词与工具清单——没有单独的"提示词状态"条目。
-
-
-##### 4.7.5 原始条目与模型投影：`context_edit` 是追加规则
-
-会话 JSONL 有两个值得区分的视图：
-
-- **原始条目**（`getEntries()`）：文件中追加保存的事实，保留消息、编辑记录和它们的父子关系；
-- **模型投影**（`buildSessionProjection()`）：沿当前叶子选出活动路径，应用压缩检查点和 context edits 后，得到这次请求真正使用的消息。
-
-例如，原先有一条 assistant entry：
-
-```json
-{"type":"message","id":"m1","parentId":"u1","message":{"role":"assistant","content":[{"type":"text","text":"包含敏感细节的回答"}]}}
-```
-
-随后应用需要把它从模型后续上下文中隐藏。系统不会静默删除/改写 `m1`，而是追加一个 context edit：
-
-```json
-{"type":"context_edit","id":"e1","parentId":"m1","targetId":"m1","replacement":null}
-```
-
-此时：
-
-| 读取方式                              | 结果                                                                       |
-| ------------------------------------- | -------------------------------------------------------------------------- |
-| `getEntries()` / 原始 JSONL         | 原 assistant entry 仍在，后面多了一条`replacement: null` 的 context edit |
-| `buildSessionProjection().entries`  | 包含来源 entry 的投影记录，可追踪来源                                      |
-| `buildSessionProjection().messages` | `m1` 不再贡献消息                                                        |
-| 当前分支的后续模型请求                | 不会看到被 omission 的回答                                                 |
-
-`appendContextEdit(targetId, replacement)` 会验证目标存在、位于当前分支，而且属于可编辑的模型可见内容。`replacement: null` 表示省略目标；`{ content: ... }` 表示只替换该条目的内容，保留其余消息字段。构造投影时，活动 context entries 中针对同一 target 的后续 edit 会覆盖 Map 中较早的 edit，因此当前分支采用最近一次规则。
-
-图示这条数据关系：
-
-```mermaid
-flowchart LR
-  M[原 message 条目 m1<br/>保留在 JSONL] --> P[buildSessionProjection]
-  E[context_edit e1<br/>targetId=m1<br/>replacement=null] --> P
-  P -->|忽略 m1 的内容| C[模型上下文 messages]
-  M -->|仍可追溯| R[原始会话历史]
-```
-
-这不是“把用户能看到的历史删除”，而是“保留审计/分支来源，调整后续模型看到的投影”。真实案例可读 `packages/coding-agent/test/suite/agent-session-boundaries.test.ts` 的 `omits a recoverable projected replacement by its source entry ID`：测试保留原 entry，追加 null edit，再断言投影不含替代内容。
-
-【容易混淆】`_replaceMessageInPlace` 与 `context_edit` 的不同：
-
-| 机制                       | 修改对象                  | 是否另追加 entry               | 原始消息是否保留原样             | 目的                                             |
-| -------------------------- | ------------------------- | ------------------------------ | -------------------------------- | ------------------------------------------------ |
-| `_replaceMessageInPlace` | 当前内存中的 message 对象 | 否；随后首次 append 该 message | 不一定；写入前会采用最终替代内容 | 让 state/listeners/transcript 对这次消息达成一致 |
-| `appendContextEdit`      | 不改 target message 对象  | 是，新增`context_edit`       | 是                               | 为活动分支的模型投影追加省略/替换规则            |
-
-读到“replace”时先问三个问题：改的是内存对象还是存储投影？原始 entry 是否仍存在？这次写入是不是新增了一条有 parentId 的记录？这三问能避免把状态更新错当成历史删除。
-
-
-#### 4.8 一个工具调用的四列清单
-
-拿第 3 章的 `read` 调用填表（本章的核心作业模板）：
-
-| 对象                                     | 产生位置（文件 → 函数）                         | 用途                       | 存储位置         |
-| ---------------------------------------- | ------------------------------------------------ | -------------------------- | ---------------- |
-| 用户消息`UserMessage`                  | `agent-session.ts` → `prompt()`             | 模型理解任务；历史         | `message` 条目 |
-| assistant 消息#1（含 `ToolCall`）      | `agent-loop.ts` → `streamAssistantResponse` | 模型表达"调用 read"；历史  | `message` 条目 |
-| `tool_execution_start/update/end` 事件 | `agent-loop.ts` → `emitToolExecutionEnd` 等 | 界面展示执行过程           | 不落盘           |
-| `ToolResultMessage`                    | `agent-loop.ts` → `createToolResultMessage` | 让模型看到文件内容；历史   | `message` 条目 |
-| 状态`pendingToolCalls` 变化            | `agent.ts` → `processEvents`                | 界面"仍在执行"提示         | 内存，run 后重置 |
-| `_entryIdsByMessage` 映射              | `agent-session.ts`（约 1133 行）               | 消息对象 ↔ 条目 id 的关联 | 内存             |
-
-
-#### 4.9 实验 L04-A：为一次运行填满四列表
-
-**实验性质**：读代码 + 填表；不需要模型。
-**验证状态**：设计中。
-
-
-##### 步骤
-
-1. 复制 4.8 的表，把对象换成"一次 bash 工具调用"（命令 `ls`），补齐六行；
-2. 在 `packages/coding-agent/src/core/session-manager.ts` 里找到 `appendMessage` 的实现，写出它干了什么（3-5 行）；
-3. 在 `packages/coding-agent/docs/session-format.md` 中找到 `buildContextEntries` 的说明，用三行话说清"恢复时如何把树变成线性历史"；
-4. 加分题：找到一条真实会话文件（如果你已经用 pi 聊过天），打开前 5 行，识别每一行的 `type`。
-
-
-##### 判定标准
-
-- 第 1 题能指出"哪些对象落盘、哪些不落"；
-- 第 2 题能说出"写入的是哪一行 JSON、父节点是谁"；
-- 第 3 题能指出"从叶子向根回溯、遇压缩检查点截断"两个要点。
-
-
-#### 4.10 常见错误
-
-| 现象/误解                                    | 纠正                                                           |
-| -------------------------------------------- | -------------------------------------------------------------- |
-| 把`message_update` 的 partial 当作历史消息 | 历史以`message_end` 的终态消息为准                           |
-| 认为所有`role: "user"` 都是人打的          | bash 记录、扩展注入、摘要在模型侧都是 user                     |
-| 混淆两种时间戳                               | 条目外层 ISO 字符串；消息内毫秒数                              |
-| 以为`stopReason` 只在结束时有意义          | 流式期间是`pending`；循环还看内容块判断                      |
-| 认为`details` 会发给模型                   | 只给界面/程序；模型只看`content`                             |
-| 修改`systemPrompt` 期待生效                | 它只读；要追加系统消息（sections 补丁）                        |
-| 把`agent_end` 当作"会话彻底结束"           | 之后还可能有重试、压缩（看`willRetry` 与 `agent_settled`） |
-
-
-#### 4.11 验收题
-
-1. 说出四种对象各自"会不会落盘"，并为每种举一个例子。
-2. `ToolCall.id` 和 `ToolResultMessage.toolCallId` 的关系是什么？如果不匹配会发生什么？
-3. `convertToLlm` 的输入和输出类型分别是什么？为什么压缩摘要要包 `<summary>` 标签？
-4. `agent_end` 与 `agent_settled` 的区别？一个会话 run 里哪个只会出现一次？
-5. 会话文件里为什么会有"同一父节点的多个子条目"？这对应什么用户操作？
-
-
-##### 参考答案（要点）
-
-1. 消息：落盘（`message` 条目）；事件：不落盘（但触发写入）；状态：不落盘（内存）；条目：落盘（JSONL）。
-2. 一一对应；缺失或不匹配会让历史不自洽——部分供应商会拒绝请求（toolResult 找不到对应 toolCall），或模型无法把结果与请求关联。
-3. 输入 `AgentMessage[]`，输出 `Message[]`；摘要包标签是让模型能区分"这是历史压缩"而非用户新发言。
-4. `agent_end` = 一次 run 的循环结束（可能因重试多次出现）；`agent_settled` = 会话层全部收尾（重试/压缩/边界）完成后一次，每次 `session.prompt()` 只出现一次（结束阶段）。
-5. 从某个历史节点继续对话（分支/fork），或分支摘要后开新路。对应 `/tree` 切换、`--fork` 等操作。
-
-
-#### 4.12 源码依据
-
-- `packages/ai/src/types.ts`（`TextContent`、`ImageContent`、`ThinkingContent`、`ToolCall`、`Usage`、`StopReason`、`Message` 四角色）；
-- `packages/agent/src/types.ts`（`AgentMessage`、`CustomAgentMessages`、`AgentState`、`AgentEvent`）；
-- `packages/coding-agent/src/core/messages.ts`（扩展角色与 `convertToLlm`）；
-- `packages/coding-agent/src/core/agent-session.ts`（`AgentSessionEvent` 第 190 行、`state` 第 1396 行、持久化分支约 1113 行）；
-- `packages/coding-agent/docs/message-types.md`、`docs/session-format.md`。
-
-
----
-
-### 附录 H：数据形状对照表
-
-> 用途：排查"某字段在哪个阶段存在/消失"时按表查。**列出的字段以基线 commit 的类型定义为准**（用编辑器转定义复核）；字段的完整语义参见对应章节。
-
----
-
-
-#### H.1 六种形状的总关系
-
-```mermaid
-flowchart LR
-  M1[AgentMessage<br/>内部消息（含应用角色）] -->|convertToLlm| M2[Message<br/>四角色模型消息]
-  M1 -->|message_end 事件 + appendMessage| E[SessionEntry<br/>磁盘条目]
-  E -->|三级投影| M1
-  M2 -->|适配器| P[供应商请求]
-  S[AgentEvent / AgentSessionEvent<br/>运行时事件] -->|subscribe| UI[界面/宿主]
-  S -->|toJsonEvent| J[JsonAgentSessionEvent<br/>线上事件]
-  C[RpcCommand / RpcResponse<br/>协议命令与响应] -->|stdin/stdout JSONL| RC[远端客户端]
-```
-
-一句话：**AgentMessage 是"活的水"，Message 是"发给模型的",SessionEntry 是"冻在磁盘的"，Event 是"流过的浪"，JsonEvent 是"拍成照片的浪"。**
-
----
-
-
-#### H.2 内容块（`packages/ai/src/types.ts`）
-
-| 块                  | 判别字段             | 字段                                                                           | 备注                           |
-| ------------------- | -------------------- | ------------------------------------------------------------------------------ | ------------------------------ |
-| `TextContent`     | `type: "text"`     | `text`、`textSignature?`                                                   | signature 为不透明供应商元数据 |
-| `ImageContent`    | `type: "image"`    | `data`（base64）、`mimeType`                                               | 内联图片                       |
-| `ThinkingContent` | `type: "thinking"` | `thinking`、`thinkingSignature?`、`redacted?`                            | 思考块；签名照原样回传         |
-| `ToolCall`        | `type: "toolCall"` | `id`、`name`、`arguments`（对象）、`thoughtSignature?`、`namespace?` | id 是调用-结果桥梁             |
-
-
-#### H.3 消息族
-
-
-##### H.3.1 模型消息（`Message` 四角色）
-
-| 角色                  | 关键字段                                                                                                                                                                                                                                                                                                       | 备注                                     |
-| --------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------- |
-| `SystemMessage`     | `content`（string 或 TextContent[]）、`sections?`、`toolsAdded?`、`toolsRemoved?`、`timestamp`                                                                                                                                                                                                       | 分节补丁 + 工具声明；可回放              |
-| `UserMessage`       | `content`（string 或 (TextContent\|ImageContent)[]）、`timestamp`                                                                                                                                                                                                                                          |                                          |
-| `AssistantMessage`  | `content`（TextContent\|ThinkingContent\|ToolCall）[]、`api`、`provider`、`model`、`responseModel?`、`responseId?`、`providerThinkingLevel?`、`thinkingLevel?`、`diagnostics?`、`usage`、`stopReason`、`deferred?`、`errorMessage?`、`rawStopReason?`、`endTurn?`、`timestamp` | `stopReason` 七值（见 H.3.3）          |
-| `ToolResultMessage` | `toolCallId`、`toolName`、`content`（TextContent\|ImageContent）[]、`details?`、`usage?`、`isError`、`timestamp`                                                                                                                                                                                 | details 不进模型；usage 计工具内嵌套调用 |
-
-
-##### H.3.2 编码助手扩展的四角色（`core/messages.ts`）
-
-| 角色                         | 关键字段                                                                                                                         | 转换为                           |
-| ---------------------------- | -------------------------------------------------------------------------------------------------------------------------------- | -------------------------------- |
-| `BashExecutionMessage`     | `command`、`output`、`exitCode`、`cancelled`、`truncated`、`fullOutputPath?`、`excludeFromContext?`、`timestamp` | user 文本（`!!` 前缀 → 排除） |
-| `CustomMessage`            | `customType`、`content`、`display`、`details?`、`timestamp`                                                            | user 消息                        |
-| `BranchSummaryMessage`     | `summary`、`fromId`、`timestamp`                                                                                           | user 文本（`<summary>` 包装）  |
-| `CompactionSummaryMessage` | `summary`、`tokensBefore`、`timestamp`                                                                                     | user 文本（带前缀）              |
-
-
-##### H.3.3 `StopReason` 七值速查
-
-| 值           | 含义     | 循环行为                |
-| ------------ | -------- | ----------------------- |
-| `pending`  | 流式中   | 不持久化                |
-| `stop`     | 正常结束 | 看工具/队列             |
-| `length`   | 输出截断 | 工具全拒 + 可能溢出恢复 |
-| `toolUse`  | 要求工具 | 执行后继续              |
-| `error`    | 失败     | 结束 run（可重试）      |
-| `aborted`  | 取消     | 结束 run                |
-| `deferred` | 延迟应答 | 凭 handle 取回          |
-
-
-#### H.4 事件族
-
-
-##### H.4.1 `AgentEvent`（core）
-
-| 事件                      | 载荷                                   |
-| ------------------------- | -------------------------------------- |
-| `agent_start`           | —                                     |
-| `agent_end`             | `messages`                           |
-| `turn_start`            | —                                     |
-| `turn_end`              | `message`、`toolResults`           |
-| `message_start`         | `message`                            |
-| `message_update`        | `message`、`assistantMessageEvent` |
-| `message_end`           | `message`                            |
-| `tool_execution_start`  | `toolCallId`、`toolName`、`args` |
-| `tool_execution_update` | 同上 +`partialResult`                |
-| `tool_execution_end`    | 同上 +`result`、`isError`          |
-
-
-##### H.4.2 `AssistantMessageEvent`（嵌套在 message_update）
-
-`start` / `text_start|text_delta|text_end` / `thinking_start|thinking_delta|thinking_end` / `toolcall_start|toolcall_delta|toolcall_end` / `done`（reason+message）/ `error`（reason+error）——各带 `partial`（快照）。
-
-
-##### H.4.3 `AgentSessionEvent` 相对 `AgentEvent` 的差异
-
-| 差异                                                     | 说明                                                   |
-| -------------------------------------------------------- | ------------------------------------------------------ |
-| `agent_end` 多 `willRetry`                           | 会话层改写                                             |
-| 新增`agent_settled`                                    | 自动工作清零                                           |
-| 新增`queue_update`                                     | steering/followUp 队列快照                             |
-| 新增`compaction_start/end`                             | 压缩过程                                               |
-| 新增`entry_appended`                                   | 部分辅助写入路径主动发布已追加条目；不是通用的落盘通知 |
-| 新增`session_info_changed`、`thinking_level_changed` | 元数据变化                                             |
-| 新增`auto_retry_start/end`、`summarization_retry_*`  | 两类重试                                               |
-| 新增`bash_execution_update`                            | RPC bash 流式输出                                      |
-| 事件可带`parentToolCallId`                             | 嵌套调用归属                                           |
-
-
-##### H.4.4 线上事件（`JsonAgentSessionEvent`）
-
-| 差异点             | 规则                                                                             |
-| ------------------ | -------------------------------------------------------------------------------- |
-| `message_update` | 去掉累积`partial`；顶层带 `usage`；`toolcall_start` 补 `id`/`toolName` |
-| 其余事件           | 原样                                                                             |
-| 记录边界           | LF 一行一条；可选前置`\r` 剥离                                                 |
-
-
-#### H.5 会话条目（`session-manager.ts`）
-
-**公共字段（除 header）**：`type`、`id`、`parentId`（null=根）、`timestamp`（ISO 字符串）。
-
-| 条目 type                             | 独有字段                                                                                                         | 进上下文？       |
-| ------------------------------------- | ---------------------------------------------------------------------------------------------------------------- | ---------------- |
-| `session`（header，无 id/parentId） | `version`、`id`、`timestamp`、`cwd`、`parentSession?`                                                  | —               |
-| `message`                           | `message: AgentMessage`                                                                                        | ✅               |
-| `model_change`                      | `provider`、`modelId`                                                                                        | ❌（影响解释）   |
-| `thinking_level_change`             | `thinkingLevel`                                                                                                | ❌               |
-| `usage`                             | `kind`、`provider`、`model`、`usage`、`note?`                                                          | ❌               |
-| `compaction`                        | `summary`、`firstKeptEntryId`、`tokensBefore`、`usage?`、`fromHook?`、`details?`、`systemMessage?` | ✅（替代旧条目） |
-| `context_edit`                      | `targetId`、`replacement`（null=省略）                                                                       | 间接             |
-| `branch_summary`                    | `summary`、`fromId`、`usage?`、`fromHook?`、`details?`                                                 | ✅               |
-| `custom`                            | `customType`、`data?`                                                                                        | ❌               |
-| `custom_message`                    | `customType`、`content`、`display`、`details?`                                                           | ✅               |
-| `label`                             | `targetId`、`label?`                                                                                         | ❌               |
-| `session_info`                      | `name`                                                                                                         | ❌               |
-
-【陷阱】条目时间戳是 ISO；消息内 `timestamp` 是毫秒——**两种时间戳**（第 4.7.1 节）。
------------------------------------------------------------------------
-
-
-#### H.6 工具形状
-
-
-##### H.6.1 运行时契约 `AgentTool`（`agent/src/types.ts`）
-
-| 字段                  | 类型                                                                         | 说明                               |
-| --------------------- | ---------------------------------------------------------------------------- | ---------------------------------- |
-| `name`              | string                                                                       | 模型调用的名字                     |
-| `label`             | string                                                                       | 界面显示名                         |
-| `description`       | string                                                                       | 给模型的说明                       |
-| `parameters`        | TSchema                                                                      | 参数 schema（typebox/JSON Schema） |
-| `prepareArguments?` | (args)=>params                                                               | 校验前垫片                         |
-| `outputSchema?`     | TSchema                                                                      | structuredContent 的形状声明       |
-| `execute`           | (id, params, signal?, onUpdate?)=>Promise<AgentToolResult></agenttoolresult> | 四参执行                           |
-| `replay?`           | `"never"\|"safe"`                                                           | 持久执行重放策略                   |
-| `executionMode?`    | `"sequential"\|"parallel"`                                                  | 个体调度约束                       |
-
-
-##### H.6.2 注册形态 `ToolDefinition`（`core/extensions/types.ts`）额外字段
-
-`promptSnippet?`、`promptGuidelines?`、`constrainedSampling?`、`renderCall?`/`renderResult?`/`renderShell?`（渲染）、`exposure?`（`"direct"|"model-only"|"codemode"|"deferred"|"hidden"`）、`namespace?`。
-
-
-##### H.6.3 结果与钩子
-
-| 形状                          | 字段                                                                                         |
-| ----------------------------- | -------------------------------------------------------------------------------------------- |
-| `AgentToolResult<TDetails>` | `content`、`details`、`structuredContent?`、`usage?`、`isError?`、`terminate?`   |
-| `BeforeToolCallResult`      | `block?`、`reason?`、`terminate?`                                                      |
-| `AfterToolCallResult`       | `content?`、`details?`、`structuredContent?`、`isError?`、`usage?`、`terminate?` |
-
-【陷阱】`content`（模型可见）≠ `details`（界面/程序）≠ `structuredContent`（仅程序化）；后置钩子给 `content` 但不给 `structuredContent` 时，旧结构化数据会被丢弃（第 7.6.2 节）。
-
-
-#### H.7 实验协议形状（client/server，选修）
-
-| 形状               | 内容                                                                                  |
-| ------------------ | ------------------------------------------------------------------------------------- |
-| 线帧               | `[4 字节无符号大端长度][definite-length CBOR]`                                      |
-| server target      | `{ serverId }`                                                                      |
-| session target     | `{ serverId, sessionId, attachmentId }`                                             |
-| 附着管理           | `attach()`/`detach()` **不返回路由 ID**；带外 `attachment` 消息发布活路由 |
-| 服务信封（不透明） | `{ serviceId, instance?, member, args }`，严格 JSON；Chord 语义                     |
-| 限额               | 16 MiB/帧、1,000,000 元素、64 层嵌套                                                  |
-
-
-#### H.8 CLI-RPC 形状（`rpc-types.ts`）
-
-| 形状                | 内容                                                                                                                                                                                                                          |
-| ------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `RpcCommand`      | 约 30 条命令（prompting/state/model/thinking/queue modes/compaction/retry/bash/session/messages/commands），每条带可选`id`                                                                                                  |
-| `RpcSessionState` | `model?`、`thinkingLevel`、`isStreaming`、`isCompacting`、`steeringMode`、`followUpMode`、`sessionFile?`、`sessionId`、`sessionName?`、`autoCompactionEnabled`、`messageCount`、`pendingMessageCount` |
-| `RpcResponse`     | `{ id?, type:"response", command, success:true, data }` 或 `{ ..., success:false, error }`；解析失败为无 id 的 `command:"parse"`                                                                                        |
-| Extension UI        | `extension_ui_request`（含 `id` 与方法/参数）→ `extension_ui_response`（用同一 id）；对话框=请求响应，通知=单向                                                                                                        |
-
-
-#### H.9 运行状态形状
-
-
-##### H.9.1 `AgentState`（对外）
-
-`systemPrompt`（只读推导）、`model`、`thinkingLevel`、`tools`（get/set 复制）、`messages`（get/set 复制）、`isStreaming`、`streamingMessage?`、`pendingToolCalls`（只读 Set）、`errorMessage?`。
-
-
-##### H.9.2 会话侧运行标志（内部，排查用）
-
-| 标志                        | 含义                                        |
-| --------------------------- | ------------------------------------------- |
-| `_isAgentRunActive`       | 会话层认为 run 进行中                       |
-| `_agentRunAbortRequested` | 本 run 被请求取消                           |
-| `_retryAttempt`           | 连续重试计数（成功清零）                    |
-| `_failedResponse`         | 最近失败响应（重试/报告用）                 |
-| `_lastAssistantMessage`   | turn_end 时记录的最近助手消息（收尾循环用） |
-| `_entryIdsByMessage`      | 消息对象 → 条目 id 映射                    |
-| `_isEmittingAgentSettled` | 收尾事件发送中（延后新 prompt）             |
-
-
-#### H.10 转换矩阵：谁把谁变成谁
-
-| 从                    | 到                        | 转换函数（位置）                                                      |
-| --------------------- | ------------------------- | --------------------------------------------------------------------- |
-| `AgentMessage[]`    | `Message[]`             | `convertToLlm`（`core/messages.ts`；agent 默认版在 `agent.ts`） |
-| `SessionEntry[]`    | 活动路径                  | `buildSessionPath`（内部）                                          |
-| 活动路径              | 折叠条目                  | `buildContextEntries`                                               |
-| 折叠条目              | 投影消息                  | `buildSessionProjection`（含 context_edit）                         |
-| 条目                  | 消息                      | `sessionEntryToContextMessages`                                     |
-| 投影消息              | 请求上下文                | `normalizeContext`（含 `Content` 简写折叠）                       |
-| `Message`/`Tool`  | 供应商载荷                | 各 provider 适配器（`providers/*`）                                 |
-| 供应商增量            | `AssistantMessageEvent` | 各 API 实现（`api/*`）                                              |
-| `AgentToolResult`   | `ToolResultMessage`     | `createToolResultMessage`（`agent-loop.ts`）                      |
-| `AgentSessionEvent` | 线上事件                  | `toJsonEvent`（`modes/json-event.ts`）                            |
-| 线上事件              | 字节流                    | `serializeJsonLine` + `writeRawStdout`                            |
-| `RpcCommand`        | `RpcResponse`           | `handleCommand`（`modes/rpc/rpc-mode.ts`）                        |
-| `SessionEntry[]`    | 新会话文件                | `createBranchedSession` / `forkFrom`                              |
-
-
-#### H.11 高频混淆字段速查
-
-| 易混对                                                     | 区分                          |
-| ---------------------------------------------------------- | ----------------------------- |
-| `message.timestamp`（毫秒） vs 条目 `timestamp`（ISO） | 两种时间口径                  |
-| `ToolCall.arguments`（对象） vs 适配器的分片 JSON 文本   | 内部已解析                    |
-| `ToolResultMessage.toolCallId` vs `toolCall.id`        | 必须一一对应                  |
-| `SystemMessage.content` vs `SystemMessage.sections`    | 前者基础文本；后者具名分节    |
-| `content` vs `details` vs `structuredContent`        | 模型 / 界面与程序 / 仅程序    |
-| `sessionId` vs `attachmentId`                          | 会话 vs 一次表现层附着        |
-| `stopReason:"length"` vs `"stop"`                      | 截断 vs 正常                  |
-| `agent_end` vs `agent_settled`                         | 低层 run 结束 vs 自动工作清零 |
-| `replay:"safe"` vs `"never"`                           | 崩溃后重跑 vs 报 interrupted  |
-
-
-#### H.12 使用建议
-
-- 排查"字段在某阶段为 undefined"：对照 H.10 找**转换点**，再看该函数是否保留字段（如 `withToolChanges` 会重置工具字段、`createToolResultMessage` 不带 `structuredContent`）；
-- 排查"事件里没有我需要的字段"：对照 H.4——**线上事件**（H.4.4）比内存事件更瘦（没有 partial）；
-- 排查"磁盘上有但模型看不到"：对照 H.5 的"进上下文？"列 + H.10 的投影链。
-
----
-
-## 动手任务 A：做一张四列表。
-
-独立造一段“用户要求读 README → 模型发出 read → 工具返回 → 模型总结”的轨迹。下面的代码是完整基线，可以直接写进今日准备指定的测试文件：
+**第一步：在系统临时目录创建测试文件。** 下面的内容保存为 `probe.test.ts`。把其中的 `D:/Github/pi` 替换成你的仓库根目录（使用正斜杠）。
 
 ```typescript
 import { writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { fauxAssistantMessage, fauxToolCall } from "@earendil-works/pi-ai";
-import { expect, it } from "vitest";
-import { createHarness } from "./harness.ts";
+import { expect, it } from "D:/Github/pi/node_modules/vitest/dist/index.js";
+import { fauxAssistantMessage, fauxToolCall } from "D:/Github/pi/packages/ai/src/index.ts";
+import { createHarness } from "D:/Github/pi/packages/coding-agent/test/suite/harness.ts";
 
-it("shows four views of one tool call", async () => {
+it("probe four views", async () => {
   const h = await createHarness();
   try {
     writeFileSync(join(h.tempDir, "README.md"), "# Demo\nA short paragraph.\n");
@@ -1289,33 +729,206 @@ it("shows four views of one tool call", async () => {
       fauxAssistantMessage("README 已读取"),
     ]);
     await h.session.prompt("读取 README");
-    expect(h.session.messages.some((m) => m.role === "toolResult")).toBe(true);
-    expect(h.sessionManager.getBranch().some((e) => e.type === "message")).toBe(true);
-    console.log("messages", h.session.messages.map((m) => m.role));
-    console.log("events", h.events.map((e) => e.type));
-    console.log("state", h.session.agent.state.messages.map((m) => m.role));
-    console.log("entries", h.sessionManager.getBranch().map((e) => e.type));
+    const eventNames = h.events.map((e) =>
+      e.type === "message_update" ? `message_update:${e.assistantMessageEvent.type}` : e.type,
+    );
+    const deltaText = h.events
+      .flatMap((e) =>
+        e.type === "message_update" && e.assistantMessageEvent.type === "text_delta"
+          ? [e.assistantMessageEvent.delta]
+          : [],
+      )
+      .join("");
+    const last = h.session.messages.at(-1);
+    const finalText =
+      last?.role === "assistant" ? last.content.map((c) => (c.type === "text" ? c.text : "")).join("") : "";
+    const out = [
+      "MESSAGES " + JSON.stringify(h.session.messages.map((m) => m.role)),
+      "EVENTS " + JSON.stringify(eventNames),
+      "STATE " + JSON.stringify(h.session.state.messages.map((m) => m.role)),
+      "ENTRIES " + JSON.stringify(h.sessionManager.getBranch().map((e) => e.type)),
+      "CONTEXT " + JSON.stringify(h.sessionManager.buildSessionContext().messages.map((m) => m.role)),
+      "DELTA_JOINED " + JSON.stringify(deltaText),
+      "FINAL_TEXT " + JSON.stringify(finalText),
+    ];
+    writeFileSync(join(tmpdir(), "pi-task03-out.txt"), out.join("\n") + "\n");
+    expect(deltaText).toBe(finalText);
   } finally {
     h.cleanup();
   }
 });
 ```
 
-四组输出是四列表的观察口。每行填“模型消息 / 对外事件 / Agent 当前状态 / 会话条目”，至少覆盖用户输入、工具调用增量、完整助手消息、工具结果、最终回答。尚未发生就写“无”，不能用同一个对象替代四列。
+**第二步：运行（工作目录为 `packages/coding-agent`）。**
 
-## 动手任务 B：事件折叠。
+PowerShell：
 
-从 `h.events` 提取一组 `message_update` 中的 `text_start → text_delta* → text_end`，按到达顺序手工拼出最终助手 `content`，与 `message_end` 的完成消息比较。再假设丢失 `message_end`：写明界面可能已有文字，但哪一步无法确认完整消息。错误或取消属于另一种终态，在源码中找出对应 `stopReason`。
+```powershell
+Set-Location D:\Github\pi\packages\coding-agent
+$probe = Join-Path $env:TEMP "pi-task03-probe"
+New-Item -ItemType Directory -Force $probe | Out-Null
+# 把上面的代码保存为 $probe\probe.test.ts 后执行：
+node ../../node_modules/vitest/dist/cli.js --run --root $probe (Join-Path $probe "probe.test.ts")
+Get-Content (Join-Path $env:TEMP "pi-task03-out.txt")
+Remove-Item -Recurse -Force $probe, (Join-Path $env:TEMP "pi-task03-out.txt")
+```
 
-## 实验记录
+bash（Git Bash，Windows；Linux 或 macOS 把 `TMPD` 换成 `$(node -p "require('os').tmpdir()")`）：
 
-1. 先写出 `UserMessage`、`AssistantMessage`、`ToolResultMessage` 各一条最小示例，标出 `role`、`content` 和工具调用 ID 的作用。再对应到一组会话条目。
-2. 订阅一次 faux 运行的事件，按时间编号，不按事件名归类。每到 `message_update` 只更新“进行中内容”，到 `message_end` 才更新“完成消息”。
-3. 对四列表的每一行问“模型此刻能看到什么”。工具启动事件、TUI 渲染内容和会话磁盘条目都不能自动算作模型输入。
-4. 交付一张不少于五行的四列表和一个 100 字左右的说明：为什么事件流可用于显示进度，但不能直接当作恢复会话的唯一数据源。
+```bash
+cd "$(git rev-parse --show-toplevel)/packages/coding-agent"
+TMPD="$(cygpath -m "$TEMP")"
+PROBE="$TMPD/pi-task03-probe"
+mkdir -p "$PROBE"
+# 把上面的代码保存为 "$PROBE/probe.test.ts" 后执行：
+node ../../node_modules/vitest/dist/cli.js --run --root "$PROBE" "$PROBE/probe.test.ts"
+cat "$TMPD/pi-task03-out.txt"
+rm -rf "$PROBE" "$TMPD/pi-task03-out.txt"
+```
 
-若看不到工具结果，检查 `README.md` 是否确实写入 `h.tempDir`，以及 read 工具是否处于活动工具集；若只有一次模型调用，检查第一条 faux 响应的 `stopReason` 是否为 `toolUse`。实验后只删除自己新建的测试文件。
+**预期输出**（本地运行得到的 `pi-task03-out.txt` 内容）：
 
-## 验收标准
+```text
+MESSAGES ["system","user","assistant","toolResult","assistant"]
+EVENTS ["agent_start","turn_start","message_start","message_end","message_start","message_end","message_start","message_update:toolcall_start","message_update:toolcall_delta","message_update:toolcall_delta","message_update:toolcall_end","message_end","tool_execution_start","tool_execution_end","message_start","message_end","turn_end","turn_start","message_start","message_update:text_start","message_update:text_delta","message_update:text_end","message_end","turn_end","agent_end","agent_settled"]
+STATE ["system","user","assistant","toolResult","assistant"]
+ENTRIES ["message","message","message","message","message"]
+CONTEXT ["system","user","assistant","toolResult","assistant"]
+DELTA_JOINED "README 已读取"
+FINAL_TEXT "README 已读取"
+```
 
-给任意一个 `toolResult`，能指出它是消息而非工具事件；给一条 JSONL 会话记录，能说明它是否一定进入下一轮模型上下文。
+注意两点：
+
+- `toolcall_delta` 的数量每次运行可能不同。本地两次运行分别得到一次和两次。这是流式分块的正常变化，不影响结论。
+- 测试里的 `expect(deltaText).toBe(finalText)` 通过，说明把所有 `text_delta` 拼起来，与最终助手消息的文字一致。
+
+**结果解读**：
+
+- `MESSAGES` 比用户输入多一个 `system`。提示词和工具声明也是一条消息，它进入转录，也进入会话条目。
+- `EVENTS` 中，`tool_execution_*` 出现在 `message_end`（助手 toolCall）之后、toolResult 之前。事件不包含历史，只是过程。
+- `ENTRIES` 有五条 `message`，没有 `session` 头（`getBranch()` 不返回文件头）。
+- `CONTEXT` 与 `ENTRIES` 的角色顺序相同。本次运行中没有压缩或省略，所以投影结果与原始条目一致。
+
+### 实验 2：事件折叠（手工拼接增量）
+
+- **目的**：理解“界面能显示增量，但完整消息要等 `message_end`”。
+- **步骤**：读实验 1 的 `DELTA_JOINED` 和 `FINAL_TEXT`。
+- **预期**：两者都是 `"README 已读取"`。
+
+如果把最后一个 `message_end` 从事件列表中去掉，界面仍能显示文字（已经收到的 `text_delta` 都在），但是无法确认最终消息的 `stopReason` 和 `usage`。这些字段只在 `message_end` 携带的完整 `AssistantMessage` 里。
+
+错误或取消属于另一种终态：`AssistantMessage.stopReason` 为 `error` 或 `aborted`，并带 `errorMessage`。`AgentState.errorMessage` 在 `turn_end` 时从这条消息提取。
+
+### 实验 3：读代码填表（不需要运行）
+
+- **目的**：练习判断一个数据属于哪一类。
+- **步骤**：在下面的表中，为每一行填写“是否落盘”“是否发给模型”“是否只在内存中”。
+
+| 数据 | 是否落盘 | 是否发给模型 | 只在内存中 |
+| --- | --- | --- | --- |
+| 用户的一条 `user` 消息 | | | |
+| 一个 `text_delta` 事件 | | | |
+| `AgentState.streamingMessage` | | | |
+| `tool_execution_start` 事件 | | | |
+| 一条 `bashExecution` 消息（未带 `!!`） | | | |
+| 一条 `compaction` 条目 | | | |
+
+答案见自测题的参考答案。
+
+## 自测题
+
+1. 一条 `bashExecution` 消息（没有 `!!` 前缀）会被发给模型吗？它以什么角色出现？它会写入磁盘吗？
+2. `ToolCall.id` 与 `ToolResultMessage.toolCallId` 是什么关系？如果二者不一致，会发生什么？
+3. 为什么 `message_update` 中的 `partial` 或 `streamingMessage` 不能当作历史保存？应该以哪个事件为准？
+4. `agent_end` 与 `agent_settled` 有什么区别？一次 `session.prompt()` 中，哪一个可能出现多次？
+5. `AgentState.systemPrompt` 为什么是只读的？想修改提示词应该怎么做？
+
+### 参考答案
+
+1. 会。它被 `convertToLlm` 转成 `role: "user"` 的文本，内容是 `Ran ...` 形式的命令和输出。它写入磁盘，作为 `message` 条目。只有带 `!!` 前缀（`excludeFromContext` 为真）的 bash 记录才会被丢弃，不发给模型。
+2. 一一对应。工具结果的 `toolCallId` 必须等于调用的 `id`。不一致时，历史里的结果找不到对应调用，部分供应商会拒绝请求，或模型无法把结果和调用联系起来。
+3. 流式过程中的消息还不完整，内容可能会变。历史以 `message_end` 带来的终态消息为准。`streamingMessage` 只在内存中，`message_end` 时被清空。
+4. `agent_end` 是一次 Agent 运行的循环结束，因为自动重试可能多次出现。`agent_settled` 是会话层全部工作结束（包括重试、压缩），每次 `prompt()` 只发一次。
+5. 提示词由转录中的系统消息重放得出，不是独立保存的字符串。直接赋值会破坏“转录是唯一来源”的规则。要修改提示词，应追加一条带 `content` 或 `sections` 的系统消息。
+
+## 常见错误
+
+| 现象 | 原因 | 解决 |
+| --- | --- | --- |
+| 界面把流式文字当成历史，重启后文字不完整 | 把 `message_update` 的 `partial` 当成完整消息保存 | 历史以 `message_end` 的终态消息为准 |
+| 以为所有 `role: "user"` 都是人打的字 | `bashExecution`、`custom`、`branchSummary`、`compactionSummary` 都在模型侧被转成 `user` | 看原始角色（`AgentMessage` 中的 `role`），再看 `convertToLlm` 如何转换 |
+| 把条目的时间戳和消息的时间戳混用 | 条目 `timestamp` 是 ISO 字符串，消息 `timestamp` 是毫秒数字 | 比较时间前先统一格式；注意 `new Date(...).getTime()` 的转换 |
+| 给 `session.state.systemPrompt` 赋值，期望立即生效 | 该字段是只读的，且由系统消息重放得出 | 追加系统消息（`content` 或 `sections`），而不是直接赋值 |
+| 把 `agent_end` 当成“会话彻底结束” | 自动重试时同一次 `prompt()` 会有多个 `agent_end` | 等待 `agent_settled`，它只在会话层全部工作结束后发出一次 |
+
+## 选读：源码深入（可选，放在文件最后）
+
+选读，跳过不影响主线。
+
+### 选读 A：ToolResultMessage 的 details 与 structuredContent
+
+`AgentToolResult`（`packages/agent/src/types.ts`）有 `content`、`details`、`structuredContent?`、`usage?`、`isError?`、`terminate?`。其中：
+
+- `content` 发给模型；
+- `details` 给界面和扩展；
+- `structuredContent` 给程序化调用者，并且要符合工具的 `outputSchema`。
+
+`structuredContent` 不会进入 `ToolResultMessage`，所以它不保证会被保存到会话里。后置钩子（`afterToolCall`）如果只提供 `content`、不提供 `structuredContent`，旧的结构化数据会被丢弃，这是注释里明确写的规则。
+
+### 选读 B：context_edit 与模型投影
+
+会话文件是追加写入的。如果要让模型“看不到”某条已保存的回答，不能删除那一行，而是追加一条 `context_edit`：
+
+```json
+{"type":"context_edit","id":"e1","parentId":"m1","targetId":"m1","replacement":null}
+```
+
+- `getBranch()` 或原始条目仍然包含 `m1`；
+- 投影（`buildSessionProjection`，位于 `packages/coding-agent/src/core/session-manager.ts`）会跳过 `m1` 的内容；
+- 后续模型请求看不到这条回答。
+
+`replacement` 为 `null` 表示省略；为 `{ content: ... }` 表示只替换内容。`SessionManager.appendContextEdit(targetId, replacement)` 在 `packages/coding-agent/src/core/session-manager.ts` 中定义；`AgentSession` 在多处调用它。
+
+区分两种“替换”：
+
+| 机制 | 改的是什么 | 是否追加新条目 |
+| --- | --- | --- |
+| `_replaceMessageInPlace` | 内存里的同一个消息对象 | 否，首次写入前完成 |
+| `appendContextEdit` | 不改原消息，追加一条规则 | 是 |
+
+### 选读 C：SystemMessage 的 replace 字段
+
+旧笔记称 `packages/coding-agent/docs/message-types.md` 描述了 `replace: true`（丢弃之前的状态，建立新基线）。本次没有核对那份文档。但 `packages/ai/src/types.ts` 的 `SystemMessage` 中没有 `replace` 字段，因此源码中不存在这个选项。读的时候以类型定义为准。
+
+### 选读 D：JSON 线上事件
+
+`packages/coding-agent/src/modes/rpc/rpc-mode.ts` 中，每个会话事件在输出前都经过 `toJsonEvent`（导入自 `../json-event.ts`，即 `packages/coding-agent/src/modes/json-event.ts`）。线上事件比内存事件更瘦，例如不带累积的 `partial`。具体字段规则属于 SDK 与 RPC 模式，本篇不展开。
+
+### 选读 E：entry_appended 不是通用落盘通知
+
+`AgentSessionEvent` 有 `entry_appended`。本次核对中，它在 context edit 的写入路径（`appendContextEdit` 之后）、缓存预热（cache warmer）的回调里、以及部分条目写入路径中被发出。它不是“文件新增了一行”的通用通知。普通助手或工具结果的 `message_end` 持久化路径，本次没有逐行确认是否发出它，不要依赖这一点。
+
+## 下一篇
+
+下一篇是模型与供应商。本篇讲的是“消息长什么样”。下一篇解决：这些模型消息如何被转换成具体供应商的请求格式，以及供应商返回的流式增量如何变成 `AssistantMessageEvent`。
+
+## 术语小结
+
+| 术语 | 一句话定义 | 首次出现的小节 |
+| --- | --- | --- |
+| 模型消息（Message） | 供应商能理解的四种角色消息的联合类型 | 先用一个例子理解 |
+| 内容块（content block） | 消息内容的最小单元：text、image、thinking、toolCall | 概念 1 |
+| 判别字段（discriminant） | 用来区分联合类型成员的字面量字段，如 `role`、`type` | 概念 1 |
+| Agent 消息（AgentMessage） | pi 内部的消息类型，模型消息加上应用角色 | 概念 2 |
+| 声明合并（declaration merging） | 用同名接口扩展已有类型的 TypeScript 机制 | 概念 2 |
+| 事件（AgentEvent） | 过程通知，只在发出时有效，不保存 | 概念 3 |
+| 会话事件（AgentSessionEvent） | `AgentSession` 对外发出的事件，在 AgentEvent 基础上增加会话级事件 | 概念 3 |
+| 流式增量（delta） | 流式输出中的一小段内容，如 `text_delta` 的 `delta` 字段 | 概念 3 |
+| 会话条目（SessionEntry） | 写入会话文件的一行记录，带 `id` 与 `parentId` | 概念 4 |
+| 活动分支（active branch） | 从根到当前叶子的一条路径，`getBranch()` 返回的内容 | 概念 4 |
+| 翻译（convertToLlm） | 把 `AgentMessage[]` 转换成 `Message[]` 的函数 | 概念 6 |
+| 状态（AgentState） | 进程里当前的模型、工具、消息等值，退出后消失 | 概念 7 |
+| 只读字段（readonly） | 只能读取、不能赋值的属性 | 概念 7 |
+| 原地替换（in-place replacement） | 保持同一个对象的身份，只改它的字段内容 | 概念 7 |
+| 投影（projection） | 从原始条目计算出“模型实际看到的内容”的过程 | 选读 B |
